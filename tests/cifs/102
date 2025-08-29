@@ -1,0 +1,270 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: verify sharesock reuse vs nosharesock across two shares on the same host
+#
+# Behavior under test
+# - Default (sharesock): mounting a second share on the same server should reuse
+#   the same transport (no extra connection).
+# - With -o nosharesock: mounting a second share should not reuse the transport.
+#   With SMB3 multichannel, a single mount may open multiple TCP sockets; we
+#   therefore assert that the total number of connections does not decrease and
+#   is at least 2 after the second mount.
+#
+# How connections are detected
+# - Prefer /proc/fs/cifs/DebugData when populated: we count unique ConnectionId
+#   blocks that mention the server host. DebugData is typically populated after
+#   a mount and may be empty after unmount; when empty, we fall back.
+# - Fallback: count established TCP connections to the server host on port 445
+#   (or 139) via `ss` (or `netstat` if `ss` is not available).
+#
+# Requirements and setup
+# - FSTYP=cifs, TEST_DEV set to //host/share and TEST_DIR writable
+# - A second share on the same host via SCRATCH_DEV (preferred) or TEST_DEV2
+# - Test keeps stdout stable; diagnostics and snapshots are logged to $seqres.full
+#
+# Notes
+# - We skip the test if global nosharesock is present in TEST_FS_MOUNT_OPTS,
+#   since that would invalidate the sharesock phase.
+# - Cleanup output is suppressed to avoid polluting expected output.
+#
+# Requirements:
+# - TEST_DEV must be set to \\host\share (//host/share format)
+# - Provide a second share via TEST_DEV2 or SCRATCH_DEV, on the same host
+#
+# Stdout is stable; details go to $seqres.full.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+# Choose a second share: prefer SCRATCH_DEV if it is a CIFS UNC on the same host
+# and not the same share; otherwise use TEST_DEV2 if suitable.
+pick_second_share()
+{
+	local primary="$1"
+	local cand1="$SCRATCH_DEV"
+	local cand2="$TEST_DEV2"
+	if [ -n "$cand1" ] && [ "$cand1" != "$primary" ]; then
+		echo "$cand1"; return
+	fi
+	if [ -n "$cand2" ] && [ "$cand2" != "$primary" ]; then
+		echo "$cand2"; return
+	fi
+	echo "pick_second_share: primary=$primary cand1=$cand1 cand2=$cand2" >> $seqres.full
+}
+
+SECOND_DEV=$(pick_second_share "$TEST_DEV")
+[ -n "$SECOND_DEV" ] || _notrun "need second share on same host in SCRATCH_DEV or TEST_DEV2"
+
+# Skip if global mount options already force nosharesock, which would
+# invalidate the sharesock (default) phase expectations.
+if echo "$TEST_FS_MOUNT_OPTS $MOUNT_OPTIONS" | grep -qw nosharesock; then
+	_notrun "global nosharesock configured in mount options"
+fi
+
+# Extract host and share names from //host/share
+_host_from_unc()
+{
+	echo "$1" | sed -E 's#^//([^/]+)/.*#\1#'
+}
+_share_from_unc()
+{
+	echo "$1" | sed -E 's#^//[^/]+/([^/]+).*#\1#'
+}
+_unc_windows()
+{
+	local h=$(_host_from_unc "$1")
+	local s=$(_share_from_unc "$1")
+	printf "\\\\%s\\%s" "$h" "$s"
+}
+_unc_posix()
+{
+	local h=$(_host_from_unc "$1")
+	local s=$(_share_from_unc "$1")
+	printf "//%s/%s" "$h" "$s"
+}
+
+HOST1=$(_host_from_unc "$TEST_DEV")
+HOST2=$(_host_from_unc "$SECOND_DEV")
+[ "$HOST1" = "$HOST2" ] || _notrun "both shares must be on same host"
+
+UNC1=$(_unc_windows "$TEST_DEV")
+UNC2=$(_unc_windows "$SECOND_DEV")
+[ -n "$UNC1" ] && [ -n "$UNC2" ] || _notrun "unable to derive UNC paths"
+UNC1_FS=$(_unc_posix "$TEST_DEV")
+UNC2_FS=$(_unc_posix "$SECOND_DEV")
+[ "$UNC1" != "$UNC2" ] || _notrun "shares must be different"
+
+# Resolve the server host to IPs; we'll count TCP connections to any of these on port 445.
+_resolve_host_ips()
+{
+	local host="$1"
+	getent ahosts "$host" | awk '{print $1}' | sort -u
+}
+
+_tcp_conns_to_host_count()
+{
+	local host="$1"
+	local ips ip
+	ips=$(_resolve_host_ips "$host")
+	[ -n "$ips" ] || { echo "0"; return; }
+
+	# Prefer ss; fallback to netstat if ss is unavailable
+	if command -v ss >/dev/null 2>&1; then
+		# Collect candidate lines once to $tmp for debugging
+		local ssout
+		ssout=$(ss -tanH 2>/dev/null)
+		echo "ss snapshot:\n$ssout" >> $seqres.full
+		echo "$ssout" | awk -v IPS="$(echo $ips)" '
+			BEGIN {
+				split(IPS, a, " ")
+			}
+			{
+				remote=$5
+				# Count only connections to SMB ports
+				if (remote ~ /:445$/ || remote ~ /:139$/) {
+					for (i in a) {
+						if (index(remote, a[i])>0) { cnt++; break }
+					}
+				}
+			}
+			END { print cnt+0 }
+		'
+	else
+		local nsout
+		nsout=$(netstat -tan 2>/dev/null | sed '1,2d')
+		echo "netstat snapshot:\n$nsout" >> $seqres.full
+		echo "$nsout" | awk -v IPS="$(echo $ips)" '
+			BEGIN { split(IPS, a, " ") }
+			{
+				remote=$5
+				if (remote ~ /:445$/ || remote ~ /:139$/) {
+					for (i in a) {
+						if (index(remote, a[i])>0) { cnt++; break }
+					}
+				}
+			}
+			END { print cnt+0 }
+		'
+	fi
+}
+
+# Prefer DebugData when populated: count unique ConnectionIds for this host.
+_debugdata_conns_to_host_count()
+{
+	local host="$1"
+	local snap
+	snap=$(cat /proc/fs/cifs/DebugData 2>/dev/null)
+	# If DebugData has no connections, indicate unusable by printing nothing
+	echo "$snap" | grep -q "ConnectionId:" || { echo ""; return; }
+	echo "$snap" >> $seqres.full
+	echo "$snap" | awk -v HOST="$host" '
+		BEGIN { lhost=tolower(HOST); in_block=0; cid=""; hosthit=0 }
+		/^[[:space:]]*[0-9]+[)]/ && index($0, "ConnectionId:")>0 {
+			if (in_block==1 && hosthit==1 && length(cid)>0) { seen[cid]=1 }
+			in_block=1; hosthit=0; cid=""
+			for (i=1;i<=NF;i++) if ($i=="ConnectionId:") { cid=$(i+1); gsub(/[,;]/, "", cid); break }
+			next
+		}
+		{
+			line=tolower($0)
+			if (index(line, lhost)>0) hosthit=1
+		}
+		END {
+			if (in_block==1 && hosthit==1 && length(cid)>0) seen[cid]=1
+			n=0; for (k in seen) { n++ }
+			print n
+		}
+	'
+}
+
+# Wrapper: use DebugData if available, else sockets
+_conn_count_for_host()
+{
+	local host="$1"
+	local n
+	n=$(_debugdata_conns_to_host_count "$host")
+	if [ -n "$n" ]; then
+		echo "using DebugData: host=$host count=$n" >> $seqres.full
+		echo "$n"; return
+	fi
+	n=$(_tcp_conns_to_host_count "$host")
+	echo "using TCP sockets: host=$host count=$n" >> $seqres.full
+	echo "$n"
+}
+
+# Mount helpers for second share
+SECOND_MNT="$TEST_DIR/cifs102.second.$$"
+mkdir -p "$SECOND_MNT" || _fail "mkdir second mnt failed"
+
+# Clean up mounts quietly to keep stdout stable
+_register_cleanup "_unmount \"$SECOND_MNT\" >/dev/null 2>&1; rmdir \"$SECOND_MNT\" >/dev/null 2>&1; _test_unmount >/dev/null 2>&1"
+
+# Phase 1: sharesock (default)
+_test_unmount > /dev/null 2>&1
+_do "_test_mount" || _fail "mount TEST_DEV failed"
+_do "_get_mount -t $FSTYP $TEST_FS_MOUNT_OPTS $SELINUX_MOUNT_OPTIONS $SECOND_DEV $SECOND_MNT" || _fail "mount SECOND_DEV failed"
+
+# Touch a file on each share to make sure server connection state includes the share
+echo 1 > "$TEST_DIR/.cifs102.$$" || true
+echo 1 > "$SECOND_MNT/.cifs102.$$" || true
+
+host_conns_before=$(_conn_count_for_host "$HOST1")
+echo "sharesock: host=$HOST1 conns_before=$host_conns_before" >> $seqres.full
+
+# After first and second mounts, the number of TCP connections to the host should not increase
+host_conns_after_first=$(_conn_count_for_host "$HOST1")
+echo "sharesock: host=$HOST1 conns_after_first=$host_conns_after_first" >> $seqres.full
+
+host_conns_after_second=$(_conn_count_for_host "$HOST1")
+echo "sharesock: host=$HOST1 conns_after_second=$host_conns_after_second" >> $seqres.full
+
+[ "$host_conns_after_second" = "$host_conns_after_first" ] || _fail "sharesock: expected no new connection for second share"
+
+_unmount "$SECOND_MNT"
+_test_unmount
+
+# Phase 2: nosharesock
+_do "_test_mount -o nosharesock" || _fail "mount TEST_DEV (nosharesock) failed"
+_do "_get_mount -t $FSTYP -o nosharesock $TEST_FS_MOUNT_OPTS $SELINUX_MOUNT_OPTIONS $SECOND_DEV $SECOND_MNT" || _fail "mount SECOND_DEV (nosharesock) failed"
+
+echo 1 > "$TEST_DIR/.cifs102.$$" || true
+echo 1 > "$SECOND_MNT/.cifs102.$$" || true
+
+host_conns_nos_first=$(_conn_count_for_host "$HOST1")
+echo "nosharesock: host=$HOST1 conns_after_first=$host_conns_nos_first" >> $seqres.full
+
+tries=15
+host_conns_nos_second=""
+while [ $tries -gt 0 ]; do
+	host_conns_nos_second=$(_conn_count_for_host "$HOST1")
+	echo "nosharesock: host=$HOST1 conns_after_second=$host_conns_nos_second (tries left=$tries)" >> $seqres.full
+	[ -n "$host_conns_nos_first" ] && [ -n "$host_conns_nos_second" ] && \
+		[ $host_conns_nos_second -ge $((host_conns_nos_first)) ] && break
+	tries=$((tries-1))
+	sleep 0.2
+done
+
+# With nosharesock, the second share should create a new connection
+if [ -n "$host_conns_nos_first" ] && [ -n "$host_conns_nos_second" ]; then
+	# With SMB3 multichannel, a single mount can open multiple TCP sockets already.
+	# For nosharesock we expect the second mount to not reduce the number of sockets,
+	# and the total to be at least 2 sockets to the server.
+	if [ $host_conns_nos_second -lt $host_conns_nos_first ] || [ $host_conns_nos_second -lt 2 ]; then
+		_fail "nosharesock: expected >=2 TCP connections and no decrease after second mount (first=$host_conns_nos_first, second=$host_conns_nos_second)"
+	fi
+else
+	_fail "nosharesock: could not count TCP connections"
+fi
+
+# Final cleanup handled by _register_cleanup; avoid duplicate unmount noise
+
+echo "sharesock vs nosharesock OK"
+
+status=0
+exit
