@@ -1,0 +1,108 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: DebugData server interfaces and allocated channels
+#
+# Goal
+# - Ensure /proc/fs/cifs/DebugData contains a "Server interfaces" section for
+#   our connection and that at least one interface reports Allocated channels > 0.
+#   This validates that the client reports interface enumeration in DebugData and
+#   that at least one channel is active. If client multichannel is requested via
+#   mount options (multichannel or max_channels), require >=2 total channels.
+#
+# Notes
+# - We only parse the ConnectionId block that mentions our host. If DebugData is
+#   empty or lacks the Server interfaces section on this kernel/dialect, we skip.
+# - We trigger light I/O to ensure the connection is active before parsing.
+# - This does not force-enable multichannel. It adapts expectations based on
+#   mount options: if multichannel/max_channels requested, it expects >=2.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+_host_from_unc() { echo "$1" | sed -E 's#^//([^/]+)/.*#\1#'; }
+_share_from_unc() { echo "$1" | sed -E 's#^//[^/]+/([^/]+).*#\1#'; }
+_unc_windows() { local h=$(_host_from_unc "$1"); local s=$(_share_from_unc "$1"); printf "\\\\%s\\%s" "$h" "$s"; }
+
+HOST=$(_host_from_unc "$TEST_DEV")
+UNCW=$(_unc_windows "$TEST_DEV")
+[ -n "$HOST" ] || _notrun "could not derive host"
+
+_dd_allocated_channels_sum_for_host()
+{
+    local host="$1"; local snap
+    snap=$(cat /proc/fs/cifs/DebugData 2>/dev/null)
+    echo "$snap" >> $seqres.full
+    echo "$snap" | awk -v HOST="$host" '
+        BEGIN { tl=tolower(HOST); in_block=0; target=0; in_if=0; sum=0; printed=0 }
+        # Start of a new connection block
+        /^[[:space:]]*[0-9]+[)].*ConnectionId:/ {
+            # If previous block was our target and we were in interfaces section,
+            # emit and exit (should have been handled earlier, but be safe)
+            if (in_block==1 && target==1 && in_if==1) { print sum; exit }
+            in_block=1; target=0; in_if=0; sum=0; next
+        }
+        in_block==1 {
+            line=tolower($0)
+            if (index(line, tl)>0) target=1
+            if ($1=="Server" && $2=="interfaces:") { in_if=1; next }
+            # If we reach blank line or another header and we were in interfaces for target, finish
+            if ((NF==0 || ($0 ~ /^[[:space:]]*[0-9]+[)].*ConnectionId:/)) && target==1 && in_if==1) { print sum; printed=1; exit }
+            if (in_if==1 && $1=="Allocated" && $2=="channels:") {
+                n=$3 + 0; sum += n
+            }
+        }
+        END {
+            if (printed==0 && in_block==1 && target==1 && in_if==1) { print sum }
+        }
+    '
+}
+
+_register_cleanup "_test_unmount >/dev/null 2>&1; rm -f \"$TEST_DIR/.cifs105.$$\" >/dev/null 2>&1"
+
+_test_unmount > /dev/null 2>&1
+_do "_test_mount" || _fail "mount TEST_DEV failed"
+
+# Light I/O to ensure connection is active and DebugData populated
+echo 1 > "$TEST_DIR/.cifs105.$$" 2>/dev/null || true
+
+# Poll for DebugData interfaces section for our host
+tries=20
+sum=""
+while [ $tries -gt 0 ]; do
+    sum=$(_dd_allocated_channels_sum_for_host "$HOST" | awk 'NR==1{print $1+0}')
+    echo "poll: host=$HOST allocated_channels_sum='${sum}' tries=$tries" >> $seqres.full
+    [ -n "$sum" ] && break
+    tries=$((tries-1))
+    sleep 0.2
+done
+
+[ -n "$sum" ] || _notrun "DebugData lacks Server interfaces for $UNCW; kernel/dialect may not support it"
+
+# Decide expected minimum channels from mount options
+EXPECT_MIN=1
+OPTS_COMBINED="$TEST_FS_MOUNT_OPTS $MOUNT_OPTIONS"
+if echo "$OPTS_COMBINED" | grep -qw multichannel; then
+    EXPECT_MIN=2
+fi
+mc=$(echo "$OPTS_COMBINED" | sed -n 's/.*max_channels=\([0-9][0-9]*\).*/\1/p' | head -n1)
+if [ -n "$mc" ]; then
+    # max_channels implies multichannel; require at least 2, but not necessarily mc
+    # since server may cap; expecting >=2 is a reasonable minimal assertion
+    [ "$mc" -gt 1 ] && EXPECT_MIN=2
+fi
+echo "expect_min_channels=$EXPECT_MIN opts=[$OPTS_COMBINED]" >> $seqres.full
+
+if [ "$sum" -ge "$EXPECT_MIN" ]; then
+    echo "Server interfaces allocated channels OK"
+else
+    _fail "expected >=$EXPECT_MIN allocated channel(s) for $UNCW, got $sum"
+fi
+
+status=0
+exit
