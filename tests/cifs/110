@@ -1,0 +1,85 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: prefixpath basic functionality and common ops within prefix
+# Fail today
+# Behavior under test
+# - Mounting with -o prefixpath=<subdir> anchors the mount to that subdirectory
+#   on the server share. Creating files via the mount should create them under
+#   that subdir, and they should be visible via a normal (no-prefixpath) mount
+#   at <share>/<subdir>/.
+#
+# How it works
+# - Creates a unique subdirectory at the share root via a normal mount, then
+#   remounts with -o prefixpath=<subdir> and performs common ops within that
+#   anchored subtree: create, mkdir nested, rename (move) into nested dir,
+#   append content. Unmounts and verifies results via a normal mount at
+#   <share>/<subdir>/.
+#
+# Requirements
+# - FSTYP=cifs, TEST_DEV set to //host/share, TEST_DIR writable.
+#
+# Output
+# - Stable single success line; diagnostics go to $seqres.full.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+subdir="cifs110.$$"
+tmpfile="prefix.txt"
+tmpfile2="moved.txt"
+msg="hello-from-prefixpath"
+
+_register_cleanup "_test_unmount >/dev/null 2>&1; _do \"_test_mount\" >/dev/null 2>&1; rm -rf \"$TEST_DIR/$subdir\" >/dev/null 2>&1; _test_unmount >/dev/null 2>&1"
+
+# Prepare clean subdir at share root via normal mount
+_test_unmount > /dev/null 2>&1
+_do "_test_mount" || _fail "initial mount failed"
+rm -rf "$TEST_DIR/$subdir" 2>/dev/null || true
+mkdir -p "$TEST_DIR/$subdir" || _fail "mkdir subdir failed"
+_test_unmount > /dev/null 2>&1
+
+# Mount with prefixpath and perform common operations inside the anchored path
+_do "_test_mount -o prefixpath=$subdir" || _fail "mount with prefixpath failed"
+printf "%s" "$msg" > "$TEST_DIR/$tmpfile" || _fail "write via prefixpath mount failed"
+mkdir -p "$TEST_DIR/inner" || _fail "mkdir inner under prefix failed"
+mv "$TEST_DIR/$tmpfile" "$TEST_DIR/inner/$tmpfile2" || _fail "rename/move within prefix failed"
+printf "!" >> "$TEST_DIR/inner/$tmpfile2" || _fail "append after move failed"
+# Sanity: ensure objects are where we expect before unmounting
+test -f "$TEST_DIR/inner/$tmpfile2" || {
+	echo "[pre-unmount] listing $TEST_DIR and inner:" >> $seqres.full
+	ls -la "$TEST_DIR" >> $seqres.full 2>&1 || true
+	ls -la "$TEST_DIR/inner" >> $seqres.full 2>&1 || true
+	_fail "moved file missing inside prefix mount before unmount"
+}
+sync || true
+_test_unmount > /dev/null 2>&1
+
+# Verify via normal mount that file is under <share>/<subdir>/
+_do "_test_mount" || _fail "verify mount failed"
+if [ ! -f "$TEST_DIR/$subdir/inner/$tmpfile2" ]; then
+	echo "[post-remount] expected $TEST_DIR/$subdir/inner/$tmpfile2 not found; dumping dir trees" >> $seqres.full
+	ls -la "$TEST_DIR" >> $seqres.full 2>&1 || true
+	ls -la "$TEST_DIR/$subdir" >> $seqres.full 2>&1 || true
+	ls -la "$TEST_DIR/$subdir/inner" >> $seqres.full 2>&1 || true
+	echo "[post-remount] find subtree:" >> $seqres.full
+	(cd "$TEST_DIR" && find "$subdir" -maxdepth 2 -type f -printf "%p\n") >> $seqres.full 2>&1 || true
+	# Check if server ignored prefixpath and created at share root
+	if [ -f "$TEST_DIR/inner/$tmpfile2" ]; then
+		echo "[post-remount] WARNING: found file at share root (inner/$tmpfile2), prefixpath may be ignored by server/client" >> $seqres.full
+		_fail "prefixpath ignored: file created at share root instead of subdir"
+	fi
+	_fail "moved file not found under subdir/inner after prefixpath mount"
+fi
+back=$(cat "$TEST_DIR/$subdir/inner/$tmpfile2") || _fail "read back failed"
+[ "$back" = "${msg}!" ] || _fail "content mismatch: expected '${msg}!' got '$back'"
+
+echo "prefixpath basic OK"
+
+status=0
+exit
