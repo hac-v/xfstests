@@ -1,0 +1,96 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: DebugData nosharesock flag visibility
+#
+# Verifies that:
+# - With default mount (sharesock), DebugData ConnectionId blocks for our host
+#   do not include the 'nosharesock' flag.
+# - With -o nosharesock, DebugData ConnectionId blocks for our host include
+#   the 'nosharesock' flag.
+#
+# Implementation notes
+# - We parse /proc/fs/cifs/DebugData and count ConnectionId blocks that mention
+#   our server host, and how many of those contain the 'nosharesock' token.
+# - We poll briefly after mounts to allow DebugData to populate.
+# - Stdout stays minimal; diagnostics go to $seqres.full.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+_host_from_unc() { echo "$1" | sed -E 's#^//([^/]+)/.*#\1#'; }
+HOST=$(_host_from_unc "$TEST_DEV")
+
+_dd_counts_for_host() {
+    local host="$1"; local tries=20; local delay=0.1
+    local snap
+    while [ $tries -gt 0 ]; do
+        snap=$(cat /proc/fs/cifs/DebugData 2>/dev/null)
+        echo "$snap" >> $seqres.full
+        if echo "$snap" | grep -q "ConnectionId:"; then
+            break
+        fi
+        tries=$((tries-1))
+        sleep $delay
+    done
+    echo "$snap" | awk -v HOST="$host" '
+        BEGIN { lhost=tolower(HOST); inb=0; has_host=0; has_ns=0; conn=0; ns=0 }
+        /^[[:space:]]*[0-9]+[)]/ && index($0, "ConnectionId:")>0 {
+            if (inb==1 && has_host==1) { conn++; if (has_ns==1) ns++; }
+            inb=1; has_host=0; has_ns=0
+            next
+        }
+        {
+            line=tolower($0)
+            if (index(line, lhost)>0) has_host=1
+            if (index(line, "nosharesock")>0) has_ns=1
+        }
+        END {
+            if (inb==1 && has_host==1) { conn++; if (has_ns==1) ns++; }
+            print conn, ns
+        }
+    '
+}
+
+_register_cleanup "_test_unmount >/dev/null 2>&1"
+
+# Phase 1: default mount should not show nosharesock in DebugData for our host
+_test_unmount > /dev/null 2>&1
+_do "_test_mount" || _fail "mount TEST_DEV failed"
+
+read conn1 ns1 < <(_dd_counts_for_host "$HOST")
+echo "phase1: host=$HOST conn=$conn1 ns=$ns1" >> $seqres.full
+
+if [ -z "$conn1" ] || [ "$conn1" -lt 1 ]; then
+    _fail "phase1: no ConnectionId blocks found for host $HOST"
+fi
+
+if [ -n "$ns1" ] && [ "$ns1" -ne 0 ]; then
+    _fail "phase1: unexpected nosharesock flag present in DebugData"
+fi
+
+_test_unmount
+
+# Phase 2: nosharesock mount should show nosharesock in DebugData for our host
+_do "_test_mount -o nosharesock" || _fail "mount TEST_DEV (nosharesock) failed"
+
+read conn2 ns2 < <(_dd_counts_for_host "$HOST")
+echo "phase2: host=$HOST conn=$conn2 ns=$ns2" >> $seqres.full
+
+if [ -z "$conn2" ] || [ "$conn2" -lt 1 ]; then
+    _fail "phase2: no ConnectionId blocks found for host $HOST"
+fi
+
+if [ -z "$ns2" ] || [ "$ns2" -lt 1 ]; then
+    _fail "phase2: expected nosharesock flag in DebugData"
+fi
+
+echo "DebugData nosharesock flag OK"
+
+status=0
+exit
