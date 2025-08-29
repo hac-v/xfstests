@@ -1,0 +1,60 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: hardlink basic semantics
+#
+# Behavior under test
+# - Creating a hardlink increases link count to 2 on both names.
+# - Writes via one link are visible via the other.
+# - Unlinking one name leaves the other with link count 1 and data intact.
+#
+# Skip policy
+# - If ln fails with EOPNOTSUPP/ENOTSUP, skip (server/share disallows hardlinks).
+#
+# Output
+# - Stable single success line; diagnostics go to $seqres.full.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+_register_cleanup "_test_unmount >/dev/null 2>&1; rm -rf \"$TEST_DIR/cifs111.$$\" >/dev/null 2>&1"
+
+_test_unmount > /dev/null 2>&1
+_do "_test_mount" || _fail "mount failed"
+
+W="$TEST_DIR/cifs111.$$"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+printf "alpha" > "$W/a" || _fail "write base file failed"
+if ! ln "$W/a" "$W/b" 2>"$W/err"; then
+    if grep -qiE 'not supported|EOPNOTSUPP|ENOTSUP' "$W/err"; then
+        _notrun "hardlinks not supported on this server/share"
+    fi
+    _fail "ln failed: $(cat \"$W/err\")"
+fi
+
+h1=$(stat -c %h "$W/a") || _fail "stat a failed"
+h2=$(stat -c %h "$W/b") || _fail "stat b failed"
+[ "$h1" -eq 2 ] || _fail "expected link count 2 on a, got $h1"
+[ "$h2" -eq 2 ] || _fail "expected link count 2 on b, got $h2"
+
+printf "!" >> "$W/b" || _fail "append via b failed"
+back=$(cat "$W/a") || _fail "read a after write via b failed"
+[ "$back" = "alpha!" ] || _fail "content mismatch after cross-write: $back"
+
+rm -f "$W/a" || _fail "unlink a failed"
+test -f "$W/b" || _fail "b missing after unlink a"
+back2=$(cat "$W/b") || _fail "read b after unlink a failed"
+[ "$back2" = "alpha!" ] || _fail "content mismatch on b after unlink a: $back2"
+h3=$(stat -c %h "$W/b") || _fail "stat b after unlink a failed"
+[ "$h3" -eq 1 ] || _fail "expected link count 1 on b after unlink a, got $h3"
+
+echo "hardlink basic OK"
+
+status=0
+exit
