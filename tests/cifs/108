@@ -1,0 +1,140 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: nosharesock + multichannel across two shares on same host
+#
+# Behavior under test
+# - With -o nosharesock,multichannel,max_channels=2, mounting two different
+#   shares on the same host should create two separate connections, each with
+#   2 allocated channels reported in DebugData. TCP sockets to the server
+#   should be >= 4 in total.
+#
+# Skip policy
+# - Requires a second share on the same host via SCRATCH_DEV (preferred) or
+#   TEST_DEV2. Skips if not available or if DebugData lacks interface info.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+pick_second_share() {
+    local primary="$1"; local cand1="$SCRATCH_DEV"; local cand2="$TEST_DEV2"
+    if [ -n "$cand1" ] && [ "$cand1" != "$primary" ]; then echo "$cand1"; return; fi
+    if [ -n "$cand2" ] && [ "$cand2" != "$primary" ]; then echo "$cand2"; return; fi
+}
+
+_host_from_unc() { echo "$1" | sed -E 's#^//([^/]+)/.*#\1#'; }
+_share_from_unc() { echo "$1" | sed -E 's#^//[^/]+/([^/]+).*#\1#'; }
+_unc_windows() { local h=$(_host_from_unc "$1"); local s=$(_share_from_unc "$1"); printf "\\\\%s\\%s" "$h" "$s"; }
+_unc_posix() { local h=$(_host_from_unc "$1"); local s=$(_share_from_unc "$1"); printf "//%s/%s" "$h" "$s"; }
+
+PRIMARY="$TEST_DEV"
+SECONDARY=$(pick_second_share "$PRIMARY")
+[ -n "$SECONDARY" ] || _notrun "need second share on same host in SCRATCH_DEV or TEST_DEV2"
+
+HOST1=$(_host_from_unc "$PRIMARY")
+HOST2=$(_host_from_unc "$SECONDARY")
+[ "$HOST1" = "$HOST2" ] || _notrun "both shares must be on same host"
+HOST="$HOST1"
+UNC1=$(_unc_windows "$PRIMARY"); UNC2=$(_unc_windows "$SECONDARY")
+UNC1_FS=$(_unc_posix "$PRIMARY"); UNC2_FS=$(_unc_posix "$SECONDARY")
+[ "$UNC1" != "$UNC2" ] || _notrun "shares must be different"
+
+_dd_channel_sums_for_host() {
+    # Prints: "<cid> <sum>" per ConnectionId block that mentions HOST
+    local host="$1"; local snap
+    snap=$(cat /proc/fs/cifs/DebugData 2>/dev/null)
+    echo "$snap" >> $seqres.full
+    echo "$snap" | awk -v HOST="$host" '
+        BEGIN { tl=tolower(HOST); inb=0; target=0; in_if=0; sum=0; cid="" }
+        /^[[:space:]]*[0-9]+[)].*ConnectionId:/ {
+            if (inb==1 && target==1) { printf "%s %d\n", cid, sum }
+            inb=1; target=0; in_if=0; sum=0; cid=""
+            for (i=1;i<=NF;i++) if ($i=="ConnectionId:") { cid=$(i+1); gsub(/[,;]/, "", cid); break }
+            next
+        }
+        inb==1 {
+            line=tolower($0)
+            if (index(line, tl)>0) target=1
+            if ($1=="Server" && $2=="interfaces:") { in_if=1; next }
+            if ((NF==0 || ($0 ~ /^[[:space:]]*[0-9]+[)].*ConnectionId:/)) && in_if==1) { in_if=0 }
+            if (in_if==1 && $1=="Allocated" && $2=="channels:") { sum += ($3+0) }
+        }
+        END { if (inb==1 && target==1) { printf "%s %d\n", cid, sum } }
+    '
+}
+
+_resolve_host_ips() { getent ahosts "$1" | awk '{print $1}' | sort -u; }
+_tcp_conns_to_host_count() {
+    local host="$1" ips
+    ips=$(_resolve_host_ips "$host"); [ -n "$ips" ] || { echo 0; return; }
+    if command -v ss >/dev/null 2>&1; then
+        ss -tanH 2>/dev/null | awk -v IPS="$(echo $ips)" '
+            BEGIN { split(IPS,a," "); }
+            { r=$5; if (r ~ /:445$/ || r ~ /:139$/) { for (i in a) if (index(r,a[i])>0) { c++; break } } }
+            END { print c+0 }
+        '
+    else
+        netstat -tan 2>/dev/null | sed '1,2d' | awk -v IPS="$(echo $ips)" '
+            BEGIN { split(IPS,a," "); }
+            { r=$5; if (r ~ /:445$/ || r ~ /:139$/) { for (i in a) if (index(r,a[i])>0) { c++; break } } }
+            END { print c+0 }
+        '
+    fi
+}
+
+SECOND_MNT="$TEST_DIR/cifs108.second.$$"
+mkdir -p "$SECOND_MNT" || _fail "mkdir second mnt failed"
+
+_register_cleanup "_unmount \"$SECOND_MNT\" >/dev/null 2>&1; rmdir \"$SECOND_MNT\" >/dev/null 2>&1; _test_unmount >/dev/null 2>&1; rm -f \"$TEST_DIR/.cifs108.*\" >/dev/null 2>&1"
+
+# Mount both shares with nosharesock + multichannel + max_channels=2
+_test_unmount > /dev/null 2>&1
+_do "_test_mount -o nosharesock,multichannel,max_channels=2" || _fail "mount primary failed"
+_do "_get_mount -t $FSTYP -o nosharesock,multichannel,max_channels=2 $TEST_FS_MOUNT_OPTS $SELINUX_MOUNT_OPTIONS $SECONDARY $SECOND_MNT" || _fail "mount secondary failed"
+
+# Light I/O
+echo 1 > "$TEST_DIR/.cifs108.1.$$" 2>/dev/null || true
+echo 1 > "$SECOND_MNT/.cifs108.2.$$" 2>/dev/null || true
+
+# Poll DebugData for two ConnectionId blocks for host with per-connection sum==2
+tries=35
+ok=0
+while [ $tries -gt 0 ]; do
+    mapfile -t lines < <(_dd_channel_sums_for_host "$HOST")
+    echo "dd lines count=${#lines[@]}" >> $seqres.full
+    # Build per-connection assertions
+    cnt=0; mism=0; sumsum=0
+    for ln in "${lines[@]}"; do
+        cid=$(echo "$ln" | awk '{print $1}')
+        s=$(echo  "$ln" | awk '{print $2+0}')
+        [ -n "$cid" ] || continue
+        cnt=$((cnt+1)); sumsum=$((sumsum + s))
+        if [ "$s" -ne 2 ]; then mism=$((mism+1)); fi
+    done
+    echo "dd: cnt=$cnt mism=$mism sumsum=$sumsum" >> $seqres.full
+    if [ $cnt -ge 2 ] && [ $mism -eq 0 ]; then ok=1; break; fi
+    tries=$((tries-1)); sleep 0.2
+done
+
+[ $ok -eq 1 ] || _fail "expected two connections each with 2 channels in DebugData"
+
+# Also verify sockets >= 4
+tries=20
+sc=0
+while [ $tries -gt 0 ]; do
+    sc=$(_tcp_conns_to_host_count "$HOST")
+    echo "sockets: count=$sc (tries=$tries)" >> $seqres.full
+    [ "$sc" -ge 4 ] && break
+    tries=$((tries-1)); sleep 0.3
+done
+[ "$sc" -ge 4 ] || _fail "expected >=4 TCP sockets to $HOST with two nosharesock multichannel mounts (got $sc)"
+
+echo "Nosharesock multichannel (2 mounts * 2 channels) OK"
+
+status=0
+exit
