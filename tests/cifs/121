@@ -1,0 +1,107 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: PathComponentMax boundary behavior
+#
+# Behavior under test
+# - Parse PathComponentMax for our connection from /proc/fs/cifs/DebugData.
+# - Determine effective local limit as min(PathComponentMax, getconf NAME_MAX).
+# - Creating a name of effective limit bytes must succeed; limit+1 must fail.
+#
+# Skip policy
+# - If DebugData doesn't report a positive PathComponentMax for our host, skip.
+# - If getconf NAME_MAX fails, skip.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+_host_from_unc() { echo "$1" | sed -E 's#^//([^/]+)/.*#\1#'; }
+_share_from_unc() { echo "$1" | sed -E 's#^//[^/]+/([^/]+).*#\1#'; }
+_unc_windows() { local h=$(_host_from_unc "$1"); local s=$(_share_from_unc "$1"); printf "\\\\%s\\%s" "$h" "$s"; }
+
+HOST=$(_host_from_unc "$TEST_DEV")
+UNCW=$(_unc_windows "$TEST_DEV")
+[ -n "$HOST" ] || _notrun "could not derive host"
+
+_dd_pathcomponentmax_for_host()
+{
+    local host="$1" snap
+    snap=$(cat /proc/fs/cifs/DebugData 2>/dev/null) || return 2
+    echo "$snap" >> $seqres.full
+    echo "$snap" | awk -v HOST="$host" '
+        BEGIN { tl=tolower(HOST); inb=0; target=0; pcm=0; found=0 }
+        /^[[:space:]]*[0-9]+[)].*ConnectionId:/ {
+            if (inb==1 && target==1 && pcm>0) { print pcm; found=1; exit }
+            inb=1; target=0; pcm=0; next
+        }
+        inb==1 {
+            line=tolower($0)
+            if (index(line, tl)>0) target=1
+            if (target==1 && $1=="PathComponentMax:") {
+                val=$2+0; if (val>0) pcm=val
+            }
+        }
+        END { if (found==0 && inb==1 && target==1 && pcm>0) print pcm }
+    '
+}
+
+_register_cleanup "_test_unmount >/dev/null 2>&1; rm -rf \"$TEST_DIR/cifs121.$$\" >/dev/null 2>&1"
+
+_test_unmount > /dev/null 2>&1
+_do "_test_mount" || _fail "mount failed"
+
+# Light I/O to populate DebugData
+echo 1 > "$TEST_DIR/.cifs121.$$" 2>>$seqres.full || true
+
+tries=20
+PCMAX=""
+while [ $tries -gt 0 ]; do
+    PCMAX=$(_dd_pathcomponentmax_for_host "$HOST" | awk 'NR==1{print $1+0}')
+    [ -n "$PCMAX" ] && [ "$PCMAX" -gt 0 ] && break
+    tries=$((tries-1)); sleep 0.2
+done
+
+[ -n "$PCMAX" ] && [ "$PCMAX" -gt 0 ] || _notrun "DebugData lacks PathComponentMax for $UNCW"
+
+LOCAL_MAX=$(getconf NAME_MAX "$TEST_DIR" 2>/dev/null) || _notrun "getconf NAME_MAX failed"
+[ -n "$LOCAL_MAX" ] && [ "$LOCAL_MAX" -gt 0 ] || _notrun "invalid NAME_MAX"
+
+# Effective limit is min(PathComponentMax, local NAME_MAX)
+EFF_MAX=$PCMAX
+[ "$LOCAL_MAX" -lt "$EFF_MAX" ] && EFF_MAX=$LOCAL_MAX
+echo "PathComponentMax=$PCMAX local_NAME_MAX=$LOCAL_MAX eff=$EFF_MAX" >> $seqres.full
+
+[ "$EFF_MAX" -ge 1 ] || _notrun "effective max < 1"
+
+W="$TEST_DIR/cifs121.$$"
+mkdir -p "$W" || _fail "workspace mkdir failed"
+
+_mkname() { local n=$1; python3 - "$n" <<'PY' || exit 1
+import sys
+n=int(sys.argv[1])
+print('a'*n)
+PY
+}
+
+command -v python3 >/dev/null 2>&1 || _notrun "python3 required"
+
+OKNAME=$(_mkname "$EFF_MAX")
+TLNAME=$(_mkname $((EFF_MAX+1)))
+
+# Should succeed
+touch "$W/$OKNAME" 2>>$seqres.full || _fail "create at EFF_MAX failed (len=$EFF_MAX)"
+
+# Should fail (either client NAME_MAX or server PathComponentMax)
+if touch "$W/$TLNAME" 2>>$seqres.full; then
+    _fail "create beyond EFF_MAX unexpectedly succeeded (len=$((EFF_MAX+1)))"
+fi
+
+echo "PathComponentMax boundary OK"
+
+status=0
+exit
