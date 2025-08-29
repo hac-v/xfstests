@@ -1,0 +1,78 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: MF symlinks basic create/readlink/traverse
+#
+# Behavior under test
+# - Mount with -o mfsymlinks and verify:
+#   * ln -s succeeds and the created path is a symlink (lstat true).
+#   * readlink returns the exact target path string.
+#   * Reading via the symlink returns the target file contents.
+#   * Appending via the symlink updates the target (write-through).
+#   * A relative symlink in a subdirectory resolves correctly.
+#
+# How it works
+# - Mounts TEST_DEV with mfsymlinks enabled, creates a small target file, then
+#   creates two links (simple and ../ relative). Uses printf/cat to avoid
+#   newline pitfalls when validating content. Cleans up all artifacts.
+#
+# Requirements
+# - FSTYP=cifs, TEST_DEV set to //host/share, TEST_DIR writable.
+# - Kernel/client must support the mfsymlinks mount option.
+#
+# Skip policy
+# - None. With -o mfsymlinks, symlink operations must succeed; failures are
+#   considered test failures.
+#
+# Output
+# - Stdout is stable: a single success line; diagnostics go to $seqres.full.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+_register_cleanup "_test_unmount >/dev/null 2>&1; rm -rf \"$TEST_DIR/cifs109.$$\" >/dev/null 2>&1"
+
+# Ensure mfsymlinks is active for this mount
+_test_unmount > /dev/null 2>&1
+_do "_test_mount -o mfsymlinks" || _fail "mount with mfsymlinks failed"
+
+W="$TEST_DIR/cifs109.$$"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+printf "hello-world" > "$W/target.txt" || _fail "write target failed"
+
+# Create and validate simple symlink
+if ! ln -s target.txt "$W/link" 2>"$W/err"; then
+    _fail "ln -s failed under -o mfsymlinks: $(cat \"$W/err\")"
+fi
+
+test -L "$W/link" || _fail "link not a symlink"
+rl=$(readlink "$W/link") || _fail "readlink failed"
+[ "$rl" = "target.txt" ] || _fail "unexpected readlink value: $rl"
+
+# Traverse symlink for read
+back=$(cat "$W/link") || _fail "read via symlink failed"
+[ "$back" = "hello-world" ] || _fail "unexpected content via symlink: $back"
+
+# Write via symlink updates target
+printf "!" >> "$W/link" || _fail "append via symlink failed"
+newback=$(cat "$W/target.txt") || _fail "read target failed"
+[ "$newback" = "hello-world!" ] || _fail "write via symlink did not reflect in target"
+
+# Relative symlink across subdir
+mkdir -p "$W/sub" || _fail "mkdir sub failed"
+ln -s ../target.txt "$W/sub/link2" || _fail "ln -s ../target.txt sub/link2 failed"
+test -L "$W/sub/link2" || _fail "link2 not a symlink"
+rl2=$(readlink "$W/sub/link2") || _fail "readlink link2 failed"
+[ "$rl2" = "../target.txt" ] || _fail "unexpected readlink link2: $rl2"
+back2=$(cat "$W/sub/link2") || _fail "read via link2 failed"
+[ "$back2" = "hello-world!" ] || _fail "unexpected content via link2: $back2"
+
+echo "MF symlinks basic OK"
+
+status=0
+exit
