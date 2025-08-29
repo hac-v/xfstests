@@ -1,0 +1,56 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: Unicode filenames create/list/access
+#
+# Behavior under test
+# - Creating files with non-ASCII names, listing shows them intact, reading
+#   content works.
+#
+# Output
+# - Stable single success line; diagnostics go to $seqres.full.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+# Keep stdout stable; send diagnostics/warnings to the full log
+exec 2>>$seqres.full
+
+# Ensure UTF-8 locale for unicode path operations
+export LC_ALL=C.UTF-8
+
+_register_cleanup "_test_unmount >/dev/null 2>&1; rm -rf \"$TEST_DIR/cifs115.$$\" >/dev/null 2>&1"
+
+_test_unmount > /dev/null 2>&1
+_do "_test_mount" || _fail "mount failed"
+
+W="$TEST_DIR/cifs115.$$"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+name1="こんにちは.txt"
+name2="файл.txt"
+name3="اسم.txt"
+printf "one" > "$W/$name1" || _fail "write $name1 failed"
+printf "two" > "$W/$name2" || _fail "write $name2 failed"
+printf "three" > "$W/$name3" || _fail "write $name3 failed"
+
+# List and verify presence
+ls -1 "$W" > "$W/list.txt" || _fail "ls failed"
+grep -F "$name1" "$W/list.txt" >/dev/null || _fail "$name1 not listed"
+grep -F "$name2" "$W/list.txt" >/dev/null || _fail "$name2 not listed"
+grep -F "$name3" "$W/list.txt" >/dev/null || _fail "$name3 not listed"
+
+# Read back
+[ "$(cat "$W/$name1")" = "one" ] || _fail "content mismatch for $name1"
+[ "$(cat "$W/$name2")" = "two" ] || _fail "content mismatch for $name2"
+[ "$(cat "$W/$name3")" = "three" ] || _fail "content mismatch for $name3"
+
+echo "unicode filenames OK"
+
+status=0
+exit
