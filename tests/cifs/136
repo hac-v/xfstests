@@ -1,0 +1,34 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: ro mount forbids chmod/chown/truncate
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+
+_register_cleanup "_test_unmount >/dev/null 2>&1"
+_test_unmount >/dev/null 2>&1
+
+MO=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+MO_RW=$(echo "$MO" | awk -F, '{out=""; for(i=1;i<=NF;i++){ if($i=="ro"||$i=="rw") continue; out=out (out?"," : "") $i } print out}')
+MO_RO=$MO_RW; [ -n "$MO_RO" ] && MO_RO="$MO_RO,ro" || MO_RO="ro"
+
+M1=$(mktemp -d /tmp/cifs136.rw.XXXXXX) || _fail "mktemp M1"
+M2=$(mktemp -d /tmp/cifs136.ro.XXXXXX) || _fail "mktemp M2"
+_do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO_RW'" || _fail "mount rw"
+_do "mount -t cifs '$TEST_DEV' '$M2' -o '$MO_RO'" || _fail "mount ro"
+
+SUB="cifs136.$$.d"; mkdir -p "$M1/$SUB" || _fail "mkdir"
+F1="$M1/$SUB/f"; F2="$M2/$SUB/f"; echo x > "$F1" || _fail "seed"
+
+chmod 000 "$F2" >/dev/null 2>&1 && _fail "chmod succeeded on ro"
+chown 0:0 "$F2" >/dev/null 2>&1 && _fail "chown succeeded on ro"
+truncate -s 0 "$F2" >/dev/null 2>&1 && _fail "truncate succeeded on ro"
+
+echo "ro mount blocks metadata-changing ops OK"
+
+status=0
+exit
