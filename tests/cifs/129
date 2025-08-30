@@ -1,0 +1,96 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: read-only mount blocks writes and does not increase Writes counter
+#
+# Behavior under test (using /proc/fs/cifs/Stats):
+# - Mount M1 (rw, default options) and M2 (ro) to the same share.
+# - Seed a file via M1 and verify it can be read via M2.
+# - Record Writes counter for the share, then attempt to append to the file via M2.
+# - Expect the append to fail (EROFS) and the Writes counter to remain unchanged.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -r /proc/fs/cifs/Stats ] || _notrun "requires /proc/fs/cifs/Stats"
+
+M1=""; M2=""
+_cleanup_129() {
+    [ -n "$M2" ] && _do "umount -l '$M2'" >/dev/null 2>&1 || true
+    [ -n "$M1" ] && _do "umount -l '$M1'" >/dev/null 2>&1 || true
+    [ -n "$M2" ] && rmdir "$M2" >/dev/null 2>&1 || true
+    [ -n "$M1" ] && rmdir "$M1" >/dev/null 2>&1 || true
+}
+_register_cleanup _cleanup_129
+
+_test_unmount >/dev/null 2>&1
+
+_host_from_unc() { echo "$1" | sed -E 's#^//([^/]+)/.*#\1#'; }
+_share_from_unc() { echo "$1" | sed -E 's#^//[^/]+/([^/]+).*#\1#'; }
+HOST=$(_host_from_unc "$TEST_DEV"); SHARE=$(_share_from_unc "$TEST_DEV")
+[ -n "$HOST" ] && [ -n "$SHARE" ] || _notrun "could not derive host/share"
+
+_writes_for_share() {
+    awk -v H="$1" -v S="$2" '
+        BEGIN { inb=0; w="" }
+        /^[[:space:]]*[0-9]+\) / {
+            if (match($0, /\\\\+([^\\]+)\\([^[:space:]]+)/, m)) {
+                inb = (m[1]==H && m[2]==S) ? 1 : 0;
+            } else { inb = 0 }
+            next
+        }
+        inb==1 && $1=="Writes:" { w=$2 }
+        inb==1 && NF==0 { inb=0 }
+        END { if (w!="") print w }
+    ' /proc/fs/cifs/Stats 2>/dev/null
+}
+
+_opts_wo_flag() {
+    echo "$1" | awk -F, '{ out=""; for(i=1;i<=NF;i++){ if($i=="ro" || $i=="rw") continue; if(length(out)) out=out","$i; else out=$i } print out }'
+}
+
+MO=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+MO_RW=$(_opts_wo_flag "$MO"); MO_RO=$MO_RW; [ -n "$MO_RO" ] && MO_RO="$MO_RO,ro" || MO_RO="ro"
+
+# Create two mounts
+M1=$(mktemp -d /tmp/cifs129.rw.XXXXXX) || _fail "mktemp M1 failed"
+M2=$(mktemp -d /tmp/cifs129.ro.XXXXXX) || _fail "mktemp M2 failed"
+_do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO_RW'" || _fail "mount rw failed"
+_do "mount -t cifs '$TEST_DEV' '$M2' -o '$MO_RO'" || _fail "mount ro failed"
+
+# Seed file via RW mount
+SUB="cifs129.$$.d"
+_do "mkdir -p '$M1/$SUB'" || _fail "mkdir on M1 failed"
+F1="$M1/$SUB/f"; F2="$M2/$SUB/f"
+echo "seed" > "$F1" || _fail "write via M1 failed"
+cat "$F2" >/dev/null 2>&1 || _fail "read via M2 failed"
+
+# Capture baseline Writes and attempt append via RO path
+wb=$(_writes_for_share "$HOST" "$SHARE") || wb=""
+[ -n "$wb" ] || _notrun "could not read Stats Writes for //$HOST/$SHARE"
+
+# Use dd to ensure explicit write syscall attempt; expect non-zero exit (EROFS)
+if dd if=/dev/zero of="$F2" bs=1 count=1 oflag=append conv=notrunc oflag=append 2>/dev/null; then
+    _fail "write to ro mount unexpectedly succeeded"
+fi
+
+# Allow counter to settle
+sleep 1
+wa=$(_writes_for_share "$HOST" "$SHARE") || wa=""
+[ -n "$wa" ] || _notrun "could not read Stats Writes after attempt"
+
+echo "cifs129: Writes baseline=$wb after=$wa" >> "$seqres.full"
+[ $((wa-wb)) -eq 0 ] || _fail "Writes counter increased on ro mount (delta=$((wa-wb)))"
+
+# Also verify creating a new file fails
+if touch "$M2/$SUB/new" 2>/dev/null; then
+    _fail "able to create file on ro mount"
+fi
+
+echo "read-only mount blocks writes OK"
+
+status=0
+exit
