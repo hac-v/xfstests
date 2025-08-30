@@ -1,0 +1,38 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: actimeo=0 disables attribute caching (immediate refresh)
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+
+_register_cleanup "_test_unmount >/dev/null 2>&1"
+_test_unmount >/dev/null 2>&1
+
+MO=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+MO=$(echo "$MO" | awk -F, '{out=""; for(i=1;i<=NF;i++){ if($i ~ /^actimeo=/) continue; out=out (out?"," : "") $i } print out}')
+[ -n "$MO" ] && MO="$MO,actimeo=0" || MO="actimeo=0"
+
+M1=$(mktemp -d /tmp/cifs133.m1.XXXXXX) || _fail "mktemp M1 failed"
+M2=$(mktemp -d /tmp/cifs133.m2.XXXXXX) || _fail "mktemp M2 failed"
+
+_do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO'" || _fail "mount M1 failed"
+_do "mount -t cifs '$TEST_DEV' '$M2' -o '$MO'" || _fail "mount M2 failed"
+
+SUB="cifs133.$$.d"; _do "mkdir -p '$M1/$SUB'" || _fail "mkdir"
+F1="$M1/$SUB/f"; F2="$M2/$SUB/f"
+echo x > "$F1" || _fail "create via M1 failed"
+t1=$(stat -c %Y "$F1") || _fail "stat t1"
+sleep 1
+echo y >> "$F2" || _fail "append via M2 failed"
+t2=$(stat -c %Y "$F1") || _fail "stat t2"
+
+[ "$t2" -gt "$t1" ] || _fail "mtime did not refresh immediately with actimeo=0 (t1=$t1 t2=$t2)"
+
+echo "actimeo=0 immediate refresh OK"
+
+status=0
+exit
