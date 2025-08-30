@@ -1,0 +1,187 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: Simple deferred close test using /proc/fs/cifs/open_files
+#
+# Steps:
+# - Mount with closetimeo=30.
+# - Open a file for read, read a byte, then close.
+# - Verify /proc/fs/cifs/open_files lists the file after close (deferred handle).
+# - Optionally verify lsof shows the process has no FD to the file.
+# - After >closetimeo, verify the entry is gone.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+_register_cleanup "_test_unmount >/dev/null 2>&1; rm -rf \"$TEST_DIR/cifs124.$$\" >/dev/null 2>&1"
+
+_test_unmount > /dev/null 2>&1
+
+CTO=30
+_do "_test_mount -o closetimeo=$CTO" || _fail "mount failed"
+
+[ -r /proc/fs/cifs/open_files ] || _notrun "requires /proc/fs/cifs/open_files"
+
+# Get actual closetimeo in effect (env may override); choose the longest matching cifs mount for TEST_DIR
+ctoval=$(awk -v dir="$TEST_DIR" '
+    BEGIN{bestlen=0; ct=""}
+    $3=="cifs" {
+        mp=$2; if (index(dir, mp)==1 && length(mp)>bestlen) {
+            bestlen=length(mp); opts=$4;
+            split(opts,a,/,/); ct="";
+            for (i in a) { if (a[i] ~ /^closetimeo=/) { split(a[i],b,"="); ct=b[2]; break } }
+        }
+    }
+    END { if (ct!="") print ct }
+' /proc/self/mounts)
+[ -n "$ctoval" ] || ctoval=$CTO
+[ "$ctoval" != "0" ] || _fail "closetimeo=0 disables deferred close on this mount"
+
+W="$TEST_DIR/cifs124.$$"
+mkdir -p "$W" || _fail "mkdir failed"
+F="$W/simple_$$_$RANDOM"
+echo "hello world" > "$F" || _fail "create failed"
+base=$(basename -- "$F")
+
+# Use host temp for snapshots to avoid share noise
+SNAP=$(mktemp -t cifs124_open.XXXXXX)
+_register_cleanup "rm -f '$SNAP' >/dev/null 2>&1; _test_unmount >/dev/null 2>&1; rm -rf \"$TEST_DIR/cifs124.$$\" >/dev/null 2>&1"
+
+# Append a human-readable line to the full log
+log() { echo "[124] $*" >> "$seqres.full"; }
+
+# Take a fresh snapshot of /proc/fs/cifs/open_files, removing comments and CRs
+proc_snapshot() {
+    sed -e 's/\r$//' /proc/fs/cifs/open_files 2>/dev/null | grep -v '^#' > "$SNAP" || true
+}
+
+# Dump current /proc/fs/cifs/open_files snapshot into the full log with a tag
+dump_open_files() {
+    local tag="$1"
+    proc_snapshot
+    {
+        echo "==== /proc/fs/cifs/open_files ($tag) ===="
+        cat "$SNAP"
+        echo "==== end ===="
+    } >> "$seqres.full"
+}
+
+# Return the first matching line in the snapshot whose filename (last fields) contains the basename
+proc_find_by_basename() {
+    local base="$1"
+    proc_snapshot
+    awk -v base="$base" '
+        NF >= 8 {
+            fname=$8; for(i=9;i<=NF;i++) fname=fname" " $i;
+            if (index(fname, base)>0) { print $0; exit 0 }
+        }
+        END { exit 1 }
+    ' "$SNAP"
+}
+
+# Return first matching line for basename with a specific flags value (4th column)
+proc_find_by_flag() {
+    local base="$1"; local wantflag="$2"
+    proc_snapshot
+    awk -v base="$base" -v wantflag="$wantflag" '
+        NF >= 8 {
+            fname=$8; for(i=9;i<=NF;i++) fname=fname" " $i;
+            if ($4 ~ ("^" wantflag "$") && index(fname, base)>0) { print $0; exit 0 }
+        }
+        END { exit 1 }
+    ' "$SNAP"
+}
+
+# Wait until the basename appears in /proc (deferred close visible)
+wait_until_present() {
+    local base="$1"; local tries=${2:-100}; local sleep_s=${3:-0.1}
+    local line
+    while [ $tries -gt 0 ]; do
+        line=$(proc_find_by_basename "$base") && { echo "$line"; return 0; }
+        tries=$((tries-1)); sleep "$sleep_s"
+    done
+    return 1
+}
+
+# Wait until an entry for basename appears with the given flag
+wait_until_present_flag() {
+    local base="$1"; local wantflag="$2"; local tries=${3:-100}; local sleep_s=${4:-0.1}
+    local line
+    while [ $tries -gt 0 ]; do
+        # Primary: structured awk search
+        line=$(proc_find_by_flag "$base" "$wantflag") && { echo "$line"; return 0; }
+        # Fallback: grep-based heuristic if awk missed it
+        proc_snapshot
+        line=$(grep -E "(^|[[:space:]])${wantflag}([[:space:]]|$)" "$SNAP" | grep -F -- "$base" | head -n1) && {
+            echo "$line"; return 0;
+        }
+        tries=$((tries-1)); sleep "$sleep_s"
+    done
+    return 1
+}
+
+# Wait until the basename no longer appears (deferred handle cleaned)
+wait_until_absent() {
+    local base="$1"; local tries=${2:-200}; local sleep_s=${3:-0.1}
+    while [ $tries -gt 0 ]; do
+        if ! proc_find_by_basename "$base" >/dev/null 2>&1; then return 0; fi
+        tries=$((tries-1)); sleep "$sleep_s"
+    done
+    return 1
+}
+
+# Baseline snapshot after mount and file creation
+dump_open_files "after mount & create"
+
+# Open for read, read a byte, close
+log "opening $F for read, then closing to trigger deferred close (closetimeo=$ctoval)"
+exec 7<"$F" || _fail "open read failed"
+dd if=/proc/self/fd/7 of=/dev/null bs=1 count=1 status=none || true
+exec 7<&-
+
+# Snapshot immediately after close
+dump_open_files "immediately after close"
+
+# Optional: prove the process closed the file (if lsof exists)
+if command -v lsof >/dev/null 2>&1; then
+    if lsof -p $$ 2>/dev/null | grep -q -- " $F$"; then
+        _fail "lsof still shows FD to $F after close"
+    fi
+fi
+
+# Should appear in /proc open_files while deferred (read-mode 0x8000)
+# First, try the immediate snapshot we just took; then fall back to polling
+deferred_line=$(awk -v base="$base" '
+    NF >= 8 {
+        fname=$8; for(i=9;i<=NF;i++) fname=fname" " $i;
+        if ($4=="0x8000" && index(fname, base)>0) { print $0; exit 0 }
+    }
+    END { exit 1 }
+' "$SNAP" 2>/dev/null) || deferred_line=""
+
+if [ -z "$deferred_line" ]; then
+    deferred_line=$(wait_until_present_flag "$base" "0x8000" 200 0.1) || {
+        proc_snapshot
+        log "deferred entry not visible; ctoval=$ctoval"
+        dump_open_files "deferred NOT visible"
+        _fail "deferred entry not visible after close"
+    }
+fi
+log "deferred present: $deferred_line"
+dump_open_files "after deferred detected"
+
+# After closetimeo, it should disappear
+sleep $((ctoval + 2))
+dump_open_files "before cleanup check (post-timeout)"
+wait_until_absent "$base" 300 0.1 || _fail "deferred entry not cleaned after timeout"
+dump_open_files "after cleanup"
+
+echo "deferred close basic OK"
+
+status=0
+exit
