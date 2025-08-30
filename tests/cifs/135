@@ -1,0 +1,84 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: nobrl suppresses byte-range lock requests (Locks counter)
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -r /proc/fs/cifs/Stats ] || _notrun "requires /proc/fs/cifs/Stats"
+
+_register_cleanup "_test_unmount >/dev/null 2>&1"
+_test_unmount >/dev/null 2>&1
+
+_host_from_unc() { echo "$1" | sed -E 's#^//([^/]+)/.*#\1#'; }
+_share_from_unc() { echo "$1" | sed -E 's#^//[^/]+/([^/]+).*#\1#'; }
+HOST=$(_host_from_unc "$TEST_DEV"); SHARE=$(_share_from_unc "$TEST_DEV")
+
+_locks_for_share() {
+    awk -v H="$1" -v S="$2" '
+        BEGIN { inb=0; l="" }
+        /^[[:space:]]*[0-9]+\) / {
+            if (match($0, /\\\\+([^\\]+)\\([^[:space:]]+)/, m)) inb=(m[1]==H && m[2]==S)?1:0; else inb=0; next }
+        inb==1 && $1=="Locks:" { l=$2 }
+        inb==1 && NF==0 { inb=0 }
+        END { if(l!="") print l }
+    ' /proc/fs/cifs/Stats 2>/dev/null
+}
+
+MO=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+MO_D=$MO
+MO_N=$(echo "$MO" | awk -F, '{out=""; for(i=1;i<=NF;i++){ if($i=="nobrl") continue; out=out (out?"," : "") $i } print out}')
+[ -n "$MO_N" ] && MO_N="$MO_N,nobrl" || MO_N="nobrl"
+
+MNT1=$(mktemp -d /tmp/cifs135.d.XXXXXX) || _fail "mktemp1"; _do "mount -t cifs '$TEST_DEV' '$MNT1' -o '$MO_D'" || _fail "mount1"
+MNT2=$(mktemp -d /tmp/cifs135.n.XXXXXX) || _fail "mktemp2"; _do "mount -t cifs '$TEST_DEV' '$MNT2' -o '$MO_N'" || _fail "mount2"
+
+# Prepare a file visible on both mounts
+SUB="cifs135.$$.d"; mkdir -p "$MNT1/$SUB" || _fail "mkdir"
+F1="$MNT1/$SUB/f"; F2="$MNT2/$SUB/f"; echo data > "$F1" || _fail "seed"
+
+# Try to place a byte-range lock using python (fcntl.lockf)
+lock_py=$(cat <<'PY'
+import fcntl, sys
+try:
+    with open(sys.argv[1], 'r+') as f:
+        fcntl.lockf(f, fcntl.LOCK_EX|fcntl.LOCK_NB, 10, 0)
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+PY
+)
+
+python3 - <<PY "$F1" >/dev/null 2>&1
+import fcntl, sys
+try:
+    with open(sys.argv[1], 'r+') as f:
+        fcntl.lockf(f, fcntl.LOCK_EX|fcntl.LOCK_NB, 10, 0)
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+PY
+l0=$(_locks_for_share "$HOST" "$SHARE")
+
+python3 - <<PY "$F2" >/dev/null 2>&1
+import fcntl, sys
+try:
+    with open(sys.argv[1], 'r+') as f:
+        fcntl.lockf(f, fcntl.LOCK_EX|fcntl.LOCK_NB, 10, 0)
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+PY
+l1=$(_locks_for_share "$HOST" "$SHARE")
+
+[ -n "$l0" ] && [ -n "$l1" ] || _notrun "could not read Locks"
+
+[ $((l1-l0)) -eq 0 ] || _fail "Locks increased with nobrl (delta=$((l1-l0)))"
+
+echo "nobrl suppresses Locks requests OK"
+
+status=0
+exit
