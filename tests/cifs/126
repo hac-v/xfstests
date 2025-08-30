@@ -1,0 +1,103 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: attribute cache (actimeo) behavior across two mounts
+#
+# Behavior under test
+# - Mount M1 with actimeo=A1>0 and M2 with actimeo=A2 (small).
+# - Create a file via M1 and record its mtime (t1).
+# - After >=1s, modify the file via M2 to update server mtime.
+# - Immediately stat via M1: mtime should still be t1 (cached, stale).
+# - After A1 seconds elapse, stat via M1 must reflect the new mtime (>t1).
+#
+# Fails if M1 observes an immediate refresh with actimeo>0 or fails to refresh after TTL.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+
+# Clean up any mounts/dirs we create
+M1=""; M2=""; SUB=""
+_cleanup_attrcache() {
+    [ -n "$M2" ] && _do "umount -l '$M2'" >/dev/null 2>&1 || true
+    [ -n "$M1" ] && _do "umount -l '$M1'" >/dev/null 2>&1 || true
+    [ -n "$M2" ] && rmdir "$M2" >/dev/null 2>&1 || true
+    [ -n "$M1" ] && rmdir "$M1" >/dev/null 2>&1 || true
+}
+_register_cleanup _cleanup_attrcache
+
+# Start from a clean state for the default mount
+_test_unmount >/dev/null 2>&1
+
+A1=5   # actimeo seconds for M1 (cache TTL)
+A2=1   # actimeo seconds for M2
+
+# Build mount options by taking existing MOUNT_OPTIONS and overriding actimeo at the end (last wins)
+_opts_wo() {
+    # remove a key=... option from a comma list
+    echo "$1" | awk -v k="$2" -F, '{
+        out=""; for (i=1;i<=NF;i++) { if ($i ~ ("^"k"=")) continue; if (length(out)) out=out","$i; else out=$i }
+        print out
+    }'
+}
+
+MO=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+MO1=$(_opts_wo "$MO" "actimeo")
+MO2=$MO1
+[ -n "$MO1" ] && MO1="$MO1,actimeo=$A1" || MO1="actimeo=$A1"
+[ -n "$MO2" ] && MO2="$MO2,actimeo=$A2" || MO2="actimeo=$A2"
+
+# Create two independent mount points to the same share
+M1=$(mktemp -d /tmp/cifs126.m1.XXXXXX) || _fail "mktemp M1 failed"
+M2=$(mktemp -d /tmp/cifs126.m2.XXXXXX) || _fail "mktemp M2 failed"
+
+_do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO1'" || _fail "mount M1 failed"
+_do "mount -t cifs '$TEST_DEV' '$M2' -o '$MO2'" || _fail "mount M2 failed"
+
+# Discover effective actimeo on M1 from /proc/self/mounts; require >0
+act1=$(awk -v mp="$M1" '$2==mp && $3=="cifs"{print $4}' /proc/self/mounts | awk -F, '{for(i=1;i<=NF;i++){ if($i ~ /^actimeo=/){split($i,a,"="); print a[2]; exit}}}')
+[ -n "$act1" ] || act1=$A1
+[ "$act1" != "0" ] || _fail "actimeo=0 in effect on M1; caching disabled"
+
+# Work under a unique subdir to avoid collisions
+SUB="cifs126.$$.d"
+_do "mkdir -p '$M1/$SUB'" || _fail "mkdir on M1 failed"
+F1="$M1/$SUB/f"
+F2="$M2/$SUB/f"
+
+# Create file via M1 and get its mtime
+echo "data" > "$F1" || _fail "create via M1 failed"
+t1=$(stat -c %Y "$F1") || _fail "stat mtime t1 failed"
+
+# Ensure next write will have a newer timestamp (seconds granularity)
+sleep 1
+
+# Modify via M2 and force server to commit metadata
+echo "more" >> "$F2" || _fail "append via M2 failed"
+if command -v $XFS_IO_PROG >/dev/null 2>&1; then
+    $XFS_IO_PROG -c fsync "$F2" >/dev/null 2>&1 || sync
+else
+    sync
+fi
+
+# Immediately check from M1: should be stale (still t1)
+t_immediate=$(stat -c %Y "$F1") || _fail "stat immediate failed"
+[ "$t_immediate" -eq "$t1" ] || _fail "mtime refreshed immediately despite actimeo>0 (t1=$t1, now=$t_immediate)"
+
+# While still within TTL, it should remain stale
+sleep $(( act1>2 ? act1-2 : 0 ))
+t_mid=$(stat -c %Y "$F1") || _fail "stat mid failed"
+[ "$t_mid" -eq "$t1" ] || _fail "mtime refreshed before TTL expired (actimeo=$act1)"
+
+# After TTL, it should refresh to a newer value
+sleep $(( 2 + 0 ))
+t_after=$(stat -c %Y "$F1") || _fail "stat after failed"
+[ "$t_after" -gt "$t1" ] || _fail "mtime did not refresh after TTL (t1=$t1, after=$t_after, actimeo=$act1)"
+
+echo "attribute cache actimeo behavior OK"
+
+status=0
+exit
