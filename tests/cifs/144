@@ -1,0 +1,43 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: forceuid/forcegid enforce client-side ownership mapping
+#
+# What this test validates
+# - Mount with uid/gid and forceuid/forcegid.
+# - Files created on this mount report the forced %u:%g regardless of server mapping.
+# - Skip if mount rejects the options.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+
+_register_cleanup "_test_unmount >/dev/null 2>&1"
+_test_unmount >/dev/null 2>&1
+
+# Choose forced ids (prefer qa_user_* if set, else fixed large ids)
+UIDX=${qa_user_uid:-55555}
+GIDX=${qa_user_gid:-44444}
+
+# Build mount options with uid/gid + forceuid/forcegid, stripping any prior uid/gid/force*
+BASE=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+BASE=$(echo "$BASE" | awk -F, '{out=""; for(i=1;i<=NF;i++){ if($i ~ /^uid=/ || $i ~ /^gid=/ || $i=="forceuid" || $i=="forcegid") continue; out=out (out?"," : "") $i } print out}')
+MO=$BASE; [ -n "$MO" ] && MO="$MO,uid=$UIDX,gid=$GIDX,forceuid,forcegid" || MO="uid=$UIDX,gid=$GIDX,forceuid,forcegid"
+
+MNT=$(mktemp -d /tmp/cifs144.XXXXXX) || _fail "mktemp failed"
+_do "mount -t cifs '$TEST_DEV' '$MNT' -o '$MO'" || _notrun "forceuid/forcegid not supported"
+
+SUB="cifs144.$$.d"; mkdir -p "$MNT/$SUB" || _fail "mkdir"
+F="$MNT/$SUB/f"
+echo x > "$F" || _fail "create"
+
+own=$(stat -c '%u:%g' "$F") || _fail "stat"
+[ "$own" = "$UIDX:$GIDX" ] || _fail "ownership mismatch: $own vs $UIDX:$GIDX"
+
+echo "forceuid/forcegid ownership mapping OK"
+
+status=0
+exit
