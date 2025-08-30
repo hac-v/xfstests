@@ -1,0 +1,36 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: serverino yields stable inode across remounts
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+
+_register_cleanup "_test_unmount >/dev/null 2>&1"
+_test_unmount >/dev/null 2>&1
+
+# Strip serverino/noserverino from existing options, then append serverino
+MO=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+MO=$(echo "$MO" | awk -F, '{out=""; for(i=1;i<=NF;i++){ if($i=="serverino"||$i=="noserverino") continue; out=out (out?"," : "") $i } print out}')
+[ -n "$MO" ] && MO="$MO,serverino" || MO="serverino"
+
+MNT=$(mktemp -d /tmp/cifs131.XXXXXX) || _fail "mktemp failed"
+
+_do "mount -t cifs '$TEST_DEV' '$MNT' -o '$MO'" || _fail "mount1 failed"
+SUB="cifs131.$$.d"; _do "mkdir -p '$MNT/$SUB'" || _fail "mkdir failed"
+F="$MNT/$SUB/f"; echo x > "$F" || _fail "create failed"
+i1=$(stat -c %i "$F") || _fail "stat i1 failed"
+_do "umount -l '$MNT'" || true
+
+_do "mount -t cifs '$TEST_DEV' '$MNT' -o '$MO'" || _fail "mount2 failed"
+i2=$(stat -c %i "$F") || _fail "stat i2 failed"
+
+[ "$i1" = "$i2" ] || _fail "inode changed across remount (serverino): $i1 -> $i2"
+
+echo "serverino inode stable across remount OK"
+
+status=0
+exit
