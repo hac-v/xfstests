@@ -1,0 +1,73 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: noperm disables client-side permission checks
+#
+# Behavior:
+# - Mount M1 with default client permission checks (perm, implicit).
+# - Mount M2 with -o noperm.
+# - Create a file via M1 with mode 0600 owned by root.
+# - As user 'nobody', reading the file via M1 should fail (client perm check).
+# - As user 'nobody', reading the same file via M2 should succeed (noperm).
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+
+# Need a non-privileged user to test client-side permission checks
+if ! id -u nobody >/dev/null 2>&1; then
+    _notrun "requires user 'nobody'"
+fi
+
+M1=""; M2=""; SUB=""
+_cleanup_130() {
+    [ -n "$M2" ] && _do "umount -l '$M2'" >/dev/null 2>&1 || true
+    [ -n "$M1" ] && _do "umount -l '$M1'" >/dev/null 2>&1 || true
+    [ -n "$M2" ] && rmdir "$M2" >/dev/null 2>&1 || true
+    [ -n "$M1" ] && rmdir "$M1" >/dev/null 2>&1 || true
+}
+_register_cleanup _cleanup_130
+
+_test_unmount >/dev/null 2>&1
+
+_opts_wo_flag() {
+    # Remove bare perm/noperm flags from a comma-separated list
+    echo "$1" | awk -F, '{ out=""; for(i=1;i<=NF;i++){ if($i=="perm" || $i=="noperm") continue; if(length(out)) out=out","$i; else out=$i } print out }'
+}
+
+MO=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+MO1=$(_opts_wo_flag "$MO")
+# Force explicit client-side permission checks and mode mapping for reliability
+[ -n "$MO1" ] && MO1="$MO1,perm,file_mode=0600,dir_mode=0700" || MO1="perm,file_mode=0600,dir_mode=0700"
+MO2=$(_opts_wo_flag "$MO"); [ -n "$MO2" ] && MO2="$MO2,noperm,file_mode=0600,dir_mode=0700" || MO2="noperm,file_mode=0600,dir_mode=0700"
+
+M1=$(mktemp -d /tmp/cifs130.m1.XXXXXX) || _fail "mktemp M1 failed"
+M2=$(mktemp -d /tmp/cifs130.m2.XXXXXX) || _fail "mktemp M2 failed"
+
+_do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO1'" || _fail "mount M1 failed"
+_do "mount -t cifs '$TEST_DEV' '$M2' -o '$MO2'" || _fail "mount M2 failed"
+
+SUB="cifs130.$$.d"
+_do "mkdir -p '$M1/$SUB'" || _fail "mkdir on M1 failed"
+F1="$M1/$SUB/secret"; F2="$M2/$SUB/secret"
+echo "topsecret" > "$F1" || _fail "write via M1 failed"
+# Ensure mode reflects 600 on the client (required for perm check)
+perm_bits=$(stat -c %a "$F1" 2>/dev/null || echo "")
+echo "cifs130: initial mode=$perm_bits (expect 600)" >> "$seqres.full"
+[ "$perm_bits" = "600" ] || _notrun "client mode mapping not 600; cannot verify perm behavior"
+
+# As 'nobody', read should fail via M1 (client perm check)
+if su -s /bin/sh nobody -c "cat '$F1' >/dev/null 2>&1"; then
+    _fail "read via M1 (perm) unexpectedly succeeded for nobody"
+fi
+
+# As 'nobody', read should succeed via M2 (noperm)
+su -s /bin/sh nobody -c "cat '$F2' >/dev/null 2>&1" || _fail "read via M2 (noperm) failed for nobody"
+
+echo "client noperm allows access regardless of mode OK"
+
+status=0
+exit
