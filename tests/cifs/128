@@ -1,0 +1,93 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: nolease disables directory lease caching (QueryDirectories increments every ls)
+#
+# Behavior under test (using /proc/fs/cifs/Stats):
+# - Mount the share with -o nolease.
+# - First ls increments QueryDirectories.
+# - Subsequent ls shortly after also increments (no caching).
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -r /proc/fs/cifs/Stats ] || _notrun "requires /proc/fs/cifs/Stats"
+
+MNT=""
+_cleanup_128() {
+    [ -n "$MNT" ] && _do "umount -l '$MNT'" >/dev/null 2>&1 || true
+    [ -n "$MNT" ] && rmdir "$MNT" >/dev/null 2>&1 || true
+}
+_register_cleanup _cleanup_128
+
+# Start from a clean state for default mount
+_test_unmount >/dev/null 2>&1
+
+# Derive host/share for Stats parsing
+_host_from_unc() { echo "$1" | sed -E 's#^//([^/]+)/.*#\1#'; }
+_share_from_unc() { echo "$1" | sed -E 's#^//[^/]+/([^/]+).*#\1#'; }
+HOST=$(_host_from_unc "$TEST_DEV")
+SHARE=$(_share_from_unc "$TEST_DEV")
+[ -n "$HOST" ] && [ -n "$SHARE" ] || _notrun "could not derive host/share"
+
+_qdir_for_share() {
+    local host="$1" share="$2" tries=10 val
+    while [ $tries -gt 0 ]; do
+        val=$(awk -v H="$host" -v S="$share" '
+            BEGIN { inb=0; qd="" }
+            /^[[:space:]]*[0-9]+\) / {
+                if (match($0, /\\\\+([^\\]+)\\([^[:space:]]+)/, m)) {
+                    inb = (m[1]==H && m[2]==S) ? 1 : 0;
+                } else { inb = 0 }
+                next
+            }
+            inb==1 && $1=="QueryDirectories:" { qd=$2 }
+            inb==1 && NF==0 { inb=0 }
+            END { if (qd!="") print qd }
+        ' /proc/fs/cifs/Stats 2>/dev/null)
+        if [ -n "$val" ]; then echo "$val"; return 0; fi
+        tries=$((tries-1)); sleep 0.1
+    done
+    return 1
+}
+
+# Prepare mount options with nolease
+MO=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+[ -n "$MO" ] && MO="$MO,nolease" || MO="nolease"
+
+MNT=$(mktemp -d /tmp/cifs128.mnt.XXXXXX) || _fail "mktemp failed"
+_do "mount -t cifs '$TEST_DEV' '$MNT' -o '$MO'" || _fail "mount with nolease failed"
+
+# Prepare target directory
+W="$MNT/cifs128.$$"
+mkdir -p "$W/sub" || _fail "mkdir failed"
+for i in $(seq 1 10); do echo x > "$W/sub/f$i" || _fail "seed file $i"; done
+
+# Baseline and first ls
+qd0=$(_qdir_for_share "$HOST" "$SHARE") || _notrun "could not read Stats for //$HOST/$SHARE"
+ls -1 "$W/sub" >/dev/null 2>&1 || _fail "ls #1 failed"
+tries=30
+while [ $tries -gt 0 ]; do
+    qd1=$(_qdir_for_share "$HOST" "$SHARE") || qd1=""
+    [ -n "$qd1" ] && [ $((qd1-qd0)) -ge 1 ] && break
+    tries=$((tries-1)); sleep 0.1
+done
+[ $tries -gt 0 ] || _fail "no QueryDirectories increment after first ls"
+
+# Second ls shortly after should also increment (no lease caching)
+ls -1 "$W/sub" >/dev/null 2>&1 || _fail "ls #2 failed"
+tries=30
+while [ $tries -gt 0 ]; do
+    qd2=$(_qdir_for_share "$HOST" "$SHARE") || qd2=""
+    [ -n "$qd2" ] && [ $((qd2-qd1)) -ge 1 ] && break
+    tries=$((tries-1)); sleep 0.1
+done
+[ $tries -gt 0 ] || _fail "no additional QueryDirectories increment with nolease"
+
+echo "directory lease disabled with nolease OK"
+
+status=0
+exit
