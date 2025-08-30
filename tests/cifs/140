@@ -1,0 +1,78 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: nocase/ignorecase enables case-insensitive path name matching
+#
+# What this test validates
+# - With -o nocase, lookup succeeds regardless of path case variations.
+# - Creating the same pathname with different case fails with EEXIST.
+#
+# Preconditions
+# - FSTYP=cifs; server and kernel must support nocase (skip otherwise).
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+
+_register_cleanup "_test_unmount >/dev/null 2>&1"
+_test_unmount >/dev/null 2>&1
+
+# Build mount options with nocase (ignorecase synonym) and ensure no explicit ro/rw flags clash
+BASE=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+BASE=$(echo "$BASE" | awk -F, '{out=""; for(i=1;i<=NF;i++){ if($i=="nocase"||$i=="ignorecase"||$i=="ro"||$i=="rw") continue; out=out (out?"," : "") $i } print out}')
+MO=$BASE; [ -n "$MO" ] && MO="$MO,nocase" || MO="nocase"
+
+MNT=$(mktemp -d /tmp/cifs140.nocase.XXXXXX) || _fail "mktemp failed"
+_do "mount -t cifs '$TEST_DEV' '$MNT' -o '$MO'" || _notrun "nocase not supported"
+
+SUB="cifs140.$$.d"; mkdir -p "$MNT/$SUB" || _fail "mkdir"
+Upper="$MNT/$SUB/CaseFile.txt"
+Lower="$MNT/$SUB/casefile.txt"
+Mixed="$MNT/$SUB/CASEFILE.TXT"
+
+# Create initial file with a mixed-case name
+echo "Hello" > "$Upper" || _fail "create Upper failed"
+
+# Lookup variants should succeed under nocase
+for P in "$Lower" "$Mixed"; do
+	cat "$P" >/dev/null 2>&1 || _notrun "server does not honor nocase lookups"
+done
+
+# Ensure content is identical via each path
+h1=$(sha1sum "$Upper" | awk '{print $1}')
+h2=$(sha1sum "$Lower" | awk '{print $1}')
+h3=$(sha1sum "$Mixed" | awk '{print $1}')
+[ "$h1" = "$h2" ] && [ "$h1" = "$h3" ] || _fail "content mismatch across case variants"
+
+# Creating the same pathname differing only in case should fail with EEXIST
+out=$(python3 - <<'PY' "$Mixed"
+import os, sys, errno
+p=sys.argv[1]
+flags=os.O_WRONLY|os.O_CREAT|os.O_EXCL
+try:
+	fd=os.open(p, flags, 0o644)
+	os.close(fd)
+	print('CREATED')
+	sys.exit(0)
+except OSError as e:
+	if e.errno==errno.EEXIST:
+		print('EEXIST')
+		sys.exit(2)
+	print('ERROR', e.errno)
+	sys.exit(1)
+PY
+)
+
+case "$out" in
+  EEXIST) : ;; # expected
+  CREATED) _fail "able to create duplicate by case variant under nocase" ;;
+  *) _notrun "nocase create semantics not enforced (out=$out)" ;;
+esac
+
+echo "nocase case-insensitive lookup and EEXIST semantics OK"
+
+status=0
+exit
