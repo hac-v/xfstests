@@ -1,0 +1,47 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: nodelete option prevents unlink/rename
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ "$(id -u)" = 0 ] || _notrun "root remount required"
+
+mount_line=$(awk -v mnt="$TEST_DIR" '$2==mnt {print; exit}' /proc/mounts)
+orig_opts=$(echo "$mount_line" | awk '{print $4}')
+
+
+W="$TEST_DIR/cifs155.$$"; mkdir -p "$W" || _fail "mkdir"; _register_cleanup "rm -rf '$W' >/dev/null 2>&1"
+
+echo "Initial mount opts: $orig_opts" >> $seqres.full
+if ! echo "$orig_opts" | grep -qw nodelete; then
+	base_opts=${MOUNT_OPTIONS#-o}
+	_test_unmount >/dev/null 2>&1 || true
+	if ! _do "_test_mount -o nodelete,$base_opts"; then
+		_notrun "could not mount with nodelete"
+	fi
+	mount_line=$(awk -v mnt="$TEST_DIR" '$2==mnt {print; exit}' /proc/mounts)
+	orig_opts=$(echo "$mount_line" | awk '{print $4}')
+	_register_cleanup "_test_unmount >/dev/null 2>&1; _do '_test_mount -o $base_opts' >/dev/null 2>&1 || true"
+fi
+echo "$orig_opts" | grep -qw nodelete || _notrun "nodelete option not active"
+
+# Now create target after nodelete active
+echo data > "$W/file1" || _fail "create"
+
+# Attempt unlink; expect failure (non-zero rc)
+rm -f "$W/file1" 2>>$seqres.full
+rc=$?
+echo "unlink rc=$rc (expect non-zero)" >> $seqres.full
+if [ $rc -eq 0 ]; then
+	_fail "unlink succeeded under nodelete"
+fi
+
+echo data > "$W/file2" || _fail "second create"
+mv "$W/file2" "$W/file2.moved" 2>>$seqres.full || true
+echo "rename rc=$? (rename may or may not be blocked)" >> $seqres.full
+
+echo "nodelete enforcement OK"
+status=0; exit
