@@ -1,0 +1,127 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: directory lease caching via QueryDirectories counters
+#
+# What this test validates
+# - First readdir (ls) increments QueryDirectories for the share.
+# - No accesses occur within the cache TTL (dir_cache_timeout from sysfs).
+# - After TTL, the next readdir increments QueryDirectories again, proving lease expiry.
+#
+# Implementation
+# - Parses /proc/fs/cifs/Stats for the per-share QueryDirectories counter.
+# - Reads TTL from /sys/module/cifs/parameters/dir_cache_timeout and waits TTL+2 seconds.
+# - Avoids any mid-TTL access that could refresh the cache window.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ -r /proc/fs/cifs/Stats ] || _notrun "requires /proc/fs/cifs/Stats"
+
+_register_cleanup "_test_unmount >/dev/null 2>&1; rm -rf '$TEST_DIR/cifs127.$$' >/dev/null 2>&1"
+
+_test_unmount >/dev/null 2>&1
+_do "_test_mount" || _fail "mount failed"
+
+# Helpers to derive host/share and read Stats for our share
+_host_from_unc() { echo "$1" | sed -E 's#^//([^/]+)/.*#\1#'; }
+_share_from_unc() { echo "$1" | sed -E 's#^//[^/]+/([^/]+).*#\1#'; }
+
+HOST=$(_host_from_unc "$TEST_DEV")
+SHARE=$(_share_from_unc "$TEST_DEV")
+[ -n "$HOST" ] && [ -n "$SHARE" ] || _notrun "could not derive host/share"
+
+# Read directory cache timeout from sysfs (seconds). Fallback to 30 if unavailable.
+TTL=30
+if [ -r /sys/module/cifs/parameters/dir_cache_timeout ]; then
+    _t=$(tr -d ' \t\n' </sys/module/cifs/parameters/dir_cache_timeout 2>/dev/null)
+    if [[ "$_t" =~ ^[0-9]+$ ]] && [ "$_t" -gt 0 ]; then
+        TTL=$_t
+    fi
+fi
+
+_qdir_for_share() {
+    local host="$1" share="$2" tries=10 val
+    while [ $tries -gt 0 ]; do
+        val=$(awk -v H="$host" -v S="$share" '
+            BEGIN { inb=0; qd="" }
+            /^[[:space:]]*[0-9]+\) / {
+                # Parse header line like: "1) \\host\share"
+                if (match($0, /\\\\+([^\\]+)\\([^[:space:]]+)/, m)) {
+                    inb = (m[1]==H && m[2]==S) ? 1 : 0;
+                } else {
+                    inb = 0;
+                }
+                next
+            }
+            inb==1 && $1=="QueryDirectories:" { qd=$2 }
+            inb==1 && NF==0 { inb=0 }
+            END { if (qd!="") print qd }
+        ' /proc/fs/cifs/Stats 2>/dev/null)
+        if [ -n "$val" ]; then echo "$val"; return 0; fi
+        tries=$((tries-1)); sleep 0.1
+    done
+    return 1
+}
+
+# Prepare a unique directory with some entries
+W="$TEST_DIR/cifs127.$$"
+mkdir -p "$W/sub" || _fail "mkdir failed"
+for i in $(seq 1 20); do echo x > "$W/sub/f$i" || _fail "seed file $i"; done
+
+# Snapshot baseline QueryDirectories
+qd0=$(_qdir_for_share "$HOST" "$SHARE") || _notrun "could not read Stats for //$HOST/$SHARE"
+echo "cifs127: QD baseline=$qd0" >> "$seqres.full"
+
+# First ls should increment
+ls -1 "$W/sub" >/dev/null 2>&1 || _fail "ls initial failed"
+tries=50
+while [ $tries -gt 0 ]; do
+    qd1=$(_qdir_for_share "$HOST" "$SHARE") || qd1=""
+    if [ -n "$qd1" ] && [ $((qd1-qd0)) -ge 1 ]; then break; fi
+    tries=$((tries-1)); sleep 0.2
+done
+[ $tries -gt 0 ] || _fail "QueryDirectories did not increment after initial ls"
+echo "cifs127: QD after first ls=$qd1 delta=$((qd1-qd0))" >> "$seqres.full"
+
+# Start TTL window timestamp right after we observed the initial increment
+start_ts=$(date +%s)
+
+# Do not access the directory within TTL to avoid refreshing the cache window
+qd2=$(_qdir_for_share "$HOST" "$SHARE") || _fail "read Stats after initial increment failed"
+echo "cifs127: QD before post-ttl access=$qd2" >> "$seqres.full"
+
+# After ~TTL from first ls, expect a refresh on next access
+now=$(date +%s)
+elapsed=$((now-start_ts))
+need=$((TTL + 2 - elapsed))
+[ $need -gt 0 ] && sleep $need
+echo "cifs127: slept need=$need (ttl=$TTL, elapsed=$elapsed)" >> "$seqres.full"
+ls -1 "$W/sub" >/dev/null 2>&1 || _fail "ls post-ttl failed"
+attempt=1
+inc=0
+while [ $attempt -le 3 ] && [ $inc -eq 0 ]; do
+    tries=15
+    while [ $tries -gt 0 ]; do
+        qd3=$(_qdir_for_share "$HOST" "$SHARE") || qd3=""
+        if [ -n "$qd3" ] && [ $((qd3-qd2)) -ge 1 ]; then inc=1; break; fi
+        tries=$((tries-1)); sleep 0.2
+    done
+    if [ $inc -eq 1 ]; then break; fi
+    attempt=$((attempt+1))
+    [ $attempt -le 3 ] || break
+    sleep 1
+    echo "cifs127: retrying post-ttl ls attempt=$attempt" >> "$seqres.full"
+    ls -1 "$W/sub" >/dev/null 2>&1 || _fail "ls post-ttl retry $attempt failed"
+done
+[ $inc -eq 1 ] || _fail "no QueryDirectories increment after TTL"
+echo "cifs127: QD after post-ttl ls=$qd3 delta=$((qd3-qd2)) attempts=$attempt" >> "$seqres.full"
+
+echo "directory lease cache 30s basic OK"
+
+status=0
+exit
