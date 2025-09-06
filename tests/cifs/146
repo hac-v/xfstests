@@ -1,0 +1,130 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: statfs (df) space accounting accuracy after creating data
+#
+# Objective
+# - Compare statfs-derived total/used/avail with df -k output before and after
+#   creating a data file, ensuring deltas reflect the file size within a
+#   reasonable tolerance (to accommodate allocation granularity, metadata,
+#   compression, or thin provisioning effects).
+#
+# Success Criteria
+# 1. Baseline: statfs total/used roughly matches df (within small %).
+# 2. After writing a test file, used space and available space change by an
+#    amount close to file size (70%..130% range) and statfs vs df still align.
+# 3. Clean up leaves no failure.
+#
+# The test intentionally keeps allocation modest and adaptive: chooses a size
+# up to 32MB or 1/8 of free space (whichever is smaller, but at least 4MB).
+# Data is written with dd (not fallocate) to ensure real blocks are consumed.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+command -v stat >/dev/null 2>&1 || _notrun "stat command required"
+command -v df >/dev/null 2>&1 || _notrun "df command required"
+
+_register_cleanup "rm -f '$TEST_DIR/cifs146.testfile' >/dev/null 2>&1; _test_unmount >/dev/null 2>&1"
+
+_test_unmount >/dev/null 2>&1
+_do "_test_mount" || _fail "mount failed"
+
+TESTFILE="$TEST_DIR/cifs146.testfile"
+
+pct_diff() { # pct_diff a b -> integer percent difference relative to a
+	local a=$1 b=$2
+	[ "$a" -eq 0 ] && echo 0 && return 0
+	local d=$(( a>b ? a-b : b-a ))
+	printf '%d' $(( d*100 / a ))
+}
+
+read_statfs() {
+	# echo total_bytes used_bytes free_bytes block_size bcount ffree
+	local b f S
+	read b f S < <(stat -f -c '%b %f %S' "$1") || return 1
+	local total=$((b*S))
+	local free=$((f*S))
+	local used=$((total-free))
+	echo "$total $used $free $S $b $f"
+}
+
+read_df_k() {
+	# POSIX df -kP path; output 1K-blocks Used Available Use% Mounted_on
+	local line
+	line=$(df -kP "$1" | tail -1) || return 1
+	# shellcheck disable=SC2086
+	set -- $line
+	# Fields: FS TOTAL USED AVAIL USE% MNT
+	local total=$2 used=$3 avail=$4
+	echo "$total $used $avail"
+}
+
+# Baseline readings
+read total0 used0 free0 _ _ _ < <(read_statfs "$TEST_DIR") || _fail "statfs baseline failed"
+read dftotal0 dfused0 dfavail0 < <(read_df_k "$TEST_DIR") || _fail "df baseline failed"
+
+# Compare totals within 2%
+pt=$(pct_diff $total0 $((dftotal0*1024)))
+[ $pt -le 2 ] || echo "cifs146: WARNING total mismatch pct=$pt" >> $seqres.full
+
+# Compare used within 6% (allow slack)
+pu=$(pct_diff $used0 $((dfused0*1024)))
+[ $pu -le 6 ] || echo "cifs146: WARNING used mismatch pct=$pu" >> $seqres.full
+
+# Determine target file size (bytes)
+free_k=$dfavail0
+# target <= 32MB and <= free/8, but >= 4MB
+max_target_k=$((32*1024))
+cap_target_k=$(( free_k / 8 ))
+[ $cap_target_k -lt $max_target_k ] && max_target_k=$cap_target_k
+[ $max_target_k -lt $((4*1024)) ] && max_target_k=$((4*1024))
+# guard: if remaining free is extremely small skip
+[ $free_k -lt $((max_target_k + 4096)) ] && _notrun "insufficient free space for allocation"
+TARGET_K=$max_target_k
+TARGET_MB=$((TARGET_K/1024))
+
+echo "cifs146: planning to allocate ${TARGET_MB}MB ($TARGET_K KiB)" >> $seqres.full
+
+# Write data (avoid oflag=direct to keep speed reasonable); sync to ensure blocks allocated
+( dd if=/dev/zero of="$TESTFILE" bs=1M count=$TARGET_MB conv=fsync status=none ) || _fail "write data"
+
+# Post-allocation readings
+read total1 used1 free1 _ _ _ < <(read_statfs "$TEST_DIR") || _fail "statfs after failed"
+read dftotal1 dfused1 dfavail1 < <(read_df_k "$TEST_DIR") || _fail "df after failed"
+
+# Deltas (convert df back to bytes for consistency)
+file_bytes=$((TARGET_K*1024))
+used_delta=$((used1-used0))
+avail_delta=$(((dfavail0 - dfavail1)*1024))
+
+# Sanity: used should increase, free should decrease
+[ $used1 -gt $used0 ] || _fail "statfs used did not increase"
+[ $dfavail1 -lt $dfavail0 ] || _fail "df available did not decrease"
+
+# Check delta within 70%..130% of expected file size (bytes)
+low=$((file_bytes*70/100))
+high=$((file_bytes*130/100))
+if [ $used_delta -lt $low ] || [ $used_delta -gt $high ]; then
+	echo "cifs146: used_delta=$used_delta file_bytes=$file_bytes (outside range $low..$high)" >> $seqres.full
+	_fail "statfs used delta outside tolerance"
+fi
+if [ $avail_delta -lt $low ] || [ $avail_delta -gt $((file_bytes*140/100)) ]; then
+	echo "cifs146: avail_delta=$avail_delta file_bytes=$file_bytes" >> $seqres.full
+	_fail "df avail delta outside tolerance"
+fi
+
+# Cross-check post totals again
+pt2=$(pct_diff $total1 $((dftotal1*1024)))
+[ $pt2 -le 2 ] || echo "cifs146: WARNING total post mismatch pct=$pt2" >> $seqres.full
+pu2=$(pct_diff $used1 $((dfused1*1024)))
+[ $pu2 -le 6 ] || echo "cifs146: WARNING used post mismatch pct=$pu2" >> $seqres.full
+
+echo "statfs df space accounting OK"
+
+status=0
+exit
