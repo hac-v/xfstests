@@ -1,0 +1,81 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: byte-range locks (fcntl) basic semantics
+#
+# Behavior under test
+# - Process A takes an exclusive byte-range lock on [0,100).
+# - Process B trying to lock overlapping range fails with EAGAIN (non-blocking).
+# - After A releases, B succeeds.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "python3 required"
+
+_register_cleanup "_test_unmount >/dev/null 2>&1; rm -rf \"$TEST_DIR/cifs120.$$.w\" >/dev/null 2>&1"
+
+_test_unmount > /dev/null 2>&1
+_do "_test_mount" || _fail "mount failed"
+
+W="$TEST_DIR/cifs120.$$.w"
+mkdir -p "$W" || _fail "workspace mkdir failed"
+F="$W/lockfile"
+dd if=/dev/zero of="$F" bs=1 count=1 conv=notrunc 2>>$seqres.full || true
+
+PYSRC="$W/locktest.py"
+cat > "$PYSRC" <<'PY'
+import fcntl, os, sys
+path=sys.argv[1]
+mode=sys.argv[2]  # a1,b1,a0,b0
+fd=os.open(path, os.O_RDWR|os.O_CREAT)
+try:
+    if mode=='a1':
+        fcntl.lockf(fd, fcntl.LOCK_EX|fcntl.LOCK_NB, 100, 0, os.SEEK_SET)
+        print('A_LOCKED')
+        sys.stdout.flush();
+        import time; time.sleep(1.0)
+    elif mode=='b1':
+        try:
+            fcntl.lockf(fd, fcntl.LOCK_EX|fcntl.LOCK_NB, 100, 0, os.SEEK_SET)
+            print('B_LOCKED')
+        except OSError as e:
+            print('B_FAIL', e.errno)
+    elif mode=='a0':
+        # release A lock
+        fcntl.lockf(fd, fcntl.LOCK_UN, 100, 0, os.SEEK_SET)
+        print('A_RELEASED')
+    elif mode=='b0':
+        fcntl.lockf(fd, fcntl.LOCK_EX|fcntl.LOCK_NB, 100, 0, os.SEEK_SET)
+        print('B_LOCKED_AFTER')
+finally:
+    os.close(fd)
+PY
+
+# A acquires (short hold) in background
+python3 "$PYSRC" "$F" a1 > "$W/a.out" 2>>$seqres.full &
+pa=$!
+sleep 0.2
+grep -q '^A_LOCKED' "$W/a.out" 2>/dev/null || { kill $pa 2>/dev/null || true; _fail "A failed to acquire lock"; }
+
+# B should fail while A holds
+b=$(python3 "$PYSRC" "$F" b1)
+echo "$b" >> $seqres.full
+echo "$b" | grep -q '^B_FAIL' || _fail "B unexpectedly acquired overlapping lock"
+
+# Wait until A releases naturally (~1s), then B should succeed
+wait $pa 2>>$seqres.full || true
+# Try B again (should succeed now)
+b2=$(python3 "$PYSRC" "$F" b0)
+echo "$b2" >> $seqres.full
+echo "$b2" | grep -q '^B_LOCKED_AFTER' || _fail "B failed to acquire after release"
+
+echo "byte-range locks basic OK"
+
+status=0
+exit
