@@ -1,0 +1,91 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: /proc/fs/cifs/open_files basic presence test (forward compatible)
+#
+# Format (current kernels):
+#   <tree id> <ses id> <persistent fid> <flags> <count> <pid> <uid> <filename> [lease]
+# The optional final lease token (lease state) may be present and future kernels may
+# append further fields. We only require that the PID field (#6) is numeric and that
+# the concatenated trailing portion (field 8 onward) contains the basename of our test
+# file. Extra trailing tokens are ignored. After closing the file the entry must
+# disappear.
+#
+# Output is a single success line; diagnostics go to $seqres.full.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+_register_cleanup "[ -n \"$CHILD\" ] && kill $CHILD >/dev/null 2>&1; exec 3>&- 2>/dev/null; _test_unmount >/dev/null 2>&1; rm -rf \"$TEST_DIR/cifs123.$$\" >/dev/null 2>&1"
+
+_test_unmount > /dev/null 2>&1
+_do "_test_mount" || _fail "mount failed"
+
+# Ensure cifs open_files proc entry exists on this kernel
+if [ ! -r /proc/fs/cifs/open_files ]; then
+    _notrun "requires /proc/fs/cifs/open_files"
+fi
+
+W="$TEST_DIR/cifs123.$$"
+mkdir -p "$W" || _fail "mkdir failed"
+F="$W/holdfile.$$"
+echo "hello" > "$F" || _fail "create failed"
+
+base=$(basename -- "$F")
+echo "base_name=$base" >> $seqres.full
+
+# Open and hold the file in this process (fd 9) so pid=$$ appears in column 6.
+exec 9>>"$F" || _fail "open hold fd"
+echo "held_fd=9 pid=$$" >> $seqres.full
+
+find_entry_line() {
+    # Echo matching line to stdout, or nothing.
+    sed -e 's/\r$//' /proc/fs/cifs/open_files 2>/dev/null | awk -v base="$base" -v mypid="$$" '
+        $0 ~ /^(\s*#|\s*$)/ { next }
+        NF < 8 { next }
+        ($6!=mypid) { next }
+        {
+            tail=$8; for(i=9;i<=NF;i++) tail=tail" "$i
+            if (index(tail, base)>0) { print $0 }
+        }
+    ' | head -n1
+}
+
+# Poll for appearance
+tries=20
+match_line=""
+while [ $tries -gt 0 ]; do
+    match_line=$(find_entry_line) && [ -n "$match_line" ] && break || true
+    tries=$((tries-1)); sleep 0.15
+done
+[ -n "$match_line" ] || _fail "no entry for pid $$ filename $base in /proc/fs/cifs/open_files"
+echo "matched line: $match_line" >> $seqres.full
+
+# Basic field validation
+pid_field=$(echo "$match_line" | awk '{print $6}')
+echo "$pid_field" | grep -Eq '^[0-9]+$' || _fail "pid field not numeric: $pid_field"
+
+# Close and verify disappearance
+exec 9>&-
+# Allow time for kernel to drop entry; poll until gone
+gone=0
+tries=10
+while [ $tries -gt 0 ]; do
+    line=$(find_entry_line)
+    if [ -z "$line" ]; then
+        gone=1; break
+    fi
+    sleep 0.1
+    tries=$((tries-1))
+done
+[ $gone -eq 1 ] || _fail "entry persisted after close"
+
+echo "open files entry presence OK"
+
+status=0
+exit
