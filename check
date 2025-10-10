@@ -726,6 +726,22 @@ else
 	trap "_wrapup; exit \$status" 0 1 2 3 15
 fi
 
+function ts() { date +%s; }
+
+function _cifs_collect_stats() {
+	local testname=$1
+	mkdir -p $RESULT_BASE
+	local modhash=$(modinfo -F srcversion cifs 2>/dev/null)
+	: ${modhash:-"UNKNOWN"}
+        out="${testname}.${modhash}.stats"
+        if [[ -r /proc/fs/cifs/Stats ]]; then
+            cp /proc/fs/cifs/Stats "$out" || true
+            echo "[*] Saved CIFS stats to $out"
+        else
+            echo "[E] /proc/fs/cifs/Stats not available at snapshot time (rc=${rc})" >&2
+        fi
+}
+
 function run_section()
 {
 	local section=$1 skip
@@ -1083,6 +1099,8 @@ function run_section()
 		fi
 		_stash_test_status "$seqnum" "$tc_status"
 	done
+
+	_cifs_collect_stats $seqres
 
 	# Reset these three variables so that unmount output doesn't get
 	# written to $seqres.full of the last test to run.
