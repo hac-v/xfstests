@@ -1,0 +1,77 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: sloppy mount ignores unknown options
+#
+# Goal:
+#   Verify that mounting with an unsupported option fails with EINVAL, while
+#   adding the "sloppy" option causes the same unsupported flag to be ignored
+#   and the mount to succeed.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+BAD_OPT="notarealopt=1"
+
+MNT=$(mktemp -d /tmp/cifs185.mnt.XXXXXX) || _fail "mktemp"
+
+cleanup()
+{
+    if mountpoint -q "$MNT"; then
+        umount "$MNT" >/dev/null 2>&1 || true
+    fi
+    rmdir "$MNT" >/dev/null 2>&1 || true
+}
+_register_cleanup cleanup
+
+base_opts=${MOUNT_OPTIONS#-o}
+if [ -z "$base_opts" ]; then
+    base_opts=$(awk -v mnt="$TEST_DIR" '$2==mnt {print $4}' /proc/mounts)
+fi
+
+join_opts()
+{
+    local extra="$1"
+    if [ -z "$base_opts" ]; then
+        printf '%s' "$extra"
+    elif [ -z "$extra" ]; then
+        printf '%s' "$base_opts"
+    else
+        printf '%s,%s' "$extra" "$base_opts"
+    fi
+}
+
+errfile=$TMPDIR/cifs185.err
+rm -f "$errfile"
+
+# Expect failure without sloppy
+opts_fail=$(join_opts "$BAD_OPT")
+if mount -t cifs "$TEST_DEV" "$MNT" -o "$opts_fail" 1>>$seqres.full 2>"$errfile"; then
+    umount "$MNT" >/dev/null 2>&1 || true
+    _fail "mount unexpectedly succeeded without sloppy"
+fi
+
+if ! grep -qi "Invalid argument" "$errfile"; then
+    echo "cifs185: stderr without sloppy:" >>$seqres.full
+    cat "$errfile" >>$seqres.full
+    _fail "missing 'Invalid argument' without sloppy"
+fi
+
+# Expect success with sloppy
+opts_sloppy=$(join_opts "sloppy,$BAD_OPT")
+if ! mount -t cifs "$TEST_DEV" "$MNT" -o "$opts_sloppy" >>$seqres.full 2>>$seqres.full; then
+    _fail "mount failed even with sloppy"
+fi
+
+if ! umount "$MNT" >>$seqres.full 2>&1; then
+    _fail "umount after sloppy mount failed"
+fi
+
+echo "Sloppy mount ignores unknown option OK"
+status=0
+exit
