@@ -1,0 +1,114 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: credit stress – flood many small opens/stats and ensure credits recover
+# Purpose: Exercise SMB2/3 credit allocation under burst of concurrent tiny ops
+# and verify the client neither exceeds negotiated Max credits nor leaves a
+# large number of Active credits outstanding after I/O completes.
+#
+# Strategy:
+#  1. Confirm /proc/fs/cifs/DebugData present; extract Max and Active baseline.
+#  2. Create a directory with N small files.
+#  3. Launch M background workers performing tight loops of stat on the files.
+#  4. While workers run, poll DebugData to record highest Active observed.
+#  5. After workers exit, wait a short settle interval and sample Active again.
+#  6. Pass if: highest_active <= max AND final_active <= baseline_active + TOL.
+#     (TOL gives room for in-flight ops finishing; default 4.)
+#  7. Skip if parsing fails or DebugData format unrecognized.
+#
+# Notes:
+#  - We intentionally avoid very long runtime; adjust ITER/WORKERS if needed.
+#  - This approximates stressing credits; actual compounding depends on kernel.
+#  - If multiple CIFS mounts exist, baseline/active may include other traffic.
+#    Test still valid: we only ensure we don't leak a large delta we created.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick stress
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ -r /proc/fs/cifs/DebugData ] || _notrun "no DebugData"
+
+# Optionally shrink credit window for quicker saturation using max_credits=
+# If user already mounted with max_credits we leave it. Otherwise, if root,
+# attempt a remount adding a small max_credits (default 64).
+TARGET_MAX_CRED=64
+mount_line=$(awk -v mnt="$TEST_DIR" '$2==mnt {print; exit}' /proc/mounts)
+[ -n "$mount_line" ] || _notrun "mount entry not found"
+orig_opts=$(echo "$mount_line" | awk '{print $4}')
+echo "$orig_opts" | grep -qw 'max_credits=' && HAS_MAX=1 || HAS_MAX=0
+if [ $HAS_MAX -eq 0 ] && [ "$(id -u)" = 0 ]; then
+    if mount -o remount,max_credits=$TARGET_MAX_CRED "$TEST_DIR" 2>>$seqres.full; then
+        _register_cleanup "mount -o remount,${orig_opts%%,*} '$TEST_DIR' >/dev/null 2>&1 || true"
+        echo "cifs150: remounted with max_credits=$TARGET_MAX_CRED" >> $seqres.full
+    else
+        echo "cifs150: remount with max_credits failed; proceeding with existing credits" >> $seqres.full
+    fi
+fi
+
+DBG=/proc/fs/cifs/DebugData
+
+parse_credits() {
+    # prints: max active (first occurrence)
+    awk '/Credits:/ {for(i=1;i<=NF;i++){if($i=="Max:") m=$(i+1); if($i=="Active:") a=$(i+1);} if(m!=""&&a!=""){gsub(/[,]/,"",m); gsub(/[,]/,"",a); print m, a; exit}}' $DBG 2>/dev/null
+}
+
+read max base_active < <(parse_credits)
+[ -n "$max" ] && [ -n "$base_active" ] || _notrun "cannot parse credits"
+case $max in *[!0-9]*|"") _notrun "bad max format" ;; esac
+case $base_active in *[!0-9]*|"") _notrun "bad active format" ;; esac
+
+W="$TEST_DIR/cifs150.$$"
+mkdir -p "$W" || _fail "mkdir work"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1"
+
+FILE_COUNT=64
+for i in $(seq -f %03g 1 $FILE_COUNT); do echo x > "$W/f$i" || _fail "seed $i"; done
+
+# Worker parameters
+WORKERS=32
+ITER=40   # each worker loops ITER times over all files -> ops = WORKERS*ITER*FILE_COUNT stats
+# If max credits are now small, bump iterations a bit to exercise recycling
+if [ $max -le 128 ]; then ITER=60; fi
+TOL=4
+
+worker() {
+    for j in $(seq 1 $ITER); do
+        for f in "$W"/f*; do stat -c %s "$f" >/dev/null 2>&1 || exit 1; done
+    done
+}
+
+pids=""
+for w in $(seq 1 $WORKERS); do worker & pids="$pids $!"; done
+
+highest=$base_active
+
+# Poll while any worker alive
+while :; do
+    alive=0
+    for p in $pids; do if kill -0 $p 2>/dev/null; then alive=1; break; fi; done
+    read mcur acur < <(parse_credits)
+    if [ -n "$acur" ] && [ "$acur" -gt "$highest" ]; then highest=$acur; fi
+    [ $alive -eq 1 ] || break
+    # short sleep; total polling time bounded by worker runtime
+    sleep 0.05
+done
+
+wait 2>/dev/null || true
+
+sleep 1  # settle
+read _ final_active < <(parse_credits)
+[ -n "$final_active" ] || _fail "final parse failed"
+
+echo "cifs150: max=$max base=$base_active highest=$highest final=$final_active" >> $seqres.full
+
+# Checks
+if [ "$highest" -gt "$max" ]; then _fail "observed active ($highest) > max ($max)"; fi
+if [ "$final_active" -gt $((base_active + TOL)) ]; then
+    _fail "final active ($final_active) > baseline ($base_active)+$TOL (possible leak)"
+fi
+
+echo "credit stress basic OK"
+status=0
+exit

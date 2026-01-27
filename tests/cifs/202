@@ -1,0 +1,256 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: concurrent locks and open/close latency across multiple mounts stay bounded
+#
+# Behavior under test:
+# - Mount the target share twice with identical options (M1/M2).
+# - Run contending fcntl(LOCK_EX) loops from both mounts, observing that each
+#   acquisition completes within a configurable latency threshold.
+# - Run concurrent open/read/close loops from both mounts and verify per-iteration
+#   wall clock latency also remains below a configurable threshold.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto stress
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+command -v python3 >/dev/null 2>&1 || _notrun "python3 required"
+
+LOCK_WORKERS=${CIFS202_LOCK_WORKERS:-8}
+LOCK_ITER=${CIFS202_LOCK_ITER:-200}
+LOCK_HOLD_MS=${CIFS202_LOCK_HOLD_MS:-5}
+LOCK_THRESHOLD_MS=${CIFS202_LOCK_THRESHOLD_MS:-3000}
+OPEN_WORKERS=${CIFS202_OPEN_WORKERS:-8}
+OPEN_ITER=${CIFS202_OPEN_ITER:-200}
+OPEN_THRESHOLD_MS=${CIFS202_OPEN_THRESHOLD_MS:-5000}
+OPEN_PAYLOAD_BYTES=${CIFS202_OPEN_PAYLOAD_BYTES:-65536}
+
+_require_positive_int() {
+    case "$2" in
+    ''|*[^0-9]*) _notrun "$1 must be integer" ;;
+    esac
+    [ "$2" -gt 0 ] || _notrun "$1 must be >0"
+}
+
+_require_nonneg_int() {
+    case "$2" in
+    ''|*[^0-9]*) _notrun "$1 must be integer" ;;
+    esac
+    [ "$2" -ge 0 ] || _notrun "$1 must be >=0"
+}
+
+_require_positive_int "CIFS202_LOCK_WORKERS" "$LOCK_WORKERS"
+_require_positive_int "CIFS202_LOCK_ITER" "$LOCK_ITER"
+_require_nonneg_int "CIFS202_LOCK_HOLD_MS" "$LOCK_HOLD_MS"
+_require_positive_int "CIFS202_LOCK_THRESHOLD_MS" "$LOCK_THRESHOLD_MS"
+_require_positive_int "CIFS202_OPEN_WORKERS" "$OPEN_WORKERS"
+_require_positive_int "CIFS202_OPEN_ITER" "$OPEN_ITER"
+_require_positive_int "CIFS202_OPEN_THRESHOLD_MS" "$OPEN_THRESHOLD_MS"
+_require_nonneg_int "CIFS202_OPEN_PAYLOAD_BYTES" "$OPEN_PAYLOAD_BYTES"
+
+M1=""; M2=""; SUBDIR=""
+_opts_wo_flag() {
+    echo "$1" | awk -F, '{ out=""; for (i=1; i<=NF; i++) { if ($i=="ro" || $i=="rw") continue; if (length(out)) out=out","$i; else out=$i } print out }'
+}
+
+_is_mounted() {
+    if command -v findmnt >/dev/null 2>&1; then
+        findmnt -rn -M "$1" >/dev/null 2>&1
+    else
+        grep -qs "[[:space:]]$1[[:space:]]" /proc/mounts
+    fi
+}
+
+_cleanup_202() {
+    if [ -n "$M1" ] && [ -n "$SUBDIR" ] && [ -d "$M1/$SUBDIR" ]; then
+        rm -rf "$M1/$SUBDIR" >/dev/null 2>&1 || true
+    fi
+    if [ -n "$M2" ] && [ -n "$SUBDIR" ] && [ -d "$M2/$SUBDIR" ]; then
+        rm -rf "$M2/$SUBDIR" >/dev/null 2>&1 || true
+    fi
+    for mp in "$M1" "$M2"; do
+        [ -n "$mp" ] || continue
+        if _is_mounted "$mp"; then
+            _do "umount -l '$mp'" >/dev/null 2>&1 || true
+        fi
+        rmdir "$mp" >/dev/null 2>&1 || true
+    done
+}
+_register_cleanup _cleanup_202
+
+MO=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+MO_RW=$(_opts_wo_flag "$MO")
+[ -n "$MO_RW" ] || MO_RW="rw"
+
+M1=$(mktemp -d /tmp/cifs202.m1.XXXXXX) || _fail "mktemp M1 failed"
+M2=$(mktemp -d /tmp/cifs202.m2.XXXXXX) || _fail "mktemp M2 failed"
+
+_do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO_RW'" || _fail "mount M1 failed"
+_do "mount -t cifs '$TEST_DEV' '$M2' -o '$MO_RW'" || _fail "mount M2 failed"
+
+SUBDIR="cifs202.$$"
+_do "mkdir -p '$M1/$SUBDIR'" || _fail "mkdir workdir failed"
+sleep 1
+[ -d "$M2/$SUBDIR" ] || _fail "workdir not visible via second mount"
+
+lock_file="$M1/$SUBDIR/lock.dat"
+open_file="$M1/$SUBDIR/open.dat"
+
+touch "$lock_file" || _fail "touch lock file failed"
+truncate -s "$OPEN_PAYLOAD_BYTES" "$lock_file" || _fail "truncate lock file failed"
+truncate -s "$OPEN_PAYLOAD_BYTES" "$open_file" || _fail "truncate open file failed"
+[ -f "$M2/$SUBDIR/lock.dat" ] || _fail "lock file not visible via second mount"
+[ -f "$M2/$SUBDIR/open.dat" ] || _fail "open file not visible via second mount"
+
+LOCK_PATHS="$M1/$SUBDIR/lock.dat:$M2/$SUBDIR/lock.dat"
+OPEN_PATHS="$M1/$SUBDIR/open.dat:$M2/$SUBDIR/open.dat"
+
+echo "--- cifs202 python workload" >>"$seqres.full"
+LOCK_WORKERS=$LOCK_WORKERS \
+LOCK_ITER=$LOCK_ITER \
+LOCK_HOLD_MS=$LOCK_HOLD_MS \
+LOCK_THRESHOLD_MS=$LOCK_THRESHOLD_MS \
+OPEN_WORKERS=$OPEN_WORKERS \
+OPEN_ITER=$OPEN_ITER \
+OPEN_THRESHOLD_MS=$OPEN_THRESHOLD_MS \
+OPEN_PAYLOAD_BYTES=$OPEN_PAYLOAD_BYTES \
+LOCK_PATHS="$LOCK_PATHS" \
+OPEN_PATHS="$OPEN_PATHS" \
+python3 - <<'PY' >>"$seqres.full" 2>&1 || _fail "lock/open workload failed"
+import os
+import sys
+import time
+import fcntl
+import multiprocessing as mp
+from queue import Empty
+
+LOCK_WORKERS = int(os.environ['LOCK_WORKERS'])
+LOCK_ITER = int(os.environ['LOCK_ITER'])
+LOCK_HOLD_S = float(os.environ['LOCK_HOLD_MS']) / 1000.0
+LOCK_THRESHOLD_MS = float(os.environ['LOCK_THRESHOLD_MS'])
+OPEN_WORKERS = int(os.environ['OPEN_WORKERS'])
+OPEN_ITER = int(os.environ['OPEN_ITER'])
+OPEN_THRESHOLD_MS = float(os.environ['OPEN_THRESHOLD_MS'])
+OPEN_PAYLOAD_BYTES = int(os.environ['OPEN_PAYLOAD_BYTES'])
+LOCK_PATHS = [p for p in os.environ['LOCK_PATHS'].split(':') if p]
+OPEN_PATHS = [p for p in os.environ['OPEN_PATHS'].split(':') if p]
+
+if len(LOCK_PATHS) == 0 or len(OPEN_PATHS) == 0:
+    print('CONFIG_FAIL no lock/open paths provided')
+    sys.exit(1)
+
+MIN_SLEEP = 0.0
+
+queue_type = mp.Queue
+
+
+def run_phase(kind, workers, worker_fn):
+    q = queue_type()
+    procs = [mp.Process(target=worker_fn, args=(i, q)) for i in range(workers)]
+    for p in procs:
+        p.start()
+    messages = []
+    failure = None
+    completed = 0
+    while completed < workers:
+        msg = q.get()
+        messages.append(msg)
+        completed += 1
+        if msg[0] != 'ok' and failure is None:
+            failure = msg
+    if failure is not None:
+        for p in procs:
+            if p.is_alive():
+                p.terminate()
+        for p in procs:
+            p.join()
+        while True:
+            try:
+                messages.append(q.get_nowait())
+            except Empty:
+                break
+        label, idx, path, detail = failure
+        if label == 'timeout':
+            print(f"{kind.upper()}_FAIL timeout idx={idx} path={path} ms={detail:.3f}")
+        else:
+            print(f"{kind.upper()}_FAIL error idx={idx} path={path} detail={detail}")
+        return False, None
+    for p in procs:
+        p.join()
+    max_metric = max((m[3] for m in messages), default=0.0)
+    print(f"{kind.upper()}_OK workers={workers} max_ms={max_metric:.3f}")
+    return True, max_metric
+
+
+def lock_worker(idx, q):
+    path = LOCK_PATHS[idx % len(LOCK_PATHS)]
+    max_wait = 0.0
+    try:
+        with open(path, 'r+b', buffering=0) as fh:
+            for _ in range(LOCK_ITER):
+                start = time.monotonic()
+                fcntl.flock(fh, fcntl.LOCK_EX)
+                wait_ms = (time.monotonic() - start) * 1000.0
+                if wait_ms > LOCK_THRESHOLD_MS:
+                    fcntl.flock(fh, fcntl.LOCK_UN)
+                    q.put(('timeout', idx, path, wait_ms))
+                    return
+                if wait_ms > max_wait:
+                    max_wait = wait_ms
+                if LOCK_HOLD_S > MIN_SLEEP:
+                    time.sleep(LOCK_HOLD_S)
+                fcntl.flock(fh, fcntl.LOCK_UN)
+        q.put(('ok', idx, path, max_wait))
+    except Exception as exc:
+        q.put(('error', idx, path, repr(exc)))
+
+
+def open_worker(idx, q):
+    path = OPEN_PATHS[idx % len(OPEN_PATHS)]
+    max_duration = 0.0
+    chunk = 262144
+    read_target = OPEN_PAYLOAD_BYTES
+    try:
+        for _ in range(OPEN_ITER):
+            start = time.monotonic()
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                remaining = read_target
+                while remaining > 0:
+                    buf = os.read(fd, chunk if remaining > chunk else remaining)
+                    if not buf:
+                        break
+                    remaining -= len(buf)
+            finally:
+                os.close(fd)
+            duration_ms = (time.monotonic() - start) * 1000.0
+            if duration_ms > OPEN_THRESHOLD_MS:
+                q.put(('timeout', idx, path, duration_ms))
+                return
+            if duration_ms > max_duration:
+                max_duration = duration_ms
+        q.put(('ok', idx, path, max_duration))
+    except Exception as exc:
+        q.put(('error', idx, path, repr(exc)))
+
+
+if __name__ == '__main__':
+    ok_lock, max_lock = run_phase('lock', LOCK_WORKERS, lock_worker)
+    if not ok_lock:
+        sys.exit(1)
+    ok_open, max_open = run_phase('open', OPEN_WORKERS, open_worker)
+    if not ok_open:
+        sys.exit(1)
+    print(f"SUMMARY lock_max_ms={max_lock:.3f} open_max_ms={max_open:.3f}")
+PY
+
+# Ensure remote directory cleanup without failing the workload.
+rm -rf "$M1/$SUBDIR" >/dev/null 2>&1 || true
+sync
+
+echo "cifs202: multi-mount lock/open stress OK"
+
+status=0
+exit

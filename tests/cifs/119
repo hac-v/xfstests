@@ -1,0 +1,78 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: SMB3 encryption (seal) with -o seal
+#
+# Behavior under test
+# - Mount with -o seal and verify DebugData indicates encryption on the session
+#   or tree. If no reliable indicator, skip.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+_host_from_unc() { echo "$1" | sed -E 's#^//([^/]+)/.*#\1#'; }
+_share_from_unc() { echo "$1" | sed -E 's#^//[^/]+/([^/]+).*#\1#'; }
+_unc_windows() { local h=$(_host_from_unc "$1"); local s=$(_share_from_unc "$1"); printf "\\\\%s\\%s" "$h" "$s"; }
+
+HOST=$(_host_from_unc "$TEST_DEV")
+UNCW=$(_unc_windows "$TEST_DEV")
+[ -n "$HOST" ] || _notrun "could not derive host"
+
+_dd_encryption_on_for_host()
+{
+    local host="$1" snap
+    snap=$(cat /proc/fs/cifs/DebugData 2>/dev/null) || return 2
+    echo "$snap" >> $seqres.full
+    echo "$snap" | awk -v HOST="$host" '
+        BEGIN { tl=tolower(HOST); in_block=0; target=0; enc=0; found=0 }
+        /^[[:space:]]*[0-9]+[)].*ConnectionId:/ {
+            if (in_block==1 && target==1) { print enc; found=1; exit }
+            in_block=1; target=0; enc=0; next
+        }
+        in_block==1 {
+            line=tolower($0)
+            if (index(line, tl)>0) target=1
+            if (target==1) {
+                # Look for common indicators: Encryption: on/yes/true; or cipher lines
+                if (index(line, "encryption")>0 && (index(line, "on")>0 || index(line, "yes")>0 || index(line, "true")>0 || index(line, "enabled")>0)) enc=1
+                # Some kernels append 'encrypted' to session/share lines instead of an 'Encryption:' token.
+                if (index(line, "encrypted")>0) enc=1
+                if (index(line, "cipher")>0 && (index(line, "gcm")>0 || index(line, "ccm")>0 || index(line, "aes")>0)) enc=1
+                if (index(line, "sealed")>0 && (index(line, "yes")>0 || index(line, "true")>0)) enc=1
+            }
+        }
+        END { if (found==0 && in_block==1 && target==1) print enc }
+    '
+}
+
+_register_cleanup "_test_unmount >/dev/null 2>&1; rm -rf \"$TEST_DIR/cifs119.$$.w\" >/dev/null 2>&1"
+
+_test_unmount > /dev/null 2>&1
+_do "_test_mount -o seal" || _fail "mount with -o seal failed"
+
+mkdir -p "$TEST_DIR/cifs119.$$.w" 2>>$seqres.full || true
+echo 1 > "$TEST_DIR/cifs119.$$.w/poke" 2>>$seqres.full || true
+
+tries=15
+state=""
+while [ $tries -gt 0 ]; do
+    state=$(_dd_encryption_on_for_host "$HOST")
+    [ -n "$state" ] && break
+    tries=$((tries-1)); sleep 0.2
+done
+
+[ -n "$state" ] || _notrun "DebugData lacks encryption state for $UNCW"
+
+if [ "$state" -eq 1 ]; then
+    echo "SMB encryption (seal) enabled OK"
+else
+    _notrun "server/share did not enable encryption for $UNCW (requested with -o seal)"
+fi
+
+status=0
+exit

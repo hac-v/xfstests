@@ -1,0 +1,128 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: out-of-space recovery mid-stream append
+#
+# Goal:
+#   Trigger ENOSPC during a large file append, free space from a secondary
+#   operation, then resume writing remaining bytes and verify final checksum.
+#
+# Strategy:
+#   1. Determine available free space and choose a target test file size
+#      (<=32MB and <=1/3 of free space) to keep runtime reasonable.
+#   2. Generate a random pattern file of target size; split into two halves.
+#   3. Write first half to remote test file.
+#   4. Consume nearly all remaining free space (leave ~512KB) with a filler
+#      file so that appending second half will hit ENOSPC.
+#   5. Attempt to append second half (expect non-zero rc, partial write).
+#   6. Delete filler file, compute remaining bytes, append missing tail.
+#   7. Verify remote size == target size and MD5 matches pattern file.
+#
+# Skip conditions:
+#   - Not CIFS / no TEST_DIR.
+#   - Insufficient free space (<16MB) to stage scenario.
+#   - Cannot compute free space or create pattern.
+#
+# Output: single success line; details in $seqres.full.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+line=$(df -Pk "$TEST_DIR" | awk 'NR==2') || _notrun "df failed"
+free_kb=$(echo "$line" | awk '{print $4}')
+[ -n "$free_kb" ] || _notrun "cannot parse free space"
+free_bytes=$((free_kb * 1024))
+[ "$free_bytes" -ge $((16*1024*1024)) ] || _notrun "free space <16MB"
+
+CAP=$((32*1024*1024))
+# target size <= 1/3 free space and CAP
+third=$((free_bytes/3))
+[ $third -gt 0 ] || _notrun "third free space zero"
+if [ $third -lt $CAP ]; then target_bytes=$third; else target_bytes=$CAP; fi
+# Align target to 1MB for simpler dd
+rem=$((target_bytes % 1048576))
+if [ $rem -ne 0 ]; then target_bytes=$((target_bytes - rem)); fi
+[ "$target_bytes" -ge $((8*1024*1024)) ] || _notrun "target <8MB"
+
+echo "cifs168: free_kb=$free_kb target_bytes=$target_bytes" >> $seqres.full
+
+pattern=$(mktemp /tmp/cifs168.pattern.XXXXXX)
+part1=$(mktemp /tmp/cifs168.part1.XXXXXX)
+part2=$(mktemp /tmp/cifs168.part2.XXXXXX)
+remote="$TEST_DIR/cifs168.remote.$$"
+filler="$TEST_DIR/cifs168.filler.$$"
+
+cleanup() { rm -f "$pattern" "$part1" "$part2" "$remote" "$filler" 2>/dev/null || true; }
+_register_cleanup cleanup
+
+# Generate pattern
+if ! head -c "$target_bytes" /dev/urandom > "$pattern" 2>>$seqres.full; then
+    _fail "generate pattern"
+fi
+half=$((target_bytes/2))
+if ! head -c "$half" "$pattern" > "$part1"; then _fail "split part1"; fi
+if ! tail -c $((target_bytes-half)) "$pattern" > "$part2"; then _fail "split part2"; fi
+pat_md5=$(md5sum "$pattern" | awk '{print $1}')
+[ -n "$pat_md5" ] || _fail "md5 pattern"
+
+echo "cifs168: pattern md5=$pat_md5" >> $seqres.full
+
+# Write first half
+if ! dd if="$part1" of="$remote" bs=1M conv=fsync status=none 2>>$seqres.full; then
+    _fail "write first half"
+fi
+
+# Compute free space again and create filler to force ENOSPC on second half
+line2=$(df -Pk "$TEST_DIR" | awk 'NR==2') || _notrun "df2 failed"
+free2_kb=$(echo "$line2" | awk '{print $4}')
+[ -n "$free2_kb" ] || _notrun "cannot parse free2"
+# Leave 512KB only
+leave_kb=512
+filler_kb=$((free2_kb - leave_kb))
+if [ $filler_kb -le 0 ]; then _notrun "not enough free space to force ENOSPC"; fi
+# If part2 smaller than leave space skip (no ENOSPC trigger)
+part2_kb=$(((target_bytes-half)/1024))
+if [ $part2_kb -le $leave_kb ]; then _notrun "cannot force ENOSPC (part2 <= leave space)"; fi
+
+# Create filler (best effort) may short-write if race; ignore small discrepancies
+( dd if=/dev/zero of="$filler" bs=1024 count=$filler_kb status=none 2>>$seqres.full || true )
+
+# Attempt append second half (expect failure ENOSPC)
+cat "$part2" >> "$remote" 2>>$seqres.full
+append_rc=$?
+cur_size=$(stat -c %s "$remote" 2>/dev/null || echo 0)
+
+if [ $append_rc -eq 0 ] && [ "$cur_size" -eq "$target_bytes" ]; then
+    # Did not hit ENOSPC; treat as skip to avoid false pass
+    _notrun "could not trigger ENOSPC (space sufficient)"
+fi
+
+if [ "$cur_size" -ge "$target_bytes" ]; then
+    _fail "unexpected size >= target after ENOSPC attempt cur=$cur_size target=$target_bytes"
+fi
+
+echo "cifs168: after ENOSPC attempt size=$cur_size rc=$append_rc" >> $seqres.full
+
+# Free space
+rm -f "$filler" || true
+sync
+
+missing=$((target_bytes - cur_size))
+
+# Append only missing bytes from part2 tail
+if ! tail -c "$missing" "$part2" >> "$remote" 2>>$seqres.full; then
+    _fail "append missing tail"
+fi
+
+final_size=$(stat -c %s "$remote" 2>/dev/null || echo 0)
+[ "$final_size" -eq "$target_bytes" ] || _fail "final size $final_size != target $target_bytes"
+remote_md5=$(md5sum "$remote" | awk '{print $1}')
+[ "$remote_md5" = "$pat_md5" ] || _fail "md5 mismatch remote=$remote_md5 local=$pat_md5"
+
+echo "cifs168: final md5=$remote_md5 size=$final_size" >> $seqres.full
+
+echo "Out-of-space recovery OK"
+status=0; exit

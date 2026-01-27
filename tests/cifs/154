@@ -1,0 +1,52 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: rasize/rsize/wsize negotiation
+# Verifies requested rasize=, rsize=, wsize= are honored or capped (not zero).
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ "$(id -u)" = 0 ] || _notrun "root remount required"
+
+mount_line=$(awk -v mnt="$TEST_DIR" '$2==mnt {print; exit}' /proc/mounts)
+[ -n "$mount_line" ] || _notrun "mount entry not found"
+orig_opts=$(echo "$mount_line" | awk '{print $4}')
+
+REQ_RASIZE=1048576
+REQ_RSIZE=65536
+REQ_WSIZE=65536
+
+if mount -o remount,rasize=$REQ_RASIZE,rsize=$REQ_RSIZE,wsize=$REQ_WSIZE "$TEST_DIR" 2>>$seqres.full; then
+  :
+else
+  _notrun "remount with sizes failed"
+fi
+_register_cleanup "mount -o remount,${orig_opts%%,*} '$TEST_DIR' >/dev/null 2>&1 || true"
+
+dbg=/proc/fs/cifs/DebugData
+[ -r $dbg ] || _notrun "no DebugData"
+
+actual_rsize=$(grep -m1 -i 'rsize' $dbg | sed -n 's/.*rsize:[[:space:]]*\([0-9]\+\).*/\1/p')
+actual_wsize=$(grep -m1 -i 'wsize' $dbg | sed -n 's/.*wsize:[[:space:]]*\([0-9]\+\).*/\1/p')
+actual_rasize=$(grep -m1 -i 'rasize' $dbg | sed -n 's/.*rasize:[[:space:]]*\([0-9]\+\).*/\1/p')
+
+[ -n "$actual_rsize" ] || _fail "missing rsize in DebugData"
+[ -n "$actual_wsize" ] || _fail "missing wsize in DebugData"
+[ -n "$actual_rasize" ] || _fail "missing rasize in DebugData"
+
+echo "cifs154: requested rasize=$REQ_RASIZE rsize=$REQ_RSIZE wsize=$REQ_WSIZE actual $actual_rasize/$actual_rsize/$actual_wsize" >> $seqres.full
+
+test_val() { # req actual
+  req=$1; act=$2; name=$3
+  [ "$act" -gt 0 ] || _fail "$name zero"
+  if [ "$act" -gt "$req" ]; then _fail "$name greater than requested ($act > $req)"; fi
+}
+test_val $REQ_RSIZE $actual_rsize rsize
+test_val $REQ_WSIZE $actual_wsize wsize
+test_val $REQ_RASIZE $actual_rasize rasize
+
+echo "rsize/wsize/rasize negotiation OK"
+status=0; exit

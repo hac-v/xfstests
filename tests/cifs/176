@@ -1,0 +1,113 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: SMB3 compression enabled + Stats update
+#
+# Behavior under test
+# - Mount with -o compress and verify DebugData reports compression enabled
+#   for our connection (skip if DebugData lacks a compression indicator).
+# - Perform write/read and confirm per-share Stats counters increment.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+_host_from_unc() { echo "$1" | sed -E 's#^//([^/]+)/.*#\1#'; }
+_share_from_unc() { echo "$1" | sed -E 's#^//[^/]+/([^/]+).*#\1#'; }
+_unc_windows() { local h=$(_host_from_unc "$1"); local s=$(_share_from_unc "$1"); printf "\\\\%s\\%s" "$h" "$s"; }
+
+HOST=$(_host_from_unc "$TEST_DEV")
+UNCW=$(_unc_windows "$TEST_DEV")
+[ -n "$HOST" ] || _notrun "could not derive host"
+
+_stats_for_unc() {
+    local unc="$1"; local tries=10; local delay=0.1; local snap
+    while [ $tries -gt 0 ]; do
+        snap=$(cat /proc/fs/cifs/Stats 2>/dev/null)
+        echo "$snap" >> $seqres.full
+        echo "$snap" | grep -Fq ") $unc" && break
+        tries=$((tries-1)); sleep $delay
+    done
+    echo "$snap" | awk -v UNC="$unc" '
+        BEGIN { inb=0; br=0; bw=0; rd=0; wr=0 }
+        /^[[:space:]]*[0-9]+\) / { inb = (index($0, UNC) > 0) ? 1 : 0; next }
+        inb==1 && NF==0 { inb=0 }
+        inb==1 {
+            if ($1=="Bytes" && $2=="read:" && $4=="Bytes" && $5=="written:") { br=$3; bw=$6 }
+            else if ($1=="Reads:") rd=$2
+            else if ($1=="Writes:") wr=$2
+        }
+        END { printf "%s %s %s %s\n", br, bw, rd, wr }
+    ' 2>> $seqres.full
+}
+
+_dd_compress_state_for_host()
+{
+    local host="$1" snap
+    snap=$(cat /proc/fs/cifs/DebugData 2>/dev/null) || return 2
+    echo "$snap" >> $seqres.full
+    echo "$snap" | awk -v HOST="$host" '
+        BEGIN { tl=tolower(HOST); in_block=0; target=0; state=""; found=0 }
+        /^[[:space:]]*[0-9]+[)].*ConnectionId:/ {
+            if (in_block==1 && target==1 && state!="") { print state; found=1; exit }
+            in_block=1; target=0; state=""; next
+        }
+        in_block==1 {
+            line=tolower($0)
+            if (index(line, tl)>0) target=1
+            if (target==1 && line ~ /compress/) {
+                if (line ~ /(enable|enabled|on|yes|true)/) state=1
+                else if (line ~ /(disable|disabled|off|no|false)/) state=0
+            }
+        }
+        END { if (found==0 && in_block==1 && target==1 && state!="") print state }
+    '
+}
+
+_register_cleanup "_test_unmount >/dev/null 2>&1; rm -f \"$TEST_DIR/.cifs176.$$\" >/dev/null 2>&1"
+
+_test_unmount > /dev/null 2>&1
+_do "_test_mount -o compress" || _notrun "mount with compress failed"
+
+FILE="$TEST_DIR/.cifs176.$$"
+
+read br0 bw0 rd0 wr0 < <(_stats_for_unc "$UNCW")
+
+dd if=/dev/zero of="$FILE" bs=4096 count=8 oflag=direct status=none || dd if=/dev/zero of="$FILE" bs=4096 count=8 status=none || _fail "write failed"
+
+tries=30
+while [ $tries -gt 0 ]; do
+    read br1 bw1 rd1 wr1 < <(_stats_for_unc "$UNCW")
+    dbw=0; dwr=0
+    [ -n "$bw1" ] && dbw=$((bw1 - bw0))
+    [ -n "$wr1" ] && dwr=$((wr1 - wr0))
+    [ $dbw -gt 0 ] || [ $dwr -ge 1 ] && break
+    tries=$((tries-1)); sleep 0.2
+done
+[ $tries -gt 0 ] || _notrun "CIFS Stats did not reflect write for $UNCW"
+
+dd if="$FILE" of=/dev/null bs=4096 count=4 iflag=direct status=none || dd if="$FILE" of=/dev/null bs=4096 count=4 status=none || _fail "read failed"
+
+tries=30
+while [ $tries -gt 0 ]; do
+    read br2 _bw rd2 _wr < <(_stats_for_unc "$UNCW")
+    dbr=0; drd=0
+    [ -n "$br2" ] && dbr=$((br2 - br0))
+    [ -n "$rd2" ] && drd=$((rd2 - rd0))
+    [ $dbr -gt 0 ] || [ $drd -ge 1 ] && break
+    tries=$((tries-1)); sleep 0.2
+done
+[ $tries -gt 0 ] || _notrun "CIFS Stats did not reflect read for $UNCW"
+
+state=$(_dd_compress_state_for_host "$HOST")
+[ -n "$state" ] || _notrun "DebugData lacks compression state for $UNCW"
+[ "$state" -eq 1 ] || _fail "compression not enabled for $UNCW"
+
+echo "SMB3 compression enabled and Stats updated OK"
+
+status=0
+exit

@@ -1,0 +1,35 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: uid/gid mount options set ownership on create
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+
+_register_cleanup "_test_unmount >/dev/null 2>&1"
+_test_unmount >/dev/null 2>&1
+
+UIDX=${qa_user_uid:-$(id -u)}
+GIDX=${qa_user_gid:-$(id -g)}
+
+BASE=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+BASE=$(echo "$BASE" | awk -F, '{out=""; for(i=1;i<=NF;i++){ if($i ~ /^uid=/ || $i ~ /^gid=/) continue; out=out (out?"," : "") $i } print out}')
+MO=$BASE; [ -n "$MO" ] && MO="$MO,uid=$UIDX,gid=$GIDX" || MO="uid=$UIDX,gid=$GIDX"
+
+M1=$(mktemp -d /tmp/cifs141.XXXXXX) || _fail "mktemp"
+_do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO'" || _fail "mount failed"
+
+SUB="cifs141.$$.d"; mkdir -p "$M1/$SUB" || _fail "mkdir"
+F="$M1/$SUB/f"
+echo x > "$F" || _fail "create"
+
+st=$(stat -c '%u:%g' "$F") || _fail "stat"
+[ "$st" = "$UIDX:$GIDX" ] || _fail "ownership mismatch: $st vs $UIDX:$GIDX"
+
+echo "uid/gid mount ownership mapping OK"
+
+status=0
+exit

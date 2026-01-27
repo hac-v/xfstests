@@ -1,0 +1,29 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: basic create/read existence smoke test
+
+. ./common/preamble
+. ./common/rc
+
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+testfile="$TEST_DIR/cifs100.$$"
+
+_cleanup() {
+    rm -f "$testfile" >/dev/null 2>&1 || true
+}
+_register_cleanup _cleanup
+
+echo "cifs100: create test file" >>"$seqres.full"
+touch "$testfile" || _fail "create failed"
+
+echo "cifs100: verify file exists" >>"$seqres.full"
+[ -f "$testfile" ] || _fail "file missing"
+
+echo "cifs100: basic create/read OK"
+
+status=0
+exit

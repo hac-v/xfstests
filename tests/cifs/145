@@ -1,0 +1,110 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: directory readdir resilience under induced disconnects
+#
+# Validates that listing a directory with many entries continues to return a
+# complete, consistent set of names even when the SMB TCP connection is killed
+# multiple times mid-sequence. The kernel client should transparently
+# reconnect and reissue remaining QueryDirectory requests without duplicates
+# or omissions.
+#
+# Strategy:
+# 1. Populate a test directory with N uniquely named files (deterministic list).
+# 2. Start iterative ls (or manual readdir via 'ls -1') capturing output.
+# 3. After every K files (observed lines read) force a disconnect using 'ss -K'
+#    (preferred) or iptables DROP fallback.
+# 4. After completion, sort the captured list and compare with expected list.
+# 5. Fail if any missing, duplicate, or extra entries.
+#
+# Notes:
+# - Uses a subshell with pipe so we can inject disconnects based on line count.
+# - If neither ss nor iptables available, skip.
+# - Keeps directory small enough for quick test but large enough to span
+#   multiple SMB QueryDirectory calls (>= 256 entries is typical). We use 600.
+#
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+command -v getent >/dev/null 2>&1 || _notrun "getent not available"
+if command -v ss >/dev/null 2>&1; then
+	DISCONNECT_METHOD=ss
+elif command -v iptables >/dev/null 2>&1; then
+	DISCONNECT_METHOD=iptables
+else
+	_notrun "need ss or iptables"
+fi
+
+_register_cleanup "_test_unmount >/dev/null 2>&1; rm -rf '$TEST_DIR/cifs145.$$' >/dev/null 2>&1"
+
+_test_unmount >/dev/null 2>&1
+_do "_test_mount" || _fail "mount failed"
+
+# Resolve server IP
+host=$(echo "$TEST_DEV" | sed -E 's#^//([^/]+)/.*#\1#')
+server_ip=$(getent hosts "$host" | awk '{print $1; exit}')
+[ -n "$server_ip" ] || _notrun "cannot resolve server IP"
+
+iptables_add_drop() { iptables -I OUTPUT -d "$server_ip" -j DROP 2>/dev/null || return 1; iptables -I INPUT -s "$server_ip" -j DROP 2>/dev/null || true; }
+iptables_remove_drop() { while iptables -D OUTPUT -d "$server_ip" -j DROP 2>/dev/null; do :; done; while iptables -D INPUT -s "$server_ip" -j DROP 2>/dev/null; do :; done; }
+ss_kill_conns() { ss -K dst "$server_ip" dport = :445 2>>$seqres.full || true; ss -K src "$server_ip" sport = :445 2>>$seqres.full || true; }
+[ "$DISCONNECT_METHOD" = "iptables" ] && _register_cleanup iptables_remove_drop
+
+W="$TEST_DIR/cifs145.$$"
+DIR="$W/listdir"
+mkdir -p "$DIR" || _fail "mkdir"
+
+TOTAL=600
+INJECT_EVERY=75   # kill after reading each 75th name
+EXPECTED=$(mktemp -t cifs145_expected.XXXXXX) || _fail "mktemp expected"
+ACTUAL=$(mktemp -t cifs145_actual.XXXXXX) || _fail "mktemp actual"
+_register_cleanup "rm -f '$EXPECTED' '$ACTUAL' >/dev/null 2>&1"
+
+# Populate predictable file set
+# Use zero-padded numbers so lexical order == numeric
+for i in $(seq -f %04g 1 $TOTAL); do echo x > "$DIR/file_$i" || _fail "seed $i"; echo "file_$i" >> "$EXPECTED"; done
+
+# Listing with induced disconnects: we use a while-read loop; each line triggers potential disconnect
+# Use LC_ALL=C to ensure stable sort order independent of locale
+LC_ALL=C ls -1 "$DIR" 2>/dev/null | (
+	set -o pipefail
+	count=0
+	while IFS= read -r line; do
+		count=$((count+1))
+		echo "$line" >> "$ACTUAL"
+		if [ $((count % INJECT_EVERY)) -eq 0 ]; then
+			if [ "$DISCONNECT_METHOD" = "ss" ]; then
+				echo "cifs145: disconnect after $count entries (ss)" >> $seqres.full
+				ss_kill_conns
+			else
+				echo "cifs145: disconnect window after $count entries (iptables)" >> $seqres.full
+				iptables_add_drop || echo "cifs145: add drop failed" >> $seqres.full
+				sleep 1
+				iptables_remove_drop
+			fi
+		fi
+	# small delay to give time for disconnect logic to act before next read	sleep 0.01
+	 done
+) || _fail "ls pipeline failed"
+
+# Sort and compare; we expect exactly the seeded set
+sort -u "$EXPECTED" -o "$EXPECTED"
+sort -u "$ACTUAL" -o "$ACTUAL"
+
+exp_count=$(wc -l < "$EXPECTED")
+act_count=$(wc -l < "$ACTUAL")
+if [ "$exp_count" -ne "$TOTAL" ]; then _fail "expected list truncated: $exp_count vs $TOTAL"; fi
+if [ "$act_count" -ne "$TOTAL" ]; then _fail "actual list count mismatch: $act_count vs $TOTAL"; fi
+if ! diff -u "$EXPECTED" "$ACTUAL" >> $seqres.full 2>&1; then
+	_fail "directory listing mismatch after reconnects"
+fi
+
+echo "readdir reconnect integrity OK"
+
+status=0
+exit

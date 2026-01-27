@@ -1,0 +1,53 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: retrans option basic verification
+# Fresh mount with retrans=N, read actual from DebugData (fallback: /proc/mounts),
+# log requested vs actual, enforce: actual >=1 and <=2x requested. Exact match
+# preferred; mismatch within bounds only notes to $seqres.full. Skip if value
+# not discoverable (older kernel). Output: single OK line; details in $seqres.full.
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ "$(id -u)" = 0 ] || _notrun "root remount required"
+
+mount_line=$(awk -v mnt="$TEST_DIR" '$2==mnt {print; exit}' /proc/mounts)
+orig_opts=$(echo "$mount_line" | awk '{print $4}')
+REQ_RETRANS=2
+
+base_opts=${MOUNT_OPTIONS#-o}
+_test_unmount >/dev/null 2>&1 || _notrun "cannot unmount test fs"
+if ! _do "_test_mount -o retrans=$REQ_RETRANS,$base_opts"; then
+	_notrun "mount with retrans failed"
+fi
+_register_cleanup "_test_unmount >/dev/null 2>&1; _do '_test_mount -o $base_opts' >/dev/null 2>&1 || true"
+
+dbg=/proc/fs/cifs/DebugData
+[ -r $dbg ] || _notrun "no DebugData"
+
+# Some kernels may present "retrans" on a line with other timing info; search all lines.
+actual=$(sed -n 's/.*[Rr]etrans:[[:space:]]*\([0-9]\+\).*/\1/p' $dbg | head -n1)
+if [ -z "$actual" ]; then
+	# Fallback: check current mount options for retrans= value
+	mline=$(awk -v mnt="$TEST_DIR" '$2==mnt {print; exit}' /proc/mounts)
+	mopts=$(echo "$mline" | awk '{print $4}')
+	alt=$(echo "$mopts" | sed -n 's/.*retrans=\([0-9]\+\).*/\1/p')
+	if [ -n "$alt" ]; then
+		actual=$alt
+		echo "cifs160: using mount option retrans=$actual (DebugData lacked field)" >> $seqres.full
+	else
+		echo "DebugData contents for diagnostics:" >> $seqres.full
+		grep -i retrans $dbg >> $seqres.full || true
+		echo "Mount opts: $mopts" >> $seqres.full
+		_notrun "no retrans field"
+	fi
+fi
+echo "cifs160: requested retrans=$REQ_RETRANS actual=$actual" >> $seqres.full
+if [ "$actual" -lt 1 ]; then _fail "retrans ($actual) invalid"; fi
+if [ "$actual" -gt $((REQ_RETRANS*2)) ]; then _fail "retrans ($actual) exceeds 2x requested"; fi
+if [ "$actual" -ne "$REQ_RETRANS" ]; then
+	echo "cifs160: note actual retrans differs from requested (tolerated)" >> $seqres.full
+fi
+echo "retrans option basic OK" 
+status=0; exit

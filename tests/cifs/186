@@ -1,0 +1,116 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: cache=strict vs cache=none coherency check
+#
+# Summary
+#   Mount the same share twice with different cache policies, modify a file
+#   through the cache=none mount, and confirm the strict cache eventually sees
+#   the change while cache=none gets it immediately. This mirrors workloads
+#   where administrators toggle metadata cache behavior and expect coherency.
+#
+# Phases
+#   1. Mount #1 with cache=strict and mount #2 with cache=none (automatic skip
+#      if cache=none is rejected by the helper).
+#   2. Seed a file via the strict mount.
+#   3. Overwrite the file via the cache=none mount.
+#   4. Read from both mounts: cache=none must report the new payload right away
+#      while cache=strict may need a cache drop/sleep to refresh.
+#   5. Fail if the strict side never observes the updated contents.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+MNT_STRICT=$(mktemp -d /tmp/cifs186.strict.XXXXXX) || _fail "mktemp"
+MNT_NONE=$(mktemp -d /tmp/cifs186.none.XXXXXX) || _fail "mktemp"
+
+cleanup()
+{
+    for mp in "$MNT_NONE" "$MNT_STRICT"; do
+        if mountpoint -q "$mp"; then
+            umount "$mp" >/dev/null 2>&1 || true
+        fi
+        rmdir "$mp" >/dev/null 2>&1 || true
+    done
+}
+_register_cleanup cleanup
+
+base_opts=${MOUNT_OPTIONS#-o}
+if [ -z "$base_opts" ]; then
+    base_opts=$(awk -v mnt="$TEST_DIR" '$2==mnt {print $4}' /proc/mounts)
+fi
+
+strip_cache() {
+    echo "$base_opts" | sed -E 's/(^|,)cache=[^,]*//g; s/,,/,/g; s/^,//; s/,$//'
+}
+
+join_opts() {
+    local extra="$1"
+    local stripped=$(strip_cache)
+    if [ -z "$stripped" ]; then
+        printf '%s' "$extra"
+    elif [ -z "$extra" ]; then
+        printf '%s' "$stripped"
+    else
+        printf '%s,%s' "$extra" "$stripped"
+    fi
+}
+
+opts_strict=$(join_opts "cache=strict")
+opts_none=$(join_opts "cache=none")
+
+err=$TMPDIR/cifs186.err
+
+if ! mount -t cifs "$TEST_DEV" "$MNT_STRICT" -o "$opts_strict" >$seqres.full 2>"$err"; then
+    cat "$err" >>$seqres.full
+    _notrun "cache=strict mount failed"
+fi
+
+err_none=$TMPDIR/cifs186_none.err
+if ! mount -t cifs "$TEST_DEV" "$MNT_NONE" -o "$opts_none" >$seqres.full 2>"$err_none"; then
+    umount "$MNT_STRICT" >/dev/null 2>&1 || true
+    rmdir "$MNT_STRICT" >/dev/null 2>&1 || true
+    if grep -qi "Invalid argument" "$err_none"; then
+        _notrun "cache=none unsupported"
+    fi
+    cat "$err_none" >>$seqres.full
+    _fail "cache=none mount failed"
+fi
+
+FILE="$MNT_STRICT/cifs186.txt"
+FILE_NONE="$MNT_NONE/cifs186.txt"
+
+printf 'STABLE1\n' >"$FILE" || _fail "seed write"
+cat "$FILE" >/dev/null || _fail "warm read"
+
+printf 'FRESH2\n' >"$FILE_NONE" || _fail "none write"
+sync
+
+strict_after=$(cat "$FILE")
+none_after=$(cat "$FILE_NONE")
+
+[ "$none_after" = "FRESH2" ] || _fail "cache=none did not see updated data"
+
+if [ "$strict_after" != "FRESH2" ]; then
+    echo "cifs186: strict mount still cached old data" >>$seqres.full
+    if [ -w /proc/sys/vm/drop_caches ]; then
+        echo 3 > /proc/sys/vm/drop_caches
+        sleep 1
+    else
+        sleep 2
+    fi
+    strict_after=$(cat "$FILE")
+fi
+
+[ "$strict_after" = "FRESH2" ] || _fail "strict mount failed to observe update"
+
+rm -f "$FILE" "$FILE_NONE" >/dev/null 2>&1 || true
+
+echo "cache=strict vs cache=none coherency OK"
+status=0
+exit

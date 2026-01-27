@@ -1,0 +1,73 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: SMB sparse/zero-data (punch hole) basic semantics
+#
+# Behavior under test
+# - Using fallocate --punch-hole --keep-size zeroes a region in the file
+#   (backed by SMB FSCTL_SET_ZERO_DATA / sparse handling).
+# - File size is unchanged; bytes inside the punched region read back as zeros,
+#   surrounding regions retain original data.
+#
+# Skip policy
+# - If fallocate is missing, skip.
+# - If the punch operation fails with EOPNOTSUPP/ENOTSUP/Operation not supported,
+#   skip (server/share does not support sparse/zero-data over SMB).
+#
+# Output
+# - Stable single success line; diagnostics go to $seqres.full.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v fallocate >/dev/null 2>&1 || _notrun "requires fallocate"
+
+_register_cleanup "_test_unmount >/dev/null 2>&1; rm -rf \"$TEST_DIR/cifs116.$$\" >/dev/null 2>&1"
+
+_test_unmount > /dev/null 2>&1
+_do "_test_mount" || _fail "mount failed"
+
+W="$TEST_DIR/cifs116.$$"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+size=$((1024*1024))    # 1 MiB
+off=$((256*1024))      # 256 KiB
+len=$((256*1024))      # 256 KiB
+
+# Create file filled with 'A' to distinguish from zeros
+yes A | head -c "$size" > "$W/f" 2>>$seqres.full || _fail "create patterned file failed"
+
+# Sanity: pre-hole region should be all 'A'
+pre_cnt=$(dd if="$W/f" bs=4096 count=1 skip=$(((off/4096)-1)) 2>>$seqres.full | tr -d 'A' | wc -c)
+[ "$pre_cnt" -eq 0 ] || _fail "pre-hole sample not uniform 'A'"
+
+# Punch hole (zero data) in the middle, keep size
+if ! fallocate --punch-hole --keep-size -o "$off" -l "$len" "$W/f" 2>"$W/err"; then
+    if grep -qiE 'not supported|EOPNOTSUPP|ENOTSUP|EINVAL' "$W/err"; then
+        _notrun "sparse/zero-data not supported on this server/share"
+    fi
+    _fail "fallocate punch-hole failed: $(cat \"$W/err\")"
+fi
+
+# Size must remain unchanged
+sz=$(stat -c %s "$W/f") || _fail "stat size failed"
+[ "$sz" -eq "$size" ] || _fail "size changed after punch: $sz"
+
+# Middle of the punched region should read as zeros (no non-zero bytes)
+mid_off=$((off + len/2))
+mid_nonzero=$(dd if="$W/f" bs=4096 count=1 skip=$((mid_off/4096)) 2>>$seqres.full | tr -d '\000' | wc -c)
+[ "$mid_nonzero" -eq 0 ] || _fail "punched sample not zeroed (non-zero bytes present)"
+
+# Post-hole region should still be 'A'
+post_cnt=$(dd if="$W/f" bs=4096 count=1 skip=$(((off+len)/4096)) 2>>$seqres.full | tr -d 'A' | wc -c)
+[ "$post_cnt" -eq 0 ] || _fail "post-hole sample altered unexpectedly"
+
+echo "sparse punch basic OK"
+
+status=0
+exit

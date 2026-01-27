@@ -1,0 +1,67 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: multichannel presence (skip if unsupported)
+# Fresh mount with -o multichannel; if server+client support it, expect >=2
+# allocated channels in DebugData OR >=2 TCP sockets to the server. If only
+# one channel/socket after retries, treat as not supported: SKIP (not fail).
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ -r /proc/fs/cifs/DebugData ] || _notrun "no DebugData"
+
+_host() { echo "$1" | sed -E 's#^//([^/]+)/.*#\1#'; }
+HOST=$(_host "$TEST_DEV")
+[ -n "$HOST" ] || _notrun "parse host failed"
+
+_register_cleanup "_test_unmount >/dev/null 2>&1"
+_test_unmount >/dev/null 2>&1 || true
+_do "_test_mount -o multichannel" || _notrun "mount with multichannel failed"
+
+echo 1 > "$TEST_DIR/.cifs162.$$" 2>/dev/null || true
+
+_dd_channels() {
+  awk -v h="$(echo $HOST | tr 'A-Z' 'a-z')" '
+    BEGIN{in=0;host=h;sum=0;printed=0;block=0}
+    /^[[:space:]]*[0-9]+[)].*ConnectionId:/ {in=1;sum=0;block=1;next}
+    in==1 {
+      l=tolower($0)
+      if ($1=="Server" && $2=="interfaces:") {iface=1;next}
+      if (iface==1 && $1=="Allocated" && $2=="channels:") {sum+=$3+0}
+      if (NF==0) { if (sum>0){print sum; printed=1}; in=0; iface=0; sum=0 }
+    }
+    END{ if (printed==0 && sum>0) print sum }
+  ' /proc/fs/cifs/DebugData 2>/dev/null | head -n1
+}
+
+_tcp_sockets() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -tanH 2>/dev/null | grep -E ':445|:139' | grep -F "$(getent ahostsv4 $HOST | awk '{print $1}' | head -n1)" | wc -l
+  else
+    netstat -tan 2>/dev/null | grep -E ':445|:139' | grep -F "$(getent ahostsv4 $HOST | awk '{print $1}' | head -n1)" | wc -l
+  fi
+}
+
+tries=25
+chan=0
+while [ $tries -gt 0 ]; do
+  chan=$(_dd_channels)
+  [ -n "$chan" ] || chan=0
+  echo "cifs162: DebugData channels=$chan tries=$tries" >> $seqres.full
+  [ "$chan" -ge 2 ] && break
+  sleep 0.2; tries=$((tries-1))
+done
+
+sockc=$(_tcp_sockets)
+echo "cifs162: socket_count=$sockc" >> $seqres.full
+
+if [ "$chan" -ge 2 ] || [ "$sockc" -ge 2 ]; then
+  echo "Multichannel present (>=2 channels or sockets) OK"
+  status=0; exit
+fi
+
+_notrun "multichannel not active (likely unsupported)"

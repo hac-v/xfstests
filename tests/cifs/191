@@ -1,0 +1,348 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: multichannel throughput versus single-channel baseline
+#
+# Summary
+#   Mount the same share twice – once forcing single-channel (nomultichannel)
+#   and once enabling multichannel – stream a sizable write workload through
+#   each, and ensure the multichannel mount achieves at least a configurable
+#   percentage more throughput. The test also checks that the client and
+#   server both advertise multichannel capability and that the DebugData entry
+#   reports multiple channels in use.
+#
+# Phases
+#   1. Verify prerequisites: CIFS FS type, root privileges, python3/gcc
+#      available, multichannel advertised in /proc/fs/cifs/DebugData.
+#   2. Mount baseline share with nomultichannel, run a parallel write helper,
+#      and record throughput and Stats counters.
+#   3. Mount the same share with multichannel, rerun the workload, and record
+#      throughput plus channel count from DebugData.
+#   4. Fail if multichannel does not activate (>1 channel) or if throughput
+#      improvement is below CIFS191_MIN_GAIN_PCT (default 5%).
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto stress
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ -r /proc/fs/cifs/DebugData ] || _notrun "DebugData unavailable"
+
+command -v python3 >/dev/null 2>&1 || _notrun "python3 required"
+command -v gcc >/dev/null 2>&1 || _notrun "gcc required"
+
+DEBUG_DATA=/proc/fs/cifs/DebugData
+if ! grep -q "MULTI_CHANNEL" "$DEBUG_DATA"; then
+    _notrun "CIFS kernel lacks multichannel support"
+fi
+
+host=$(echo "$TEST_DEV" | sed -n 's#^//\([^/]*\)/.*#\1#p')
+share=$(echo "$TEST_DEV" | sed -n 's#^//[^/]*/\([^/]*\).*#\1#p')
+[ -n "$host" ] || _notrun "parse host failed"
+[ -n "$share" ] || _notrun "parse share failed"
+
+share_pattern="\\\\$host\\$share"
+
+# Ensure the server advertises multichannel capability
+if ! awk -v host="$host" '/Server capabilities:/{cap=$0} tolower($0) ~ host {print cap}' "$DEBUG_DATA" | grep -qi "multi channel"; then
+    _notrun "server does not advertise multichannel capability"
+fi
+
+TOTAL_MB=${CIFS191_TOTAL_MB:-256}
+BLOCK_MB=${CIFS191_BLOCK_MB:-1}
+THREADS=${CIFS191_THREADS:-4}
+GAIN_PCT=${CIFS191_MIN_GAIN_PCT:-5}
+
+case "$TOTAL_MB" in ''|*[^0-9]*) _notrun "TOTAL_MB must be integer" ;; esac
+case "$BLOCK_MB" in ''|*[^0-9]*) _notrun "BLOCK_MB must be integer" ;; esac
+case "$THREADS" in ''|*[^0-9]*) _notrun "THREADS must be integer" ;; esac
+case "$GAIN_PCT" in ''|*[^0-9]*) _notrun "MIN_GAIN must be integer" ;; esac
+
+[ "$TOTAL_MB" -gt 0 ] || _notrun "TOTAL_MB must be >0"
+[ "$BLOCK_MB" -gt 0 ] || _notrun "BLOCK_MB must be >0"
+[ "$THREADS" -gt 0 ] || _notrun "THREADS must be >0"
+
+BLOCK_BYTES=$((BLOCK_MB * 1024 * 1024))
+TOTAL_BYTES=$((TOTAL_MB * 1024 * 1024))
+[ $((TOTAL_BYTES % BLOCK_BYTES)) -eq 0 ] || _notrun "TOTAL_MB must be multiple of BLOCK_MB"
+
+strip_multichannel() {
+    echo "$1" | sed -E 's/(^|,)no?multichannel//g; s/,,/,/g; s/^,//; s/,$//'
+}
+
+base_opts=${MOUNT_OPTIONS#-o}
+if [ -z "$base_opts" ]; then
+    base_opts=$(awk -v mnt="$TEST_DIR" '$2==mnt {print $4}' /proc/mounts)
+fi
+clean_opts=$(strip_multichannel "$base_opts")
+
+MNT_SINGLE=$(mktemp -d /tmp/cifs191.single.XXXXXX) || _fail "mktemp"
+MNT_MULTI=$(mktemp -d /tmp/cifs191.multi.XXXXXX) || _fail "mktemp"
+
+cleanup()
+{
+    for mp in "$MNT_MULTI" "$MNT_SINGLE"; do
+        if mountpoint -q "$mp"; then
+            umount "$mp" >/dev/null 2>&1 || true
+        fi
+        rmdir "$mp" >/dev/null 2>&1 || true
+    done
+    rm -f "$WRITER_BIN" "$WRITER_SRC" >/dev/null 2>&1 || true
+}
+_register_cleanup cleanup
+
+join_opts() {
+    local extra="$1"
+    if [ -z "$clean_opts" ]; then
+        printf '%s' "$extra"
+    elif [ -z "$extra" ]; then
+        printf '%s' "$clean_opts"
+    else
+        printf '%s,%s' "$extra" "$clean_opts"
+    fi
+}
+
+errfile=$TMPDIR/cifs191.err
+
+opts_single=$(join_opts "nomultichannel")
+if ! mount -t cifs "$TEST_DEV" "$MNT_SINGLE" -o "$opts_single" >$seqres.full 2>"$errfile"; then
+    if grep -qi "invalid argument" "$errfile"; then
+        _notrun "nomultichannel option unsupported"
+    fi
+    cat "$errfile" >>$seqres.full
+    _fail "single-channel mount failed"
+fi
+
+opts_multi=$(join_opts "multichannel")
+if ! mount -t cifs "$TEST_DEV" "$MNT_MULTI" -o "$opts_multi" >$seqres.full 2>"$errfile"; then
+    if grep -qi "invalid argument" "$errfile"; then
+        _notrun "multichannel option unsupported"
+    fi
+    cat "$errfile" >>$seqres.full
+    _fail "multichannel mount failed"
+fi
+
+WRITER_SRC=${TMPDIR}/cifs191_writer.c
+WRITER_BIN=${TMPDIR}/cifs191_writer
+
+cat >"$WRITER_SRC" <<'EOF'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+struct ctx {
+    int fd;
+    unsigned long long total;
+    unsigned long long chunk;
+    int threads;
+    int id;
+    unsigned char *buf;
+};
+
+static void *worker(void *arg)
+{
+    struct ctx *c = arg;
+    unsigned long long stride = (unsigned long long)c->chunk * (unsigned long long)c->threads;
+    for (unsigned long long off = (unsigned long long)c->id * c->chunk; off < c->total; off += stride) {
+        size_t to_write = c->chunk;
+        if (off + to_write > c->total)
+            to_write = c->total - off;
+        unsigned long long written = 0;
+        while (written < to_write) {
+            ssize_t rc = pwrite(c->fd, c->buf + written, to_write - written, off + written);
+            if (rc < 0) {
+                if (errno == EINTR)
+                    continue;
+                perror("pwrite");
+                pthread_exit((void*)1);
+            }
+            if (rc == 0) {
+                fprintf(stderr, "pwrite returned 0\n");
+                pthread_exit((void*)1);
+            }
+            written += (unsigned long long)rc;
+        }
+    }
+    return NULL;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc != 5) {
+        fprintf(stderr, "usage: %s <path> <total_bytes> <chunk_bytes> <threads>\n", argv[0]);
+        return 2;
+    }
+
+    const char *path = argv[1];
+    unsigned long long total = strtoull(argv[2], NULL, 10);
+    unsigned long long chunk = strtoull(argv[3], NULL, 10);
+    int threads = atoi(argv[4]);
+    if (total == 0 || chunk == 0 || threads <= 0) {
+        fprintf(stderr, "invalid parameters\n");
+        return 2;
+    }
+
+    int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0666);
+    if (fd < 0) {
+        perror("open");
+        return 1;
+    }
+
+    unsigned char *buf;
+    if (posix_memalign((void**)&buf, 4096, chunk) != 0) {
+        perror("posix_memalign");
+        close(fd);
+        return 1;
+    }
+    for (unsigned long long i = 0; i < chunk; i++)
+        buf[i] = (unsigned char)(i & 0xff);
+
+    pthread_t *tids = calloc(threads, sizeof(pthread_t));
+    struct ctx *ctxs = calloc(threads, sizeof(struct ctx));
+    if (!tids || !ctxs) {
+        fprintf(stderr, "oom\n");
+        free(buf);
+        close(fd);
+        return 1;
+    }
+
+    for (int i = 0; i < threads; i++) {
+        ctxs[i].fd = fd;
+        ctxs[i].total = total;
+        ctxs[i].chunk = chunk;
+        ctxs[i].threads = threads;
+        ctxs[i].id = i;
+        ctxs[i].buf = buf;
+        if (pthread_create(&tids[i], NULL, worker, &ctxs[i]) != 0) {
+            perror("pthread_create");
+            free(buf);
+            free(tids);
+            free(ctxs);
+            close(fd);
+            return 1;
+        }
+    }
+
+    int rc = 0;
+    for (int i = 0; i < threads; i++) {
+        void *ret;
+        pthread_join(tids[i], &ret);
+        if (ret)
+            rc = 1;
+    }
+
+    if (rc == 0) {
+        if (fsync(fd) != 0) {
+            perror("fsync");
+            rc = 1;
+        }
+    }
+
+    free(buf);
+    free(tids);
+    free(ctxs);
+    close(fd);
+    return rc;
+}
+EOF
+
+if ! gcc -O2 -Wall -pthread -o "$WRITER_BIN" "$WRITER_SRC" >>$seqres.full 2>&1; then
+    _fail "compile writer helper"
+fi
+
+drop_caches()
+{
+    if [ -w /proc/sys/vm/drop_caches ]; then
+        echo 3 > /proc/sys/vm/drop_caches
+    fi
+}
+
+run_workload()
+{
+    local mnt="$1"
+    local label="$2"
+    local outfile="$mnt/cifs191.dat"
+    rm -f "$outfile" >/dev/null 2>&1 || true
+    local start_ns end_ns duration throughput
+
+    start_ns=$(date +%s%N)
+    "$WRITER_BIN" "$outfile" "$TOTAL_BYTES" "$BLOCK_BYTES" "$THREADS" >>$seqres.full 2>&1 || return 1
+    end_ns=$(date +%s%N)
+
+    duration=$((end_ns - start_ns))
+    [ "$duration" -gt 0 ] || duration=1
+
+    throughput=$(CIFS191_SIZE=$TOTAL_BYTES CIFS191_DUR=$duration python3 - <<'PY'
+import os
+size = int(os.environ['CIFS191_SIZE'])
+dur = int(os.environ['CIFS191_DUR'])
+mbps = size / (dur / 1e9) / (1024 * 1024)
+print(f"{mbps:.2f}")
+PY
+)
+    [ -n "$throughput" ] || return 1
+
+    echo "cifs191: ${label}_duration_ns=$duration throughput_MBps=$throughput" >>$seqres.full
+
+    rm -f "$outfile" >/dev/null 2>&1 || true
+    echo "$throughput"
+}
+
+drop_caches
+baseline_speed=$(run_workload "$MNT_SINGLE" "single") || _fail "single-channel workload failed"
+
+drop_caches
+mc_speed=$(run_workload "$MNT_MULTI" "multichannel") || _fail "multichannel workload failed"
+
+channels=$(awk -v share="$share_pattern" '
+    /Shares:/ {inshare=0}
+    index($0, share) {inshare=1}
+    inshare && /Channels:/ {print $2; exit}
+' "$DEBUG_DATA")
+
+if [ -z "$channels" ] || [ "$channels" -lt 2 ]; then
+    echo "cifs191: channels reported=$channels" >>$seqres.full
+    _notrun "multichannel not established"
+fi
+
+GAIN_ABS=$(
+    CIFS191_BASE=$baseline_speed CIFS191_MC=$mc_speed python3 - <<'PY'
+import os
+base = float(os.environ['CIFS191_BASE'])
+mc = float(os.environ['CIFS191_MC'])
+if base <= 0:
+    print("0")
+else:
+    print(f"{((mc / base) - 1.0) * 100:.2f}")
+PY
+)
+
+echo "cifs191: baseline_MBps=$baseline_speed multichannel_MBps=$mc_speed gain_pct=$GAIN_ABS channels=$channels" >>$seqres.full
+
+cmp_result=$(CIFS191_BASE=$baseline_speed CIFS191_MC=$mc_speed python3 - <<'PY'
+import os
+base = float(os.environ['CIFS191_BASE'])
+mc = float(os.environ['CIFS191_MC'])
+if base <= 0:
+    print(0)
+else:
+    print(int((mc / base) * 100))
+PY
+)
+
+required=$((100 + GAIN_PCT))
+if [ "$cmp_result" -lt "$required" ]; then
+    _fail "multichannel throughput gain below ${GAIN_PCT}% (baseline=$baseline_speed MB/s multichannel=$mc_speed MB/s)"
+fi
+
+echo "Multichannel throughput improvement OK"
+status=0
+exit

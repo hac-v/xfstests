@@ -1,0 +1,104 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: tolerate random packet loss during sustained I/O
+#
+# Injects probabilistic packet loss on the SMB connection using iptables
+# statistics matches. Verifies large reads and writes continue to succeed while
+# loss is active, ensuring the client retries rather than failing requests.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto stress
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+command -v iptables >/dev/null 2>&1 || _notrun "iptables required"
+command -v timeout >/dev/null 2>&1 || _notrun "timeout required"
+command -v python3 >/dev/null 2>&1 || _notrun "python3 required"
+
+host=$(echo "$TEST_DEV" | sed -n 's#^//\([^/]*\)/.*#\1#p')
+[ -n "$host" ] || _notrun "parse host failed"
+server_ip=$(getent ahostsv4 "$host" | awk 'NR==1 {print $1}')
+[ -n "$server_ip" ] || _notrun "resolve server ip failed"
+
+DROP_PROB=${CIFS198_DROP_PROB:-0.30}
+READ_MB=${CIFS198_READ_MB:-16}
+WRITE_MB=${CIFS198_WRITE_MB:-8}
+READ_TIMEOUT=${CIFS198_READ_TIMEOUT:-90}
+WRITE_TIMEOUT=${CIFS198_WRITE_TIMEOUT:-90}
+
+case "$DROP_PROB" in
+''|*[^0-9.]* ) _notrun "DROP_PROB must be numeric" ;;
+esac
+
+WORKDIR="$TEST_DIR/cifs198.$$.work"
+mkdir -p "$WORKDIR" || _fail "mkdir workdir"
+_register_cleanup "rm -rf '$WORKDIR' >/dev/null 2>&1 || true"
+
+cleanup_drop()
+{
+    if [ -n "$DROP_APPLIED" ]; then
+        iptables -D OUTPUT -d "$server_ip" -p tcp --dport 445 -m statistic --mode random --probability "$DROP_PROB" -j DROP >/dev/null 2>&1 || true
+        iptables -D INPUT  -s "$server_ip" -p tcp --sport 445 -m statistic --mode random --probability "$DROP_PROB" -j DROP >/dev/null 2>&1 || true
+    fi
+}
+_register_cleanup cleanup_drop
+
+DATA_FILE="$WORKDIR/data.bin"
+READ_MB_ENV=$READ_MB DATA_FILE="$DATA_FILE" python3 - <<'PY'
+import os
+from pathlib import Path
+
+size_mb = int(os.environ['READ_MB_ENV'])
+path = Path(os.environ['DATA_FILE'])
+path.parent.mkdir(parents=True, exist_ok=True)
+
+remaining = size_mb * 1024 * 1024
+chunk = 1024 * 1024
+with path.open('wb', buffering=0) as fh:
+    while remaining > 0:
+        take = chunk if remaining >= chunk else remaining
+        fh.write(os.urandom(take))
+        remaining -= take
+PY
+
+sha_orig=$(sha256sum "$DATA_FILE" | awk '{print $1}')
+[ -n "$sha_orig" ] || _fail "hash generation failed"
+
+iptables -I OUTPUT -d "$server_ip" -p tcp --dport 445 -m statistic --mode random --probability "$DROP_PROB" -j DROP 2>>$seqres.full || _notrun "iptables statistic match unavailable"
+iptables -I INPUT  -s "$server_ip" -p tcp --sport 445 -m statistic --mode random --probability "$DROP_PROB" -j DROP 2>>$seqres.full || {
+    iptables -D OUTPUT -d "$server_ip" -p tcp --dport 445 -m statistic --mode random --probability "$DROP_PROB" -j DROP >/dev/null 2>&1
+    _notrun "iptables statistic match unavailable"
+}
+DROP_APPLIED=1
+
+read_start=$(date +%s%3N)
+if ! timeout "$READ_TIMEOUT" dd if="$DATA_FILE" of=/dev/null bs=1M count="$READ_MB" status=none 2>>$seqres.full; then
+    _fail "read under packet loss failed"
+fi
+read_end=$(date +%s%3N)
+read_ms=$((read_end - read_start))
+echo "cifs198: read ${READ_MB}MiB under loss completed in ${read_ms}ms" >>$seqres.full
+
+OUT_FILE="$WORKDIR/write.bin"
+write_start=$(date +%s%3N)
+if ! timeout "$WRITE_TIMEOUT" dd if=/dev/urandom of="$OUT_FILE" bs=1M count="$WRITE_MB" conv=fsync status=none 2>>$seqres.full; then
+    _fail "write under packet loss failed"
+fi
+write_end=$(date +%s%3N)
+write_ms=$((write_end - write_start))
+echo "cifs198: write ${WRITE_MB}MiB under loss completed in ${write_ms}ms" >>$seqres.full
+
+cleanup_drop
+unset DROP_APPLIED
+
+sha_post=$(sha256sum "$DATA_FILE" | awk '{print $1}')
+[ "$sha_post" = "$sha_orig" ] || _fail "data hash changed after loss test"
+
+timeout "$READ_TIMEOUT" dd if="$OUT_FILE" of=/dev/null bs=1M count="$WRITE_MB" status=none 2>>$seqres.full || _fail "post-loss read failed"
+
+echo "random packet loss tolerated without I/O failure"
+status=0
+exit

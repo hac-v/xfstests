@@ -1,0 +1,104 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: validate mount.cifs password limits
+#
+# Ensures mount.cifs accepts empty and 512-byte passwords (including the
+# alternate password2= secret) while rejecting inputs whose escaped
+# representation exceeds the helper's maximum length. Uses fake mounts to avoid
+# touching the live tree.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick metadata
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+case "$TEST_DEV" in
+//*) ;;
+*) _notrun "TEST_DEV must be UNC" ;;
+esac
+
+command -v mount.cifs >/dev/null 2>&1 || _notrun "mount.cifs unavailable"
+command -v python3 >/dev/null 2>&1 || _notrun "python3 required"
+
+MNT="$TEST_DIR/cifs194.mnt.$$"
+mkdir -p "$MNT" || _fail "mkdir mountpoint"
+_register_cleanup "rmdir '$MNT' >/dev/null 2>&1 || true"
+
+PASS512=$(python3 - <<'PY'
+print('p' * 512, end='')
+PY
+)
+PASS_OVER=$(python3 - <<'PY'
+print('p' * 400 + ',' * 150, end='')
+PY
+)
+PASS2_512=$(python3 - <<'PY'
+print('q' * 512, end='')
+PY
+)
+PASS2_OVER=$(python3 - <<'PY'
+print('q' * 400 + ',' * 150, end='')
+PY
+)
+
+BASEPASS="placeholder"
+
+logdir=${TMPDIR:-/tmp}/cifs194.$$
+mkdir -p "$logdir" || _fail "mkdir logdir"
+_register_cleanup "rm -rf '$logdir' >/dev/null 2>&1 || true"
+
+run_with_passes() {
+    local password=$1
+    local password2=$2
+    local logfile=$3
+    PASSWD="$password" PASSWD2="$password2" mount.cifs "$TEST_DEV" "$MNT" \
+        -f -o "user=testcase" >"$logfile" 2>&1
+    return $?
+}
+
+log_empty="$logdir/pass-empty.log"
+run_with_passes "" "" "$log_empty"
+rc=$?
+cat "$log_empty" >>$seqres.full 2>/dev/null || true
+[ $rc -eq 0 ] || _fail "mount.cifs rejected empty password"
+
+grep -q "mount error" "$log_empty" && _fail "empty password produced mount error"
+
+log512="$logdir/pass512.log"
+run_with_passes "$PASS512" "" "$log512"
+rc=$?
+cat "$log512" >>$seqres.full 2>/dev/null || true
+[ $rc -eq 0 ] || _fail "mount.cifs rejected 512-byte password"
+
+grep -q "Converted password too long" "$log512" && _fail "false overflow on 512-byte password"
+
+log_over="$logdir/pass_over.log"
+run_with_passes "$PASS_OVER" "" "$log_over"
+rc=$?
+cat "$log_over" >>$seqres.full 2>/dev/null || true
+[ $rc -ne 0 ] || _fail "mount.cifs accepted oversized password"
+
+grep -q "Converted password too long" "$log_over" || _fail "missing overflow error for oversized password"
+
+log_pass2_512="$logdir/pass2-512.log"
+run_with_passes "$BASEPASS" "$PASS2_512" "$log_pass2_512"
+rc=$?
+cat "$log_pass2_512" >>$seqres.full 2>/dev/null || true
+[ $rc -eq 0 ] || _fail "mount.cifs rejected 512-byte password2"
+
+grep -q "Converted password too long" "$log_pass2_512" && _fail "false overflow on 512-byte password2"
+
+log_pass2_over="$logdir/pass2-over.log"
+run_with_passes "$BASEPASS" "$PASS2_OVER" "$log_pass2_over"
+rc=$?
+cat "$log_pass2_over" >>$seqres.full 2>/dev/null || true
+[ $rc -ne 0 ] || _fail "mount.cifs accepted oversized password2"
+
+grep -q "Converted password too long" "$log_pass2_over" || _fail "missing overflow error for oversized password2"
+
+echo "mount.cifs password length handling OK"
+status=0
+exit

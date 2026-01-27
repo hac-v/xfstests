@@ -1,0 +1,71 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: verify read/write open share modes (shared vs non-shared access)
+#
+# Goal:
+#   Validate that when the first opener of a file excludes read or write sharing
+#   (O_EXCL share semantic via CIFS share modes) the second open respecting or
+#   violating those share permissions behaves as expected.
+#
+#   We approximate Windows share modes using posix opens combined with fcntl
+#   locks: CIFS maps POSIX open to SMB open with share flags derived from
+#   requested access + posix mount. This test checks practical client-visible
+#   semantics:
+#     1. First open for read-write; second open read-only should succeed.
+#     2. First open with advisory whole-file write lock; second open write
+#        should block/fail (EACCES/EAGAIN) while a read-only open still succeeds.
+#     3. After releasing the lock, second write open succeeds.
+#
+# Skip: if flock/fcntl locking unsupported or mount lacks 'posix' or server
+#       reports no oplock/lease capability (best-effort detection).
+#
+# Output: single success line. Diagnostics in $seqres.full.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+TESTFILE=$TEST_DIR/cifs_sharemode_163.$$.
+rm -f "$TESTFILE" 2>/dev/null || true
+
+echo "data" > "$TESTFILE" || _fail "create test file"
+
+# 1. Baseline: rw + ro open concurrently
+exec 3<> "$TESTFILE" || _fail "open fd3 rw"
+exec 4< "$TESTFILE" || _fail "open fd4 ro"
+echo "cifs163: baseline rw+ro open OK" >> $seqres.full
+
+# 2. Simulate non-shared write by taking an fcntl write lock across whole file
+python3 - <<'EOF' || _fail "python lock helper failed"
+import fcntl, sys
+with open(sys.argv[1], 'r+') as f:
+    fcntl.flock(f.fileno(), fcntl.LOCK_EX|fcntl.LOCK_NB)
+    print('LOCKED')
+EOF "$TESTFILE" | grep -q LOCKED || _fail "failed to lock file"
+echo "cifs163: acquired exclusive flock" >> $seqres.full
+
+# Attempt another writer (should fail quickly). We use a subshell to capture rc.
+( exec 5>>"$TESTFILE" ) 2>/dev/null && writer_rc=$? || writer_rc=$?
+if [ "$writer_rc" -eq 0 ]; then
+  echo "cifs163: unexpected second writer success under lock" >> $seqres.full
+  _fail "second write open unexpectedly succeeded"
+fi
+
+echo "cifs163: second writer correctly blocked rc=$writer_rc" >> $seqres.full
+
+# Read-only open should still work under an exclusive flock
+exec 6< "$TESTFILE" || _fail "ro open under lock failed"
+echo "cifs163: ro open under flock OK" >> $seqres.full
+
+# Release locks by closing descriptor used for flock (python released). Nothing to do.
+# Try writer again expected success now.
+( exec 7>>"$TESTFILE" ) 2>/dev/null && writer2_rc=$? || writer2_rc=$?
+[ "$writer2_rc" -eq 0 ] || _fail "writer after lock release failed rc=$writer2_rc"
+
+echo "cifs163: writer after lock release OK" >> $seqres.full
+
+echo "file open share mode semantics OK"
+status=0; exit

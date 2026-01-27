@@ -1,14 +1,18 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0
+# CIFS: mfsymlinks enables unix-like symlink emulation
+
+. ./common/preamble
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
 #
-# CIFS: nocase/ignorecase enables case-insensitive path name matching
+# CIFS: mapchars allows special characters in filenames (client-side mapping)
 #
 # What this test validates
-# - With -o nocase, lookup succeeds regardless of path case variations.
-# - Creating the same pathname with different case fails with EEXIST.
-#
-# Preconditions
-# - FSTYP=cifs; server and kernel must support nocase (skip otherwise).
+# - With -o mapchars, creating files containing characters typically forbidden on
+#   Windows (e.g., : * ? < > |) succeeds and can be read back via the client.
+# - Without mapchars, such creations may fail; this test focuses on the mapchars
+#   success path and skips if unsupported by the server.
 
 . ./common/preamble
 . ./common/rc
@@ -20,59 +24,28 @@ _begin_fstest auto quick
 _register_cleanup "_test_unmount >/dev/null 2>&1"
 _test_unmount >/dev/null 2>&1
 
-# Build mount options with nocase (ignorecase synonym) and ensure no explicit ro/rw flags clash
 BASE=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
-BASE=$(echo "$BASE" | awk -F, '{out=""; for(i=1;i<=NF;i++){ if($i=="nocase"||$i=="ignorecase"||$i=="ro"||$i=="rw") continue; out=out (out?"," : "") $i } print out}')
-MO=$BASE; [ -n "$MO" ] && MO="$MO,nocase" || MO="nocase"
+# Remove any pre-existing mapchars to avoid duplicates, then append
+MO=$(echo "$BASE" | awk -F, '{out=""; for(i=1;i<=NF;i++){ if($i=="mapchars") continue; out=out (out?"," : "") $i } print out}')
+[ -n "$MO" ] && MO="$MO,mapchars" || MO="mapchars"
 
-MNT=$(mktemp -d /tmp/cifs140.nocase.XXXXXX) || _fail "mktemp failed"
-_do "mount -t cifs '$TEST_DEV' '$MNT' -o '$MO'" || _notrun "nocase not supported"
+MNT=$(mktemp -d /tmp/cifs140.map.XXXXXX) || _fail "mktemp"
+_do "mount -t cifs '$TEST_DEV' '$MNT' -o '$MO'" || _notrun "mapchars not supported"
 
 SUB="cifs140.$$.d"; mkdir -p "$MNT/$SUB" || _fail "mkdir"
-Upper="$MNT/$SUB/CaseFile.txt"
-Lower="$MNT/$SUB/casefile.txt"
-Mixed="$MNT/$SUB/CASEFILE.TXT"
 
-# Create initial file with a mixed-case name
-echo "Hello" > "$Upper" || _fail "create Upper failed"
+# Filename with special characters; quote to avoid shell globbing
+NAME="a:star*ques?lt<gt>|pipe.txt"
+PATHNAME="$MNT/$SUB/$NAME"
 
-# Lookup variants should succeed under nocase
-for P in "$Lower" "$Mixed"; do
-	cat "$P" >/dev/null 2>&1 || _notrun "server does not honor nocase lookups"
-done
+echo "hello-mapchars" > "$PATHNAME" 2>>$seqres.full || _notrun "server refused special-char filename with mapchars"
 
-# Ensure content is identical via each path
-h1=$(sha1sum "$Upper" | awk '{print $1}')
-h2=$(sha1sum "$Lower" | awk '{print $1}')
-h3=$(sha1sum "$Mixed" | awk '{print $1}')
-[ "$h1" = "$h2" ] && [ "$h1" = "$h3" ] || _fail "content mismatch across case variants"
+# Verify the entry is visible with the same name and content is readable
+ls -1 "$MNT/$SUB" | grep -Fx -- "$NAME" >/dev/null || _fail "created file not listed as expected name"
+content=$(cat "$PATHNAME") || _fail "read back content failed"
+[ "$content" = "hello-mapchars" ] || _fail "content mismatch: '$content'"
 
-# Creating the same pathname differing only in case should fail with EEXIST
-out=$(python3 - <<'PY' "$Mixed"
-import os, sys, errno
-p=sys.argv[1]
-flags=os.O_WRONLY|os.O_CREAT|os.O_EXCL
-try:
-	fd=os.open(p, flags, 0o644)
-	os.close(fd)
-	print('CREATED')
-	sys.exit(0)
-except OSError as e:
-	if e.errno==errno.EEXIST:
-		print('EEXIST')
-		sys.exit(2)
-	print('ERROR', e.errno)
-	sys.exit(1)
-PY
-)
-
-case "$out" in
-  EEXIST) : ;; # expected
-  CREATED) _fail "able to create duplicate by case variant under nocase" ;;
-  *) _notrun "nocase create semantics not enforced (out=$out)" ;;
-esac
-
-echo "nocase case-insensitive lookup and EEXIST semantics OK"
+echo "mapchars special-character filename OK"
 
 status=0
 exit

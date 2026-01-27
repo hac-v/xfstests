@@ -1,0 +1,61 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: open downgrade analog via advisory flock (share mode simulation)
+#
+# Concept:
+#   SMB share mode downgrade is not directly user-space controllable; we
+#   approximate by adding an exclusive advisory flock after initial opens
+#   and verifying an existing reader continues unaffected.
+#
+# Steps:
+#   1. Primary mount: create file, open RW (writer1), write pattern.
+#   2. Secondary mount: open file READ (reader).
+#   3. Primary adds exclusive flock to writer1 (simulated "downgrade")
+#   4. Secondary performs read again; expect success.
+#   5. Optional: attempt second writer on secondary; expect success (deny-none scenario) – absence of failure indicates no regression.
+#
+# Skip if any basic requirement missing.
+# Output: single success line.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+# Secondary mount
+MNT2=$(mktemp -d /tmp/cifs173.sec.XXXXXX)
+sec_opts=${MOUNT_OPTIONS#-o}
+[ -z "$sec_opts" ] && sec_opts=$(awk -v mnt="$TEST_DIR" '$2==mnt {print $4}' /proc/mounts)
+if ! mount -t cifs "$TEST_DEV" "$MNT2" -o "$sec_opts" 2>>$seqres.full; then
+    rmdir "$MNT2"; _notrun "secondary mount failed"
+fi
+_register_cleanup "umount $MNT2 >/dev/null 2>&1 || true; rmdir $MNT2 >/dev/null 2>&1 || true"
+
+F="$TEST_DIR/cifs173.file"
+SF="$MNT2/cifs173.file"
+: > "$F" || _fail "create file"
+echo 'alpha' >> "$F" || _fail "seed write"
+
+# Open writer1
+exec {wfd}>> "$F" || _fail "open writer"
+printf 'beta' >&$wfd || _fail "append writer"
+
+# Reader on secondary
+read1=$(cat "$SF" 2>>$seqres.full) || _fail "initial read"
+
+# Apply exclusive flock
+if ! flock -x $wfd true 2>>$seqres.full; then
+    _notrun "flock unsupported"
+fi
+
+# Reader should still succeed
+read2=$(cat "$SF" 2>>$seqres.full) || _fail "read after flock"
+echo "cifs173: read2=$read2" >> $seqres.full
+
+# Attempt second writer from secondary (should not fail under typical deny-none)
+echo 'gamma' >> "$SF" 2>>$seqres.full || true
+
+echo "Open downgrade analog OK"
+status=0; exit

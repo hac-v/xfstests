@@ -1,0 +1,104 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: exec/noexec transitions enforced
+#
+# Validates that remounting with noexec prevents script execution and that
+# remounting back with exec re-allows it.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+
+mount_line=$(awk -v mnt="$TEST_DIR" '$2==mnt {print; exit}' /proc/mounts)
+[ -n "$mount_line" ] || _notrun "mount entry not found"
+orig_opts=$(echo "$mount_line" | awk '{print $4}')
+
+has_flag() {
+    echo "$1" | tr ',' '\n' | grep -qx "$2"
+}
+
+strip_flag() {
+    echo "$1" | awk -v flag="$2" -F, '{out=""; for(i=1;i<=NF;i++){if($i==flag || $i=="") continue; if(length(out)) out=out","$i; else out=$i;} print out}'
+}
+
+append_flag() {
+    local base="$1"
+    local flag="$2"
+    if [ -z "$base" ]; then
+        printf '%s' "$flag"
+    else
+        printf '%s,%s' "$base" "$flag"
+    fi
+}
+
+orig_has_noexec=0
+has_flag "$orig_opts" "noexec" && orig_has_noexec=1
+orig_has_exec=0
+has_flag "$orig_opts" "exec" && orig_has_exec=1
+
+if [ $orig_has_noexec -eq 1 ]; then
+    exec_opts=$(append_flag "$(strip_flag "$orig_opts" "noexec")" "exec")
+    noexec_opts="$orig_opts"
+else
+    if [ $orig_has_exec -eq 1 ]; then
+        exec_opts="$orig_opts"
+    else
+        exec_opts=$(append_flag "$orig_opts" "exec")
+    fi
+    noexec_opts=$(append_flag "$(strip_flag "$orig_opts" "exec")" "noexec")
+fi
+
+echo "cifs196: orig=$orig_opts exec=$exec_opts noexec=$noexec_opts" >>$seqres.full
+
+restore_exec() {
+    mount -o "remount,$orig_opts" "$TEST_DIR" >/dev/null 2>&1 || true
+}
+_register_cleanup restore_exec
+
+WORK="$TEST_DIR/cifs196.$$"
+mkdir -p "$WORK" || _fail "mkdir workdir"
+_register_cleanup "rm -rf '$WORK' >/dev/null 2>&1 || true"
+
+SCRIPT="$WORK/run-me.sh"
+cat >"$SCRIPT" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod +x "$SCRIPT" || _fail "chmod script"
+
+# Ensure script runs at least once under exec-capable mount.
+if ! mount -o remount,"$exec_opts" "$TEST_DIR" >>$seqres.full 2>&1; then
+    _notrun "unable to remount with exec"
+fi
+
+if ! "$SCRIPT"; then
+    _notrun "script execution prohibited even with exec"
+fi
+
+if ! mount -o remount,"$noexec_opts" "$TEST_DIR" >>$seqres.full 2>&1; then
+    _notrun "remount noexec unsupported"
+fi
+
+if "$SCRIPT" 2>/tmp/cifs196.err; then
+    cat /tmp/cifs196.err >>$seqres.full 2>/dev/null || true
+    rm -f /tmp/cifs196.err
+    _fail "script unexpectedly ran under noexec"
+fi
+rm -f /tmp/cifs196.err
+
+if ! mount -o remount,"$exec_opts" "$TEST_DIR" >>$seqres.full 2>&1; then
+    _fail "remount exec failed"
+fi
+
+if ! "$SCRIPT"; then
+    _fail "script failed after restoring exec"
+fi
+
+echo "noexec blocks binaries, exec restores"
+status=0
+exit

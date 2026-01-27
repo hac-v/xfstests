@@ -1,0 +1,56 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: change notify via CIFS_IOC_NOTIFY_INFO ioctl (single create event)
+# Flow: arm notify on empty dir -> create file -> ioctl returns -> validate non-zero data.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+command -v python3 >/dev/null 2>&1 || _notrun "python3 required"
+
+_register_cleanup "_test_unmount >/dev/null 2>&1; rm -rf '$TEST_DIR/cifs147.$$' >/dev/null 2>&1; rm -f '$OUT' >/dev/null 2>&1"
+
+_test_unmount >/dev/null 2>&1
+_do "_test_mount" || _fail "mount failed"
+python3 - <<'PYEOF' "$W/watch" > "$OUT" 2>>$seqres.full &
+import os, sys, fcntl, struct
+REQ = 0xc009cf0b
+try:
+	fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)
+except OSError as e:
+	print(f"IOCTL_ERROR {e.errno}"); sys.exit(0)
+buflen = 4096
+fmt = '<IBI'
+hdrsz = struct.calcsize(fmt)
+blob = bytearray(hdrsz + buflen)
+struct.pack_into(fmt, blob, 0, 0x00000FFF, 0, buflen)
+try:
+	fcntl.ioctl(fd, REQ, blob, True)
+except OSError as e:
+	print(f"IOCTL_ERROR {e.errno}"); os.close(fd); sys.exit(0)
+_, _, ret = struct.unpack_from(fmt, blob, 0)
+print(f"NOTIFY_OK {ret}")
+os.close(fd)
+PYEOF
+HPID=$!
+sleep 1
+echo test > "$W/watch/notify_target" || _fail "create file"
+sync || true
+for i in $(seq 1 150); do if ! kill -0 $HPID 2>/dev/null; then break; fi; sleep 0.1; done
+wait $HPID 2>/dev/null || true
+cat "$OUT" >> $seqres.full
+if grep -q '^IOCTL_ERROR ' "$OUT"; then
+	errno=$(sed -n 's/^IOCTL_ERROR \([0-9][0-9]*\).*/\1/p' "$OUT")
+	case "$errno" in 25|38|95) _notrun "notify ioctl not supported (errno $errno)" ;; esac
+	_fail "notify ioctl failed errno $errno"
+fi
+grep -q '^NOTIFY_OK ' "$OUT" || _fail "missing NOTIFY_OK"
+len=$(sed -n 's/^NOTIFY_OK \([0-9][0-9]*\).*/\1/p' "$OUT")
+[ -n "$len" ] && [ "$len" -gt 0 ] || _fail "invalid length"
+echo "change notify ioctl basic OK"
+status=0
+exit

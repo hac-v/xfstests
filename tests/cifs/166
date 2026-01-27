@@ -1,0 +1,109 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: lease break storm (many RWH file leases invalidated by remote writes/renames)
+#
+# Goal:
+#   Open a large set of files on the primary mount to obtain leases, then have a
+#   secondary mount sequentially write and rename each file, forcing lease
+#   breaks. Verify that all primary-side cached states are updated (file sizes
+#   reflect remote writes) within a bounded retry window.
+#
+# Notes:
+#   * We default to 200 files for runtime; set CIFS_LEASE_STORM_FILES=1000 to use 1K.
+#   * We require leasing capability (bit1 of server capabilities).
+#   * actimeo=0 used to minimize attribute caching so lease breaks drive change.
+#
+# Output: single success line. Diagnostics appended to $seqres.full.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto stress
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ -r /proc/fs/cifs/DebugData ] || _notrun "no DebugData"
+
+# Derive host and check leasing capability (bit1 = 0x2) from capabilities line.
+host=$(echo "$TEST_DEV" | sed -E 's#^//([^/]+)/.*#\1#')
+[ -n "$host" ] || _notrun "parse host failed"
+cap_line=$(awk -v h="$host" 'tolower($0) ~ h {t=1} t && /Server capabilities:/ {print; exit}' /proc/fs/cifs/DebugData)
+[ -n "$cap_line" ] || _notrun "no capabilities line"
+cap_hex=$(echo "$cap_line" | sed -n 's/.*Server capabilities:[[:space:]]*0x\([0-9a-fA-F]\+\).*/\1/p')
+[ -n "$cap_hex" ] || _notrun "parse caps failed"
+cap_val=$((0x$cap_hex))
+if [ $((cap_val & 0x2)) -eq 0 ]; then _notrun "leasing unsupported"; fi
+
+echo "cifs166: server capabilities=0x$cap_hex (leasing OK)" >> $seqres.full
+
+# Remount primary with actimeo=0 to reduce caching influence.
+mount_line=$(awk -v mnt="$TEST_DIR" '$2==mnt {print; exit}' /proc/mounts)
+[ -n "$mount_line" ] || _notrun "mount entry not found"
+base_opts=${MOUNT_OPTIONS#-o}
+[ -z "$base_opts" ] && base_opts=$(echo "$mount_line" | awk '{print $4}')
+_test_unmount >/dev/null 2>&1 || _notrun "cannot unmount"
+_do "_test_mount -o actimeo=0,$base_opts" || _fail "remount actimeo=0 failed"
+
+# Secondary mount.
+MNT2=$(mktemp -d /tmp/cifs166.sec.XXXXXX)
+sec_opts="actimeo=0,$base_opts"
+if ! mount -t cifs "$TEST_DEV" "$MNT2" -o "$sec_opts" 2>>$seqres.full; then
+    rmdir "$MNT2"; _notrun "secondary mount failed"
+fi
+_register_cleanup "_test_unmount >/dev/null 2>&1; mount -t cifs $TEST_DEV $TEST_DIR -o $base_opts >/dev/null 2>&1 || true; umount $MNT2 >/dev/null 2>&1 || true; rmdir $MNT2 >/dev/null 2>&1 || true"
+
+NUM=${CIFS_LEASE_STORM_FILES:-200}
+prim_dir="$TEST_DIR/cifs166.dir"
+sec_dir="$MNT2/cifs166.dir"
+rm -rf "$prim_dir" "$sec_dir" 2>/dev/null || true
+mkdir -p "$prim_dir" || _fail "mkdir primary"
+mkdir -p "$sec_dir" || _fail "mkdir secondary"
+
+echo "cifs166: creating $NUM files" >> $seqres.full
+for i in $(seq 1 $NUM); do
+    : > "$prim_dir/f$i" || _fail "create f$i"
+done
+
+# Open all on primary to get leases.
+for i in $(seq 1 $NUM); do
+    eval "exec {fd}<> \"$prim_dir/f$i\"" || _fail "open f$i"
+    # Record mapping for debug
+    echo "cifs166: opened f$i fd=$fd" >> $seqres.full
+done
+
+# Secondary modifications: write marker and rename then rename back.
+echo "cifs166: secondary modifying files" >> $seqres.full
+for i in $(seq 1 $NUM); do
+    echo "X$i" >> "$sec_dir/f$i" || _fail "write sec f$i"
+    mv "$sec_dir/f$i" "$sec_dir/f$i.r" || _fail "rename f$i -> f$i.r"
+    mv "$sec_dir/f$i.r" "$sec_dir/f$i" || _fail "rename back f$i"
+    # Light delay every 100 files to allow break processing
+    if [ $((i % 100)) -eq 0 ]; then sleep 0.1; fi
+done
+
+# Verification: all sizes >0 and content ends with marker line starting with X.
+fail=0
+retry=25
+while [ $retry -gt 0 ]; do
+    pending=0
+    for i in $(seq 1 $NUM); do
+        sz=$(stat -c %s "$prim_dir/f$i" 2>/dev/null || echo 0)
+        if [ "$sz" -eq 0 ]; then pending=$((pending+1)); continue; fi
+        # last line extract
+        last=$(tail -n 1 "$prim_dir/f$i" 2>/dev/null || echo "")
+        case "$last" in
+            X$i*) : ;; # ok
+            *) pending=$((pending+1));;
+        esac
+    done
+    echo "cifs166: retry=$retry pending=$pending" >> $seqres.full
+    [ $pending -eq 0 ] && break
+    sleep 0.2; retry=$((retry-1))
+done
+
+if [ $pending -ne 0 ]; then
+    _fail "lease breaks incomplete: $pending files missing updates"
+fi
+
+echo "Lease break storm OK"
+status=0; exit

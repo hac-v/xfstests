@@ -1,0 +1,112 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: TCP disconnect mid I/O (reconnect data integrity)
+#
+# Goal:
+#   While streaming a moderately large write to the share, temporarily drop
+#   TCP traffic to the server (iptables DROP) and then restore it, expecting
+#   the CIFS client to reconnect transparently and the final file checksum to
+#   match the source.
+#
+# Skip conditions:
+#   - Not CIFS / no TEST_DIR
+#   - Not root (need iptables)
+#   - iptables command missing
+#   - Could not resolve server IP
+#
+# Success criteria:
+#   - dd write completes within timeout
+#   - Remote file size matches source size
+#   - MD5 of remote equals MD5 of local pattern file
+#
+# Output: single success line; diagnostics in $seqres.full
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ "$(id -u)" = 0 ] || _notrun "root required for iptables"
+command -v iptables >/dev/null 2>&1 || _notrun "iptables missing"
+
+host=$(echo "$TEST_DEV" | sed -E 's#^//([^/]+)/.*#\1#')
+[ -n "$host" ] || _notrun "parse host failed"
+server_ip=$(getent ahostsv4 "$host" | awk '{print $1; exit}')
+[ -n "$server_ip" ] || _notrun "resolve server ip failed"
+
+echo "cifs165: server_ip=$server_ip" >> $seqres.full
+
+pattern_local=$(mktemp /tmp/cifs165.pattern.XXXXXX)
+remote_file="$TEST_DIR/cifs165.remote.$$"
+size_mb=64
+
+# Create deterministic random pattern (so we can md5). Use /dev/urandom then md5.
+if ! dd if=/dev/urandom of="$pattern_local" bs=1M count=$size_mb status=none 2>>$seqres.full; then
+    _fail "create pattern"
+fi
+pat_md5=$(md5sum "$pattern_local" | awk '{print $1}')
+[ -n "$pat_md5" ] || _fail "md5 local pattern"
+
+echo "cifs165: local md5=$pat_md5" >> $seqres.full
+
+# Cleanup handler
+cleanup() {
+    # Remove any lingering iptables rules (best effort)
+    iptables -D OUTPUT -d "$server_ip" -p tcp --dport 445 -j DROP 2>/dev/null || true
+    iptables -D INPUT -s "$server_ip" -p tcp --sport 445 -j DROP 2>/dev/null || true
+    rm -f "$pattern_local" "$remote_file" 2>/dev/null || true
+}
+_register_cleanup cleanup
+
+# Start write in background so we can interject drop window.
+# Use oflag=direct to slow throughput slightly (may not be supported; fallback).
+( dd if="$pattern_local" of="$remote_file" bs=1M oflag=direct conv=fsync status=none 2>>$seqres.full || \
+  dd if="$pattern_local" of="$remote_file" bs=1M conv=fsync status=none 2>>$seqres.full ) &
+writer_pid=$!
+
+# Allow initial progress
+sleep 0.5
+
+echo "cifs165: inserting iptables DROP rules" >> $seqres.full
+if ! iptables -I OUTPUT -d "$server_ip" -p tcp --dport 445 -j DROP 2>>$seqres.full; then
+    kill $writer_pid 2>/dev/null || true
+    _notrun "failed to add OUTPUT drop rule"
+fi
+if ! iptables -I INPUT -s "$server_ip" -p tcp --sport 445 -j DROP 2>>$seqres.full; then
+    iptables -D OUTPUT -d "$server_ip" -p tcp --dport 445 -j DROP 2>/dev/null || true
+    kill $writer_pid 2>/dev/null || true
+    _notrun "failed to add INPUT drop rule"
+fi
+
+# Keep traffic blocked for a few seconds (write should stall)
+sleep 5
+
+echo "cifs165: removing iptables DROP rules" >> $seqres.full
+iptables -D OUTPUT -d "$server_ip" -p tcp --dport 445 -j DROP 2>>$seqres.full || true
+iptables -D INPUT -s "$server_ip" -p tcp --sport 445 -j DROP 2>>$seqres.full || true
+
+# Wait for writer to finish with timeout
+wait_secs=60
+while kill -0 $writer_pid 2>/dev/null; do
+    if [ $wait_secs -le 0 ]; then
+        kill $writer_pid 2>/dev/null || true
+        _fail "write did not complete after reconnect window"
+    fi
+    sleep 1; wait_secs=$((wait_secs-1))
+done
+
+# Ensure writer exit status 0
+wait $writer_pid || _fail "writer exited non-zero"
+
+# Validate size & checksum
+remote_size=$(stat -c %s "$remote_file" 2>/dev/null || echo 0)
+expected_size=$((size_mb*1024*1024))
+[ "$remote_size" -eq "$expected_size" ] || _fail "remote size $remote_size != $expected_size"
+remote_md5=$(md5sum "$remote_file" | awk '{print $1}')
+[ "$remote_md5" = "$pat_md5" ] || _fail "md5 mismatch remote=$remote_md5 local=$pat_md5"
+
+echo "cifs165: remote md5=$remote_md5 size=$remote_size" >> $seqres.full
+
+echo "TCP disconnect mid I/O OK"
+status=0; exit

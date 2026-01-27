@@ -1,0 +1,2 @@
+QA output created by 125
+deferred close reuse semantics (R-only vs W->R/W) and cleanup OK

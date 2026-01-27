@@ -1,0 +1,62 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: basic validation of acregmax and acdirmax caching windows
+# Strategy:
+# 1. Verify mount options include acregmax= and acdirmax=; skip if absent.
+# 2. Create second mount of same share (alternate mountpoint) reusing current options.
+# 3. File attr test: cache attributes via mount1, modify via mount2, ensure change visible after > acregmax (not required before expiry).
+# 4. Dir entry test: list directory via mount1, create new file via mount2, ensure entry visible after > acdirmax.
+# 5. If acregmax/acdirmax very large (>8s) skip to keep test quick.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+mount_line=$(awk -v mnt="$TEST_DIR" '$2==mnt {print; exit}' /proc/mounts)
+[ -n "$mount_line" ] || _notrun "mount entry not found"
+opts=$(echo "$mount_line" | awk '{print $4}')
+acregmax_v=$(echo "$opts" | sed -n 's/.*acregmax=\([0-9]\+\).*/\1/p')
+acdirmax_v=$(echo "$opts" | sed -n 's/.*acdirmax=\([0-9]\+\).*/\1/p')
+[ -n "$acregmax_v" ] || _notrun "acregmax not set"
+[ -n "$acdirmax_v" ] || _notrun "acdirmax not set"
+if [ "$acregmax_v" -gt 8 ] || [ "$acdirmax_v" -gt 8 ]; then
+	_notrun "acregmax/acdirmax too large for quick test"
+fi
+
+ALT_MNT="${TEST_DIR}-ac.$$"
+mkdir -p "$ALT_MNT" || _fail "mkdir alt"
+_register_cleanup "umount '$ALT_MNT' >/dev/null 2>&1; rmdir '$ALT_MNT' >/dev/null 2>&1"
+if ! mount -t cifs -o "$opts" "$TEST_DEV" "$ALT_MNT" 2>>$seqres.full; then
+	_notrun "second mount failed"
+fi
+
+W="$TEST_DIR/cifs148.$$"
+mkdir -p "$W" || _fail "mkdir work"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1"
+
+F1="$W/file_attr"
+echo A > "$F1" || _fail "create file"
+stat_before=$(stat -c %s "$F1")
+echo BBB >> "$ALT_MNT/$(echo "$F1" | sed "s#^$TEST_DIR/##")" || _fail "append via alt"
+stat_immediate=$(stat -c %s "$F1") || _fail "stat immediate"
+sleep $((acregmax_v + 2))
+stat_after=$(stat -c %s "$F1") || _fail "stat after"
+if [ "$stat_after" -le "$stat_before" ]; then
+	_fail "attribute not refreshed after acregmax (size $stat_before -> $stat_after)"
+fi
+
+DIR="$W/dir"
+mkdir "$DIR" || _fail "mkdir dir"
+ls "$DIR" >/dev/null 2>&1 || true
+NEWF="$DIR/new_entry"
+echo x > "$ALT_MNT/$(echo "$NEWF" | sed "s#^$TEST_DIR/##")" || _fail "create new via alt"
+sleep $((acdirmax_v + 2))
+ls "$DIR" | grep -q "$(basename "$NEWF")" || _fail "dir entry not visible after acdirmax"
+echo "acregmax/acdirmax visibility OK"
+status=0
+exit
+

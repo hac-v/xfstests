@@ -1,0 +1,54 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: nosharesock uses separate sockets per mount (DebugData sessions)
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -r /proc/fs/cifs/DebugData ] || _notrun "requires DebugData"
+
+_register_cleanup "_test_unmount >/dev/null 2>&1"
+_test_unmount >/dev/null 2>&1
+
+host_from_unc() { echo "$1" | sed -E 's#^//([^/]+)/.*#\1#'; }
+share_from_unc() { echo "$1" | sed -E 's#^//[^/]+/([^/]+).*#\1#'; }
+HOST=$(host_from_unc "$TEST_DEV"); SHARE=$(share_from_unc "$TEST_DEV")
+
+count_sockets_for_share() {
+    awk -v H="$1" -v S="$2" '
+        BEGIN { n=0; inb=0; hit=0 }
+        /^[[:space:]]*[0-9]+\).*/ { if (inb && hit) n++; inb=1; hit=0; next }
+        inb==1 {
+            if ($0 ~ /\\\\/ && match($0, /\\\\+([^\\]+)\\([^[:space:]]+)/, m)) {
+                if (m[1]==H && m[2]==S) hit=1
+            }
+        }
+        END { if (inb && hit) n++; print n }
+    ' /proc/fs/cifs/DebugData 2>/dev/null
+}
+
+BASE=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+MO_SH=$BASE
+MO_NS=$(echo "$BASE" | awk -F, '{out=""; for(i=1;i<=NF;i++){ if($i=="nosharesock") continue; out=out (out?"," : "") $i } print out}')
+[ -n "$MO_NS" ] && MO_NS="$MO_NS,nosharesock" || MO_NS="nosharesock"
+
+M1=$(mktemp -d /tmp/cifs139.sh.XXXXXX) || _fail "mktemp1"
+M2=$(mktemp -d /tmp/cifs139.ns.XXXXXX) || _fail "mktemp2"
+
+before=$(count_sockets_for_share "$HOST" "$SHARE")
+
+_do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO_SH'" || _fail "mount shared"
+_do "mount -t cifs '$TEST_DEV' '$M2' -o '$MO_NS'" || _notrun "nosharesock not supported"
+
+after=$(count_sockets_for_share "$HOST" "$SHARE")
+[ -n "$before" ] && [ -n "$after" ] || _notrun "DebugData parse error"
+
+[ "$after" -ge $((before+1)) ] || _fail "nosharesock did not create separate socket (before=$before after=$after)"
+
+echo "nosharesock creates separate sockets OK"
+
+status=0
+exit

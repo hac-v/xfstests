@@ -1,0 +1,68 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: hardlink count integrity
+#
+# Steps:
+#   1. Create a file with initial content; record link count (expect 1).
+#   2. Create two hard links (ln) in same directory.
+#   3. Verify link count == 3 via stat -c %h on each name.
+#   4. Remove one link; verify remaining names report link count == 2.
+#   5. Remove second link; verify final name reports link count == 1.
+#   6. Remove final name; ensure file gone.
+#
+# Skip if filesystem not CIFS or TEST_DIR not set.
+# Output: single success line; diagnostics to $seqres.full.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+base="$TEST_DIR/cifs164_base.$$"
+link1="$TEST_DIR/cifs164_l1.$$"
+link2="$TEST_DIR/cifs164_l2.$$"
+
+cleanup() { rm -f "$base" "$link1" "$link2" 2>/dev/null || true; }
+_register_cleanup cleanup
+
+: > "$base" || _fail "create base file"
+
+h() { stat -c %h "$1" 2>/dev/null; }
+
+c0=$(h "$base") || _fail "stat base"
+[ "$c0" -eq 1 ] || _fail "initial link count $c0 !=1"
+
+echo "cifs164: initial count=$c0" >> $seqres.full
+
+ln "$base" "$link1" || _fail "ln link1"
+ln "$base" "$link2" || _fail "ln link2"
+
+c1=$(h "$base")
+c1a=$(h "$link1")
+c1b=$(h "$link2")
+[ "$c1" -eq 3 ] && [ "$c1a" -eq 3 ] && [ "$c1b" -eq 3 ] || _fail "expected 3 links got base=$c1 l1=$c1a l2=$c1b"
+
+echo "cifs164: after two links counts base=$c1 l1=$c1a l2=$c1b" >> $seqres.full
+
+rm -f "$link1" || _fail "rm link1"
+
+c2=$(h "$base")
+c2b=$(h "$link2")
+[ "$c2" -eq 2 ] && [ "$c2b" -eq 2 ] || _fail "expected 2 links after removing one got base=$c2 l2=$c2b"
+
+echo "cifs164: after removing link1 counts base=$c2 l2=$c2b" >> $seqres.full
+
+rm -f "$link2" || _fail "rm link2"
+
+c3=$(h "$base")
+[ "$c3" -eq 1 ] || _fail "expected 1 link after removing link2 got $c3"
+
+echo "cifs164: after removing link2 count base=$c3" >> $seqres.full
+
+rm -f "$base" || _fail "rm base"
+if [ -e "$base" ]; then _fail "base still exists after unlink"; fi
+
+echo "Hardlink count integrity OK"
+status=0; exit

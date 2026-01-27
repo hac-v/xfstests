@@ -1,0 +1,30 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: multiuser isolation basic
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ -n "$CIFS_USER2" ] || _notrun "CIFS_USER2 not set"
+[ -n "$CIFS_PASS2" ] || _notrun "CIFS_PASS2 not set"
+[ "$(id -u)" = 0 ] || _notrun "root mounts needed"
+
+U1=${CIFS_USER:-$USER}
+P1=${CIFS_PASS:-$PASS}
+U2=$CIFS_USER2
+P2=$CIFS_PASS2
+
+M1="$TEST_DIR-u1.$$"; M2="$TEST_DIR-u2.$$"
+mkdir -p "$M1" "$M2" || _fail "mkdir"
+_register_cleanup "umount '$M1' >/dev/null 2>&1; umount '$M2' >/dev/null 2>&1; rmdir '$M1' '$M2' >/dev/null 2>&1"
+mount -t cifs -o "multiuser,username=$U1,password=$P1" "$TEST_DEV" "$M1" >>$seqres.full 2>&1 || _notrun "mount user1 failed"
+mount -t cifs -o "multiuser,username=$U2,password=$P2" "$TEST_DEV" "$M2" >>$seqres.full 2>&1 || _notrun "mount user2 failed"
+
+echo secret > "$M1/priv.$$" || _fail "write u1"
+if cat "$M2/priv.$$" >/dev/null 2>&1; then
+  _fail "user2 accessed user1 file unexpectedly"
+fi
+echo "multiuser isolation OK"
+status=0; exit

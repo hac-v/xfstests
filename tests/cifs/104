@@ -1,0 +1,181 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: verify per-share Stats counters increment after basic I/O
+#
+# Checks /proc/fs/cifs/Stats for the specific share (\\host\share) before and
+# after controlled file I/O and asserts:
+# - Always: Creates and Closes increase; Bytes written increases.
+# - When this is the only CIFS mount, verify exact byte deltas:
+#   * Bytes written delta equals the bytes written.
+#   * If direct-read succeeds, Bytes read delta equals the bytes read.
+# Logs full snapshots into $seqres.full.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+_host_from_unc() { echo "$1" | sed -E 's#^//([^/]+)/.*#\1#'; }
+_share_from_unc() { echo "$1" | sed -E 's#^//[^/]+/([^/]+).*#\1#'; }
+_unc_windows() {
+    local h=$(_host_from_unc "$1"); local s=$(_share_from_unc "$1");
+    printf "\\\\%s\\%s" "$h" "$s"
+}
+_unc_posix() {
+    local h=$(_host_from_unc "$1"); local s=$(_share_from_unc "$1");
+    printf "//%s/%s" "$h" "$s"
+}
+
+UNCW=$(_unc_windows "$TEST_DEV")
+[ -n "$UNCW" ] || _notrun "could not derive UNC"
+UNCP=$(_unc_posix "$TEST_DEV")
+
+_stats_for_unc() {
+    local unc="$1"; local tries=10; local delay=0.1; local snap
+    while [ $tries -gt 0 ]; do
+        snap=$(cat /proc/fs/cifs/Stats 2>/dev/null)
+        echo "$snap" >> $seqres.full
+        # look for the share block header, e.g. "1) \\host\share"
+        echo "$snap" | grep -Fq ") $unc" && break
+        tries=$((tries-1)); sleep $delay
+    done
+    echo "$snap" | awk -v UNC="$unc" '
+        BEGIN { inb=0; br=0; bw=0; cr=0; cl=0; rd=0; wr=0 }
+        # New share header starts with an index like "1) "
+        /^[[:space:]]*[0-9]+\) / {
+            inb = (index($0, UNC) > 0) ? 1 : 0
+            next
+        }
+        inb==1 && NF==0 { inb=0 }
+        inb==1 {
+            if ($1=="Bytes" && $2=="read:" && $4=="Bytes" && $5=="written:") { br=$3; bw=$6 }
+            else if ($1=="Creates:") cr=$2
+            else if ($1=="Closes:") cl=$2
+            else if ($1=="Reads:") rd=$2
+            else if ($1=="Writes:") wr=$2
+        }
+        END { printf "%s %s %s %s %s %s\n", br, bw, cr, cl, rd, wr }
+    ' 2>> $seqres.full
+}
+
+_register_cleanup "_test_unmount >/dev/null 2>&1; rm -f \"$TEST_DIR/.cifs104.$$\" >/dev/null 2>&1"
+
+_test_unmount > /dev/null 2>&1
+_do "_test_mount" || _fail "mount TEST_DEV failed"
+
+read br0 bw0 cr0 cl0 rd0 wr0 < <(_stats_for_unc "$UNCW")
+echo "before: $UNCW br=$br0 bw=$bw0 cr=$cr0 cl=$cl0 rd=$rd0 wr=$wr0" >> $seqres.full
+
+# Perform controlled I/O
+FILE="$TEST_DIR/.cifs104.$$"
+WRITE_BYTES=$((16*1024))
+READ1_BYTES=$((8*1024))
+READ2_BYTES=$((8*1024))
+BS=4096
+WCOUNT=$((WRITE_BYTES / BS))
+RCOUNT1=$((READ1_BYTES / BS))
+RCOUNT2=$((READ2_BYTES / BS))
+
+# Write exact bytes: prefer direct I/O; fallback to buffered + fsync
+WRITE_DIRECT_OK=0
+dd if=/dev/zero of="$FILE" bs=$BS count=$WCOUNT oflag=direct status=none && WRITE_DIRECT_OK=1 || true
+if [ $WRITE_DIRECT_OK -eq 0 ]; then
+    dd if=/dev/zero of="$FILE" bs=$BS count=$WCOUNT status=none || true
+    # Ensure server sees data
+    $XFS_IO_PROG -c "fsync" "$FILE" >/dev/null 2>&1 || sync
+fi
+
+stat "$FILE" >/dev/null 2>&1 || true
+
+# Poll for Stats update (write + creates/closes)
+tries=50
+while [ $tries -gt 0 ]; do
+    read br1 bw1 cr1 cl1 rd1 wr1 < <(_stats_for_unc "$UNCW")
+    echo "after write: $UNCW br=$br1 bw=$bw1 cr=$cr1 cl=$cl1 rd=$rd1 wr=$wr1 (tries=$tries)" >> $seqres.full
+    dbw=0; dwr=0
+    if [ -n "$bw1" ]; then dbw=$((bw1 - bw0)); fi
+    if [ -n "$wr1" ]; then dwr=$((wr1 - wr0)); fi
+    if [ $dbw -gt 0 ] || [ $dwr -ge 1 ]; then
+        break
+    fi
+    tries=$((tries-1)); sleep 0.2
+done
+
+[ $tries -gt 0 ] || _notrun "CIFS Stats did not reflect write for $UNCW (bytes or op count); stats may be disabled on this kernel"
+
+# Determine if this is the only CIFS mount
+only_this_mount=false
+other_sources=$(awk '$3=="cifs"{print $1}' /proc/mounts | sort -u | grep -v -x "$UNCP" || true)
+if [ -z "$other_sources" ]; then
+    only_this_mount=true
+fi
+echo "only_this_mount=$only_this_mount other_cifs_sources=[$other_sources]" >> $seqres.full
+
+# Verify write bytes
+if $only_this_mount; then
+    if [ $dbw -gt 0 ]; then
+        [ $dbw -eq $WRITE_BYTES ] || _fail "expected Bytes written delta=$WRITE_BYTES, got $dbw"
+    else
+        # Fall back to op count when bytes are not reported
+        [ $dwr -ge 1 ] || _fail "expected at least one Write op, got $dwr"
+    fi
+else
+    if [ $dbw -gt 0 ]; then
+        [ $dbw -ge $WRITE_BYTES ] || _fail "expected Bytes written >= $WRITE_BYTES, got $dbw"
+    else
+        [ $dwr -ge 1 ] || _fail "expected at least one Write op, got $dwr"
+    fi
+fi
+
+# Phase A: Direct read of first half (0..READ1_BYTES)
+$XFS_IO_PROG -c "fadvise -d 0 $READ1_BYTES" "$FILE" >> $seqres.full 2>&1 || true
+read brA0 _bw _cr _cl _rd _wr < <(_stats_for_unc "$UNCW")
+dd if="$FILE" of=/dev/null bs=$BS count=$RCOUNT1 iflag=direct status=none || true
+tries=50
+while [ $tries -gt 0 ]; do
+    read brA1 _bw _cr _cl rdA1 _wr < <(_stats_for_unc "$UNCW")
+    dbrA=$((brA1 - brA0)); drdA=0
+    if [ -n "$rdA1" ]; then drdA=$((rdA1 - rd0)); fi
+    echo "after direct read: dbrA=$dbrA drdA=$drdA (tries=$tries)" >> $seqres.full
+    if [ $dbrA -ge $READ1_BYTES ] || [ $drdA -ge 1 ]; then break; fi
+    tries=$((tries-1)); sleep 0.2
+done
+[ $tries -gt 0 ] || _notrun "CIFS Stats did not reflect direct read (bytes or op count); stats may be disabled"
+if $only_this_mount; then
+    if [ $dbrA -gt 0 ]; then
+        [ $dbrA -eq $READ1_BYTES ] || _fail "expected direct Bytes read=$READ1_BYTES, got $dbrA"
+    else
+        [ $drdA -ge 1 ] || _fail "expected at least one Read op (direct), got $drdA"
+    fi
+fi
+
+# Phase B: Buffered read of second half (READ1..READ1+READ2)
+$XFS_IO_PROG -c "fadvise -d $READ1_BYTES $READ2_BYTES" "$FILE" >> $seqres.full 2>&1 || true
+read brB0 _bw _cr _cl _rd _wr < <(_stats_for_unc "$UNCW")
+dd if="$FILE" of=/dev/null bs=$BS count=$RCOUNT2 skip=$((READ1_BYTES/BS)) status=none || true
+tries=50
+while [ $tries -gt 0 ]; do
+    read brB1 _bw _cr _cl rdB1 _wr < <(_stats_for_unc "$UNCW")
+    dbrB=$((brB1 - brB0)); drdB=0
+    if [ -n "$rdB1" ]; then drdB=$((rdB1 - rd0)); fi
+    echo "after buffered read: dbrB=$dbrB drdB=$drdB (tries=$tries)" >> $seqres.full
+    if [ $dbrB -ge $READ2_BYTES ] || [ $drdB -ge 1 ]; then break; fi
+    tries=$((tries-1)); sleep 0.2
+done
+[ $tries -gt 0 ] || _notrun "CIFS Stats did not reflect buffered read (bytes or op count); stats may be disabled"
+if $only_this_mount; then
+    if [ $dbrB -gt 0 ]; then
+        [ $dbrB -eq $READ2_BYTES ] || _fail "expected buffered Bytes read=$READ2_BYTES, got $dbrB"
+    else
+        [ $drdB -ge 1 ] || _fail "expected at least one Read op (buffered), got $drdB"
+    fi
+fi
+
+echo "CIFS Stats counters updated OK"
+
+status=0
+exit

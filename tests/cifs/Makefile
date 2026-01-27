@@ -8,7 +8,7 @@ include $(TOPDIR)/include/buildgrouplist
 
 CIFS_DIR = cifs
 TARGET_DIR = $(PKG_LIB_DIR)/$(TESTS_DIR)/$(CIFS_DIR)
-DIRT = group.list
+DIRT = group.list src/cifs197_setuid
 
 default: $(DIRT)
 

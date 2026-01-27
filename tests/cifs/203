@@ -1,0 +1,225 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: leverage cifscreds for multiuser mounts and enforce credential fallback
+#
+# Behavior under test:
+# - Stash credentials for the target host via cifscreds.
+# - Mount the share with multiuser authentication without passing a password in
+#   the option string and confirm basic I/O succeeds.
+# - Remove the stored credential and assert that a password-less mount then
+#   fails as expected.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick auth
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+command -v python3 >/dev/null 2>&1 || _notrun "python3 required"
+command -v cifscreds >/dev/null 2>&1 || _notrun "cifscreds utility required"
+
+_test_unmount >/dev/null 2>&1
+
+_host_from_unc() { echo "$1" | sed -E 's#^//([^/]+)/.*#\1#'; }
+_share_from_unc() { echo "$1" | sed -E 's#^//[^/]+/([^/]+).*#\1#'; }
+HOST=$(_host_from_unc "$TEST_DEV")
+SHARE=$(_share_from_unc "$TEST_DEV")
+[ -n "$HOST" ] && [ -n "$SHARE" ] || _notrun "could not derive host/share"
+
+MO=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+
+mapfile -t __parsed < <(python3 - "$MO" <<'PY'
+import sys
+opts = sys.argv[1]
+user = ''
+password = ''
+domain = ''
+others = []
+for raw in filter(None, opts.split(',')):
+    part = raw.strip()
+    if not part:
+        continue
+    key, _, val = part.partition('=')
+    kl = key.lower()
+    if kl in ('user', 'username'):
+        if not user:
+            user = val
+        continue
+    if kl in ('password', 'pass', 'passwd'):
+        if not password:
+            password = val
+        continue
+    if kl in ('domain', 'dom'):
+        if not domain:
+            domain = val
+        continue
+    if kl in ('credentials', 'cred', 'credfile'):
+        continue
+    others.append(part)
+print(user)
+print(password)
+print(domain)
+for part in others:
+    print(part)
+PY
+)
+
+[ ${#__parsed[@]} -ge 3 ] || _notrun "failed to parse mount options"
+USER=${__parsed[0]}
+PASS=${__parsed[1]}
+DOMAIN=${__parsed[2]}
+OTHER_OPTS=()
+for idx in "${!__parsed[@]}"; do
+    [ "$idx" -ge 3 ] || continue
+    OTHER_OPTS+=("${__parsed[$idx]}")
+done
+
+[ -n "$USER" ] || _notrun "username not found in mount options"
+[ -n "$PASS" ] || _notrun "password not found in mount options"
+
+_is_mounted() {
+    if command -v findmnt >/dev/null 2>&1; then
+        findmnt -rn -M "$1" >/dev/null 2>&1
+    else
+        grep -qs "[[:space:]]$1[[:space:]]" /proc/mounts
+    fi
+}
+
+MNT=""
+CREDS_ADDED=0
+MOUNTED=0
+_cleanup_203() {
+    if [ $MOUNTED -eq 1 ] && [ -n "$MNT" ] && _is_mounted "$MNT"; then
+        umount -l "$MNT" >/dev/null 2>&1 || true
+    fi
+    if [ -n "$MNT" ]; then
+        rm -rf "$MNT" >/dev/null 2>&1 || true
+    fi
+    if [ $CREDS_ADDED -eq 1 ]; then
+        cifscreds clearall >/dev/null 2>&1 || true
+    fi
+}
+_register_cleanup _cleanup_203
+
+MNT=$(mktemp -d /tmp/cifs203.mnt.XXXXXX) || _fail "mktemp mount failed"
+workdir="cifs203.$$"
+
+mount_opts=""
+multiuser_present=0
+for opt in "${OTHER_OPTS[@]}"; do
+    [ -n "$opt" ] || continue
+    [ "$opt" = "multiuser" ] && multiuser_present=1
+    if [ -n "$mount_opts" ]; then
+        mount_opts="$mount_opts,$opt"
+    else
+        mount_opts="$opt"
+    fi
+    done
+if [ -n "$mount_opts" ]; then
+    mount_opts="$mount_opts,username=$USER"
+else
+    mount_opts="username=$USER"
+fi
+if [ -n "$DOMAIN" ]; then
+    mount_opts="$mount_opts,domain=$DOMAIN"
+fi
+if [ $multiuser_present -eq 0 ]; then
+    mount_opts="$mount_opts,multiuser"
+fi
+
+log_msg() { echo "cifs203: $*" >>"$seqres.full"; }
+
+_run_cifscreds_cmd() {
+    CIFS203_HOST="$HOST" CIFS203_USER="$USER" CIFS203_PASS="$PASS" CIFS203_CMD="$1" \
+    python3 - <<'PY' >>"$seqres.full" 2>&1
+import os
+import pty
+import select
+import sys
+
+host = os.environ['CIFS203_HOST']
+user = os.environ['CIFS203_USER']
+password = os.environ['CIFS203_PASS']
+cmd = ['cifscreds', os.environ['CIFS203_CMD'], host, '-u', user]
+
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp(cmd[0], cmd)
+
+password_sent = False
+try:
+    while True:
+        rlist, _, _ = select.select([fd], [], [], 5)
+        if not rlist:
+            break
+        if fd in rlist:
+            try:
+                data = os.read(fd, 1024)
+            except OSError:
+                break
+            if not data:
+                break
+            sys.stdout.buffer.write(data)
+            sys.stdout.flush()
+            if (not password_sent) and (b'Password' in data or b'password' in data):
+                os.write(fd, password.encode() + b'\n')
+                password_sent = True
+finally:
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+_, status = os.waitpid(pid, 0)
+sys.exit(os.WEXITSTATUS(status))
+PY
+}
+
+_add_cifscreds() {
+    if _run_cifscreds_cmd add; then
+        return 0
+    fi
+    log_msg "add failed, retrying with update"
+    _run_cifscreds_cmd update
+}
+
+log_msg "adding credential for //$HOST user=$USER"
+if ! _add_cifscreds; then
+    _notrun "cifscreds add failed"
+fi
+CREDS_ADDED=1
+
+log_msg "mounting //$HOST/$SHARE with cifscreds"
+log_msg "mount options: $mount_opts"
+if ! mount -t cifs "$TEST_DEV" "$MNT" -o "$mount_opts" >>"$seqres.full" 2>&1; then
+    _notrun "multiuser mount failed"
+fi
+MOUNTED=1
+
+mkdir -p "$MNT/$workdir" || _fail "mkdir via multiuser mount failed"
+echo "cred test" >"$MNT/$workdir/file" || _fail "write via multiuser mount failed"
+cat "$MNT/$workdir/file" >/dev/null 2>&1 || _fail "read via multiuser mount failed"
+rm -rf "$MNT/$workdir" || _fail "cleanup via multiuser mount failed"
+
+umount "$MNT" || _fail "umount after multiuser mount failed"
+MOUNTED=0
+
+log_msg "clearing credential for //$HOST user=$USER"
+cifscreds clearall >>"$seqres.full" 2>&1 || true
+CREDS_ADDED=0
+
+log_msg "mount without stored credential (expect failure)"
+log_msg "retry mount options: $mount_opts"
+if mount -t cifs "$TEST_DEV" "$MNT" -o "$mount_opts" >>"$seqres.full" 2>&1; then
+    umount "$MNT" >/dev/null 2>&1 || true
+    _fail "mount succeeded without stored credential"
+fi
+
+rmdir "$MNT" >/dev/null 2>&1 || true
+MNT=""
+
+echo "cifs203: cifscreds multiuser mount OK"
+
+status=0
+exit

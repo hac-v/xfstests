@@ -1,0 +1,83 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: directory consistency under concurrent create/unlink churn
+#
+# Goal:
+#   Populate directory with 2000 files, then run concurrent churn (random
+#   delete/recreate) while repeatedly reading directory listings. After churn
+#   stops and a quiet period, ensure stable, duplicate-free listing and that
+#   repeated listings are identical.
+#
+# Simplifications:
+#   - We cannot easily detect transient duplicates mid-run; we focus on final
+#     reconciliation consistency (post-settle) and absence of I/O errors.
+#   - Accept any final count between 1500 and 2500 (some creations vs deletions)
+#     but require stable count across N successive identical scans.
+#
+# Output: single success line. Diagnostics in $seqres.full.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto stress
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+DIR="$TEST_DIR/cifs174.dir"
+rm -rf "$DIR" 2>/dev/null || true
+mkdir -p "$DIR" || _fail "mkdir"
+COUNT=2000
+
+echo "cifs174: seeding $COUNT files" >> $seqres.full
+for i in $(seq 1 $COUNT); do : > "$DIR/f$i" || _fail "seed f$i"; done
+
+CHURN_SECS=${CIFS_DIR_CHURN_SECS:-6}
+END=$(( $(date +%s) + CHURN_SECS ))
+
+churn() {
+    local d=$1
+    while [ $(date +%s) -lt $END ]; do
+        n=$(( (RANDOM % COUNT) + 1 ))
+        f="$d/f$n"
+        if [ $((RANDOM % 2)) -eq 0 ]; then
+            rm -f "$f" 2>/dev/null || true
+        else
+            : > "$f" 2>/dev/null || true
+        fi
+    done
+}
+
+churn "$DIR" & cpid=$!
+
+# Concurrently sample directory listings (not strictly validated mid-run)
+sample=0
+while kill -0 $cpid 2>/dev/null; do
+    ls "$DIR" >/dev/null 2>>$seqres.full || { echo "cifs174: ls error" >> $seqres.full; }
+    sample=$((sample+1))
+done
+wait $cpid 2>/dev/null || true
+echo "cifs174: sample_iterations=$sample" >> $seqres.full
+
+# Quiet period to settle metadata
+sleep 2
+
+stable_runs=5
+prev_hash=""
+prev_count=0
+for r in $(seq 1 $stable_runs); do
+    mapfile -t listing < <(ls -1 "$DIR" 2>/dev/null | sort)
+    count=${#listing[@]}
+    hash=$(printf '%s\n' "${listing[@]}" | md5sum | awk '{print $1}')
+    echo "cifs174: run=$r count=$count hash=$hash" >> $seqres.full
+    if [ $r -gt 1 ]; then
+        [ "$hash" = "$prev_hash" ] || _fail "listing hash changed (run $r)"
+        [ "$count" -eq "$prev_count" ] || _fail "listing count changed (run $r)"
+    fi
+    prev_hash=$hash; prev_count=$count
+done
+
+[ $prev_count -ge 1500 ] || _fail "final count too small ($prev_count)"
+[ $prev_count -le 2500 ] || _fail "final count too large ($prev_count)"
+
+echo "Directory consistency under churn OK"
+status=0; exit

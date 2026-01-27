@@ -1,0 +1,263 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: Sequential write integrity across reconnect
+#
+# Objective
+#   Stream deterministic data to a file while forcing a TCP drop mid-write and
+#   ensure the final contents remain intact by verifying the pattern and SHA256
+#   digest from two mounts.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto stress
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v gcc >/dev/null 2>&1 || _notrun "gcc required"
+command -v iptables >/dev/null 2>&1 || _notrun "iptables required"
+command -v sha256sum >/dev/null 2>&1 || _notrun "sha256sum required"
+
+TOTAL_MB=${CIFS184_TOTAL_MB:-64}
+BLOCK_MB=${CIFS184_BLOCK_MB:-1}
+DROP_SECS=${CIFS184_DROP_SECS:-4}
+
+case "$TOTAL_MB" in ''|*[^0-9]*) _notrun "TOTAL_MB must be integer" ;; esac
+case "$BLOCK_MB" in ''|*[^0-9]*) _notrun "BLOCK_MB must be integer" ;; esac
+[ "$TOTAL_MB" -gt 0 ] || _notrun "TOTAL_MB must be >0"
+[ "$BLOCK_MB" -gt 0 ] || _notrun "BLOCK_MB must be >0"
+
+BLOCK_BYTES=$((BLOCK_MB * 1024 * 1024))
+TOTAL_BYTES=$((TOTAL_MB * 1024 * 1024))
+[ $((TOTAL_BYTES % BLOCK_BYTES)) -eq 0 ] || _notrun "TOTAL_MB must be multiple of BLOCK_MB"
+TOTAL_BLOCKS=$((TOTAL_BYTES / BLOCK_BYTES))
+[ "$TOTAL_BLOCKS" -ge 2 ] || _notrun "need ≥2 blocks"
+HALF_BLOCKS=$((TOTAL_BLOCKS / 2))
+[ "$HALF_BLOCKS" -ge 1 ] || HALF_BLOCKS=1
+TAIL_BLOCKS=$((TOTAL_BLOCKS - HALF_BLOCKS))
+[ "$TAIL_BLOCKS" -ge 1 ] || TAIL_BLOCKS=1
+
+host=$(echo "$TEST_DEV" | sed -n 's#^//\([^/]*\)/.*#\1#p')
+[ -n "$host" ] || _notrun "parse host failed"
+server_ip=$(getent ahostsv4 "$host" | awk '{print $1; exit}')
+[ -n "$server_ip" ] || _notrun "resolve IPv4 failed"
+
+TMPBASE=${TMPDIR:-/tmp}/cifs184.$$ 
+HELPER_SRC=$TMPBASE.c
+HELPER_BIN=$TMPBASE
+
+cat >"$HELPER_SRC" <<'EOF'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <endian.h>
+
+static void die(const char *msg)
+{
+    perror(msg);
+    exit(1);
+}
+
+static void fill_pattern(unsigned char *buf, size_t len, uint64_t block)
+{
+    uint64_t pat = htole64(block);
+    size_t used = 0;
+    while (used + sizeof(pat) <= len) {
+        memcpy(buf + used, &pat, sizeof(pat));
+        used += sizeof(pat);
+    }
+    if (used < len)
+        memcpy(buf + used, &pat, len - used);
+}
+
+static int retryable(int err)
+{
+    return err == EINTR || err == EAGAIN || err == EIO || err == ETIMEDOUT ||
+           err == ECONNRESET || err == ENOTCONN || err == EPIPE;
+}
+
+static void do_write(const char *path, uint64_t start, uint64_t count, size_t bsz)
+{
+    int fd = open(path, O_CREAT | O_RDWR, 0666);
+    if (fd < 0)
+        die("open");
+
+    unsigned char *buf = malloc(bsz);
+    if (!buf)
+        die("malloc");
+
+    for (uint64_t i = 0; i < count; i++) {
+        uint64_t block = start + i;
+        fill_pattern(buf, bsz, block);
+        size_t off = 0;
+        off_t base = (off_t)block * (off_t)bsz;
+        int tries = 0;
+        while (off < bsz) {
+            ssize_t rc = pwrite(fd, buf + off, bsz - off, base + off);
+            if (rc < 0) {
+                if (retryable(errno) && tries++ < 30) {
+                    sleep(1);
+                    continue;
+                }
+                die("pwrite");
+            }
+            if (rc == 0)
+                die("pwrite zero");
+            off += (size_t)rc;
+        }
+        int rc;
+        tries = 0;
+        do {
+            rc = fdatasync(fd);
+        } while (rc && retryable(errno) && tries++ < 30 && (sleep(1), 1));
+        if (rc)
+            die("fdatasync");
+    }
+
+    if (fsync(fd))
+        die("fsync");
+    if (close(fd))
+        die("close");
+    free(buf);
+}
+
+static void do_verify(const char *path, uint64_t blocks, size_t bsz)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        die("open verify");
+    unsigned char *buf = malloc(bsz);
+    unsigned char *expect = malloc(bsz);
+    if (!buf || !expect)
+        die("malloc");
+
+    for (uint64_t block = 0; block < blocks; block++) {
+        fill_pattern(expect, bsz, block);
+        size_t off = 0;
+        off_t base = (off_t)block * (off_t)bsz;
+        while (off < bsz) {
+            ssize_t rc = pread(fd, buf + off, bsz - off, base + off);
+            if (rc < 0) {
+                if (errno == EINTR)
+                    continue;
+                die("pread");
+            }
+            if (rc == 0)
+                die("unexpected EOF");
+            off += (size_t)rc;
+        }
+        if (memcmp(buf, expect, bsz) != 0) {
+            fprintf(stderr, "pattern mismatch at block %" PRIu64 "\n", block);
+            exit(1);
+        }
+    }
+
+    if (close(fd))
+        die("close verify");
+    free(buf);
+    free(expect);
+}
+
+int main(int argc, char **argv)
+{
+    if (argc < 2)
+        return 2;
+    if (strcmp(argv[1], "write") == 0) {
+        if (argc != 6)
+            return 2;
+        uint64_t start = strtoull(argv[3], NULL, 10);
+        uint64_t count = strtoull(argv[4], NULL, 10);
+        size_t bsz = (size_t)strtoull(argv[5], NULL, 10);
+        if (!bsz)
+            return 2;
+        do_write(argv[2], start, count, bsz);
+        return 0;
+    }
+    if (strcmp(argv[1], "verify") == 0) {
+        if (argc != 5)
+            return 2;
+        uint64_t blocks = strtoull(argv[3], NULL, 10);
+        size_t bsz = (size_t)strtoull(argv[4], NULL, 10);
+        if (!bsz)
+            return 2;
+        do_verify(argv[2], blocks, bsz);
+        return 0;
+    }
+    return 2;
+}
+EOF
+
+gcc -O2 -Wall -o "$HELPER_BIN" "$HELPER_SRC" >>$seqres.full 2>&1 || _fail "compile helper"
+
+MNT2=$(mktemp -d /tmp/cifs184.mnt.XXXXXX) || _fail "mktemp"
+base_opts=${MOUNT_OPTIONS#-o}
+if [ -z "$base_opts" ]; then
+    base_opts=$(awk -v mnt="$TEST_DIR" '$2==mnt {print $4}' /proc/mounts)
+fi
+if ! mount -t cifs "$TEST_DEV" "$MNT2" -o "$base_opts" >>$seqres.full 2>&1; then
+    rmdir "$MNT2"
+    _fail "secondary mount failed"
+fi
+
+FNAME=cifs184.dat
+PRIMARY="$TEST_DIR/$FNAME"
+SECONDARY="$MNT2/$FNAME"
+rm -f "$PRIMARY" "$SECONDARY" >/dev/null 2>&1 || true
+
+cleanup()
+{
+    iptables -D OUTPUT -d "$server_ip" -p tcp --dport 445 -j DROP >/dev/null 2>&1 || true
+    iptables -D INPUT -s "$server_ip" -p tcp --sport 445 -j DROP >/dev/null 2>&1 || true
+    rm -f "$PRIMARY" "$SECONDARY" >/dev/null 2>&1 || true
+    if mountpoint -q "$MNT2"; then
+        umount "$MNT2" >/dev/null 2>&1 || true
+    fi
+    rmdir "$MNT2" >/dev/null 2>&1 || true
+    rm -f "$HELPER_SRC" "$HELPER_BIN" >/dev/null 2>&1 || true
+}
+_register_cleanup cleanup
+
+echo "cifs184: writing first half ($HALF_BLOCKS blocks)" >>$seqres.full
+"$HELPER_BIN" write "$PRIMARY" 0 "$HALF_BLOCKS" "$BLOCK_BYTES" >>$seqres.full 2>&1 || _fail "first half write"
+sync
+
+echo "cifs184: forcing drop for $DROP_SECS s" >>$seqres.full
+iptables -I OUTPUT -d "$server_ip" -p tcp --dport 445 -j DROP >>$seqres.full 2>&1 || _notrun "iptables rule failed"
+iptables -I INPUT -s "$server_ip" -p tcp --sport 445 -j DROP >>$seqres.full 2>&1 || _notrun "iptables rule failed"
+
+"$HELPER_BIN" write "$PRIMARY" "$HALF_BLOCKS" "$TAIL_BLOCKS" "$BLOCK_BYTES" >>$seqres.full 2>&1 &
+PID=$!
+sleep "$DROP_SECS"
+iptables -D OUTPUT -d "$server_ip" -p tcp --dport 445 -j DROP >>$seqres.full 2>&1 || true
+iptables -D INPUT -s "$server_ip" -p tcp --sport 445 -j DROP >>$seqres.full 2>&1 || true
+wait $PID
+[ $? -eq 0 ] || _fail "second half write failed"
+sync
+
+if [ -w /proc/sys/vm/drop_caches ]; then
+    echo 3 > /proc/sys/vm/drop_caches
+    echo "cifs184: dropped host cache" >>$seqres.full
+fi
+
+echo "cifs184: verifying pattern" >>$seqres.full
+"$HELPER_BIN" verify "$PRIMARY" "$TOTAL_BLOCKS" "$BLOCK_BYTES" >>$seqres.full 2>&1 || _fail "verify primary"
+"$HELPER_BIN" verify "$SECONDARY" "$TOTAL_BLOCKS" "$BLOCK_BYTES" >>$seqres.full 2>&1 || _fail "verify secondary"
+
+sha1=$(sha256sum "$PRIMARY" 2>>$seqres.full | awk '{print $1}')
+sha2=$(sha256sum "$SECONDARY" 2>>$seqres.full | awk '{print $1}')
+echo "cifs184: sha primary=$sha1 secondary=$sha2" >>$seqres.full
+[ "$sha1" = "$sha2" ] || _fail "sha mismatch"
+
+rm -f "$PRIMARY" "$SECONDARY" >/dev/null 2>&1 || true
+
+echo "Sequential write reconnect integrity OK"
+status=0
+exit

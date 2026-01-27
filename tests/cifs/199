@@ -1,0 +1,123 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: credential sources precedence (credentials=, PASSWD[_FD], PASSWD2)
+#
+# Exercises mount.cifs fake mounts using credentials files, file descriptors,
+# and environment variables to ensure parsing, precedence, and error handling
+# behave as expected without touching the live tree.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick metadata
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+command -v mount.cifs >/dev/null 2>&1 || _notrun "mount.cifs unavailable"
+
+MNT="$TEST_DIR/cifs199.mnt.$$"
+mkdir -p "$MNT" || _fail "mkdir mountpoint"
+_register_cleanup "rmdir '$MNT' >/dev/null 2>&1 || true"
+
+logdir=${TMPDIR:-/tmp}/cifs199.$$
+mkdir -p "$logdir" || _fail "mkdir logdir"
+_register_cleanup "rm -rf '$logdir' >/dev/null 2>&1 || true"
+
+run_fake_mount()
+{
+    local opts=$1
+    local logfile=$2
+    shift 2 || true
+    env "$@" mount.cifs "$TEST_DEV" "$MNT" -f -v -o "$opts" >"$logfile" 2>&1
+    return $?
+}
+
+# 1. credentials= file with username/password/domain
+cred_ok="$logdir/cred.ok"
+cat >"$cred_ok" <<'EOF'
+username=creduser
+password=credpass
+domain=creddom
+EOF
+chmod 600 "$cred_ok" || _fail "chmod cred"
+log_cred_ok="$logdir/cred-ok.log"
+run_fake_mount "credentials=$cred_ok" "$log_cred_ok"
+rc=$?
+cat "$log_cred_ok" >>$seqres.full 2>/dev/null || true
+[ $rc -eq 0 ] || _fail "credentials file rejected"
+
+grep -q "user=creduser" "$log_cred_ok" || _fail "user missing from credentials mount"
+grep -q "domain=creddom" "$log_cred_ok" || _fail "domain missing from credentials mount"
+
+authfile=$(printf '%s' "$cred_ok.fail")
+cp "$cred_ok" "$authfile" || _fail "copy cred"
+chmod 000 "$authfile" || _fail "chmod unreadable"
+log_cred_perm="$logdir/cred-perm.log"
+run_fake_mount "credentials=$authfile" "$log_cred_perm"
+rc=$?
+cat "$log_cred_perm" >>$seqres.full 2>/dev/null || true
+[ $rc -ne 0 ] || _fail "credentials mount succeeded despite unreadable file"
+
+grep -qi "failed" "$log_cred_perm" || grep -qi "error" "$log_cred_perm" || _fail "missing unreadable credentials message"
+
+cred_bad="$logdir/cred.bad"
+cat >"$cred_bad" <<'EOF'
+username=warnuser
+password
+password=warnpass
+domain=warndom
+EOF
+chmod 600 "$cred_bad" || _fail "chmod cred bad"
+log_cred_bad="$logdir/cred-bad.log"
+run_fake_mount "credentials=$cred_bad" "$log_cred_bad"
+rc=$?
+cat "$log_cred_bad" >>$seqres.full 2>/dev/null || true
+[ $rc -eq 0 ] || _fail "credentials file with warning failed"
+
+grep -q "Credential formatted incorrectly" "$log_cred_bad" || _fail "expected malformed warning missing"
+
+echo "fdpass1" >"$logdir/pass1.txt"
+echo "fdpass2" >"$logdir/pass2.txt"
+exec 3<"$logdir/pass1.txt"
+exec 4<"$logdir/pass2.txt"
+log_fd="$logdir/fd.log"
+PASSWD_FD=3 PASSWD2_FD=4 run_fake_mount "user=fduser" "$log_fd"
+rc=$?
+exec 3<&-
+exec 4<&-
+cat "$log_fd" >>$seqres.full 2>/dev/null || true
+[ $rc -eq 0 ] || _fail "PASSWD_FD mount failed"
+
+grep -q "user=fduser" "$log_fd" || _fail "fd user missing"
+grep -q "pass=fdpass1" "$log_fd" || _fail "fd primary password missing"
+grep -q "password2=fdpass2" "$log_fd" || _fail "fd secondary password missing"
+
+exec 5<<<"envpass"
+exec 6<<<"fdoverride"
+log_prec="$logdir/precedence.log"
+PASSWD=envonly PASSWD_FD=5 PASSWD2_FD=6 run_fake_mount "user=preuser,pass=optionpass" "$log_prec"
+rc=$?
+exec 5<&-
+exec 6<&-
+cat "$log_prec" >>$seqres.full 2>/dev/null || true
+[ $rc -eq 0 ] || _fail "precedence mount failed"
+
+grep -q "pass=optionpass" "$log_prec" || _fail "command-line pass did not win precedence"
+! grep -q "envpass" "$log_prec" || _fail "environment password leaked"
+
+log_env="$logdir/env.log"
+PASSWD=envonly PASSWD2=envtwo run_fake_mount "user=envuser" "$log_env"
+rc=$?
+cat "$log_env" >>$seqres.full 2>/dev/null || true
+[ $rc -eq 0 ] || _fail "env password mount failed"
+
+grep -q "user=envuser" "$log_env" || _fail "env user missing"
+grep -q "pass=envonly" "$log_env" || _fail "env PASSWD not applied"
+grep -q "password2=envtwo" "$log_env" || _fail "env PASSWD2 not applied"
+
+rm -f "$logdir/pass1.txt" "$logdir/pass2.txt"
+
+echo "mount.cifs credential sources handling OK"
+status=0
+exit

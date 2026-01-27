@@ -1,0 +1,105 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: credit starvation recovery under artificial network stall (renumbered from 164)
+# Goal: Drive Active credits high, introduce a brief DROP of SMB traffic so
+# outstanding requests cannot complete (credits not returned), then release
+# and ensure credits fall back near baseline (no leak / stall) within timeout.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick stress
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ -r /proc/fs/cifs/DebugData ] || _notrun "no DebugData"
+command -v iptables >/dev/null 2>&1 || _notrun "iptables required"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+
+DBG=/proc/fs/cifs/DebugData
+
+parse_credits() {
+    local line max a
+    line=$(grep -m1 'Credits:' $DBG 2>/dev/null) || return 1
+    max=$(echo "$line" | sed -n 's/.*Max:[[:space:]]*\([0-9]\+\).*/\1/p')
+    a=$(echo "$line" | sed -n 's/.*Active:[[:space:]]*\([0-9]\+\).*/\1/p')
+    [ -n "$max" ] && [ -n "$a" ] || return 1
+    echo "$max $a"
+}
+
+read max base_active < <(parse_credits) || _notrun "cannot parse credits"
+case $max in *[!0-9]*|"") _notrun "bad max" ;; esac
+case $base_active in *[!0-9]*|"") _notrun "bad active" ;; esac
+
+host=$(echo "$TEST_DEV" | sed -E 's#^//([^/]+)/.*#\1#')
+[ -n "$host" ] || _notrun "parse host failed"
+server_ip=$(getent ahostsv4 "$host" | awk '{print $1; exit}')
+[ -n "$server_ip" ] || _notrun "resolve host failed"
+
+iptables_add() {
+    iptables -I OUTPUT -d "$server_ip" -p tcp --dport 445 -j DROP 2>>$seqres.full || return 1
+    iptables -I INPUT  -s "$server_ip" -p tcp --sport 445 -j DROP 2>>$seqres.full || true
+}
+iptables_remove() {
+    while iptables -D OUTPUT -d "$server_ip" -p tcp --dport 445 -j DROP 2>/dev/null; do :; done
+    while iptables -D INPUT  -s "$server_ip" -p tcp --sport 445 -j DROP 2>/dev/null; do :; done
+}
+_register_cleanup iptables_remove
+
+W="$TEST_DIR/cifs153.$$"
+mkdir -p "$W" || _fail "mkdir work"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1"
+
+FILE_COUNT=64
+for i in $(seq -f %03g 1 $FILE_COUNT); do echo x > "$W/f$i" || _fail "seed $i"; done
+
+WORKERS=32
+DURATION=6
+DROP_AT=1
+DROP_LEN=1
+TOL=4
+
+end_time=$((SECONDS + DURATION))
+
+worker() {
+    while [ $SECONDS -lt $end_time ]; do
+        for f in "$W"/f*; do stat -c %s "$f" >/dev/null 2>&1 || exit 1; done
+    done
+}
+
+pids=""
+for w in $(seq 1 $WORKERS); do worker & pids="$pids $!"; done
+
+highest=$base_active
+applied=0
+removed=0
+
+while :; do
+    alive=0
+    for p in $pids; do if kill -0 $p 2>/dev/null; then alive=1; break; fi; done
+    read mcur acur < <(parse_credits) || true
+    if [ -n "$acur" ] && [ "$acur" -gt "$highest" ]; then highest=$acur; fi
+    now=$((DURATION - (end_time - SECONDS)))
+    if [ $applied -eq 0 ] && [ $now -ge $DROP_AT ]; then
+        if iptables_add; then echo "cifs153: drop start" >> $seqres.full; applied=1; fi
+    fi
+    if [ $applied -eq 1 ] && [ $removed -eq 0 ] && [ $now -ge $((DROP_AT + DROP_LEN)) ]; then
+        iptables_remove; removed=1; echo "cifs153: drop end" >> $seqres.full
+    fi
+    [ $alive -eq 1 ] || break
+    sleep 0.05
+done
+
+wait 2>/dev/null || true
+iptables_remove
+sleep 1
+
+read _ final_active < <(parse_credits) || _fail "final parse"
+echo "cifs153: max=$max base=$base_active highest=$highest final=$final_active" >> $seqres.full
+
+if [ "$highest" -gt "$max" ]; then _fail "active $highest > max $max"; fi
+if [ "$final_active" -gt $((base_active + TOL)) ]; then _fail "final $final_active > baseline $base_active + $TOL"; fi
+
+echo "credit starvation recovery OK"
+status=0
+exit

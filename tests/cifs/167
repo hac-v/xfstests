@@ -1,0 +1,118 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: directory lease invalidation under remote modifications (acdirmax=0)
+#
+# Goal:
+#   Ensure that with directory leasing enabled, changes made via a second
+#   client (create/delete entries) are observed promptly by the first client
+#   after a lease break. We mount primary with actimeo=0 (and acdirmax=0 if
+#   honored) to minimize attribute caching and rely on the lease protocol for
+#   coherency rather than stale dentry caching.
+#
+# Skip conditions:
+#   - Not CIFS
+#   - Missing TEST_DIR / TEST_DEV
+#   - DebugData unavailable
+#   - Server capabilities do not advertise DIRECTORY_LEASING (bit 0x20)
+#
+# Pass criteria:
+#   Primary sees newly created files and absence of deleted file within retry
+#   window (6s total) after second client performs modifications.
+#
+# Output: single success line; diagnostics in $seqres.full.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ -r /proc/fs/cifs/DebugData ] || _notrun "no DebugData"
+
+host=$(echo "$TEST_DEV" | sed -E 's#^//([^/]+)/.*#\1#')
+[ -n "$host" ] || _notrun "parse host failed"
+
+# Extract server capabilities block for this host; look for DIRECTORY_LEASING bit (0x20)
+cap_line=$(awk -v h="$host" 'tolower($0) ~ h {t=1} t && /Server capabilities:/ {print; exit}' /proc/fs/cifs/DebugData)
+[ -n "$cap_line" ] || _notrun "no capabilities line for host"
+cap_hex=$(echo "$cap_line" | sed -n 's/.*Server capabilities:[[:space:]]*0x\([0-9a-fA-F]\+\).*/\1/p')
+[ -n "$cap_hex" ] || _notrun "cannot parse capabilities"
+# shell arithmetic handles hex with 0x prefix
+cap_val=$((0x$cap_hex))
+if [ $((cap_val & 0x20)) -eq 0 ]; then
+    _notrun "no directory leasing capability"
+fi
+
+echo "cifs167: server capabilities 0x$cap_hex include DIRECTORY_LEASING" >> $seqres.full
+
+# Prepare mount with actimeo=0 (and acdirmax=0 if accepted) to remove attr caching.
+mount_line=$(awk -v mnt="$TEST_DIR" '$2==mnt {print; exit}' /proc/mounts)
+[ -n "$mount_line" ] || _notrun "mount entry not found"
+orig_opts=$(echo "$mount_line" | awk '{print $4}')
+base_opts=${MOUNT_OPTIONS#-o}
+[ -n "$base_opts" ] || base_opts=$orig_opts
+
+_test_unmount >/dev/null 2>&1 || _notrun "cannot unmount test fs"
+_new_opts="actimeo=0,acdirmax=0,$base_opts"
+_do "_test_mount -o $_new_opts" || _fail "remount with actimeo=0 failed"
+_register_cleanup "_test_unmount >/dev/null 2>&1; _do '_test_mount -o $base_opts' >/dev/null 2>&1 || true; [ -n '$MNT2' ] && umount '$MNT2' >/dev/null 2>&1 || true; [ -n '$MNT2' ] && rmdir '$MNT2' >/dev/null 2>&1 || true"
+
+# Secondary mount (simulated second client)
+MNT2=$(mktemp -d /tmp/cifs167.sec.XXXXXX)
+if ! mount -t cifs "$TEST_DEV" "$MNT2" -o "$_new_opts" 2>>$seqres.full; then
+    rmdir "$MNT2"; _notrun "secondary mount failed"
+fi
+
+dirA="$TEST_DIR/cifs167.d"
+dirB="$MNT2/cifs167.d"
+rm -rf "$dirA" "$dirB" 2>/dev/null || true
+mkdir -p "$dirA" || _fail "mkdir primary dir"
+# Touch initial sentinel via primary
+: > "$dirA/sentinel" || _fail "create sentinel"
+
+# Prime cache (initial readdir)
+ls -1 "$dirA" > /dev/null 2>&1 || true
+
+# Remote modifications via second client
+mkdir -p "$dirB" || _fail "mkdir secondary dir"
+# Ensure directory exists from second perspective
+ls -1 "$dirB" > /dev/null 2>&1 || true
+# Create new files and remove sentinel
+: > "$dirB/new1" || _fail "sec create new1"
+: > "$dirB/new2" || _fail "sec create new2"
+rm -f "$dirB/sentinel" 2>/dev/null || true
+# Add another wave of modifications
+: > "$dirB/new3" || _fail "sec create new3"
+
+# Now primary should eventually reflect: new1,new2,new3 present AND sentinel absent
+want_present="new1 new2 new3"
+want_absent="sentinel"
+
+attempts=30
+ok=0
+while [ $attempts -gt 0 ]; do
+    cur=$(ls -1 "$dirA" 2>/dev/null | sort | xargs)
+    echo "cifs167: attempt=$attempts listing='$cur'" >> $seqres.full
+    miss=0
+    for f in $want_present; do
+        echo "$cur" | grep -qw "$f" || miss=1
+    done
+    gone=0
+    for f in $want_absent; do
+        if echo "$cur" | grep -qw "$f"; then gone=1; fi
+    done
+    if [ $miss -eq 0 ] && [ $gone -eq 0 ]; then ok=1; break; fi
+    sleep 0.2; attempts=$((attempts-1))
+    # light poke to generate lease break traffic
+    stat "$dirB" >/dev/null 2>&1 || true
+    stat "$dirA" >/dev/null 2>&1 || true
+done
+
+if [ $ok -ne 1 ]; then
+    echo "cifs167: final listing after retries: '$(ls -1 "$dirA" 2>/dev/null | sort | xargs)'" >> $seqres.full
+    _fail "directory entries not refreshed after remote modifications"
+fi
+
+echo "Directory lease invalidation OK"
+status=0; exit

@@ -1,0 +1,125 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: sustained write with induced network disconnects (auto reconnect & data integrity)
+#
+# What this test does
+# - Mount the share.
+# - Write a multi-megabyte file in fixed-size blocks, inducing several temporary
+#   network blackouts by inserting iptables DROP rules for the server IP.
+# - CIFS should transparently reconnect; the write loop must complete without
+#   data corruption.
+# - After completion, compute sha256 of the written file and compare against a
+#   locally generated expected file that used the same deterministic pattern.
+#
+# Skips if:
+# - iptables or getent unavailable, or server IP cannot be resolved.
+# - Not root (iptables insertion requires privileges).
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+command -v getent >/dev/null 2>&1 || _notrun "getent not available"
+# Need at least one disconnect mechanism: ss -K or iptables
+if command -v ss >/dev/null 2>&1; then
+	DISCONNECT_METHOD=ss
+elif command -v iptables >/dev/null 2>&1; then
+	DISCONNECT_METHOD=iptables
+else
+	_notrun "need ss or iptables for disconnect injection"
+fi
+
+_register_cleanup "_test_unmount >/dev/null 2>&1"
+_test_unmount >/dev/null 2>&1
+_do "_test_mount" || _fail "mount failed"
+
+# Derive server host & resolve IP (first address)
+host=$(echo "$TEST_DEV" | sed -E 's#^//([^/]+)/.*#\1#')
+[ -n "$host" ] || _notrun "could not parse host"
+server_ip=$(getent hosts "$host" | awk '{print $1; exit}')
+[ -n "$server_ip" ] || _notrun "could not resolve server IP"
+
+# File paths
+SUB="cifs143.$$.d"
+mkdir -p "$TEST_DIR/$SUB" || _fail "mkdir"
+REMOTE_FILE="$TEST_DIR/$SUB/reconnect_write.bin"
+EXPECTED_FILE=$(mktemp -t cifs143_expected.XXXXXX) || _fail "mktemp expected"
+SHA_REMOTE=$(mktemp -t cifs143_remsha.XXXXXX) || _fail "mktemp rsha"
+SHA_EXPECT=$(mktemp -t cifs143_expsha.XXXXXX) || _fail "mktemp esha"
+_register_cleanup "rm -f '$EXPECTED_FILE' '$SHA_REMOTE' '$SHA_EXPECT' >/dev/null 2>&1"
+
+# Write parameters
+BLOCK_SIZE=$((64*1024))   # 64K
+BLOCKS=64                 # ~4MB total
+INJECT_EVERY=8            # induce a disconnect every N blocks
+BLACKOUT_SECS=2           # length of iptables drop window (ignored for ss method)
+
+iptables_add_drop() {
+	iptables -I OUTPUT -d "$server_ip" -j DROP 2>/dev/null || return 1
+	iptables -I INPUT  -s "$server_ip" -j DROP 2>/dev/null || true
+}
+iptables_remove_drop() {
+	while iptables -D OUTPUT -d "$server_ip" -j DROP 2>/dev/null; do :; done
+	while iptables -D INPUT  -s "$server_ip" -j DROP 2>/dev/null; do :; done
+}
+ss_kill_conns() {
+	# Try to kill all established SMB sessions to server:445; ignore failures
+	ss -tn 2>/dev/null | grep -E "[.:]445\b" | grep "$server_ip" >> $seqres.full 2>&1 || true
+	# Attempt both dst and src directions (syntax tolerant across ss versions)
+	ss -K dst "$server_ip" dport = :445 2>>$seqres.full || true
+	ss -K src "$server_ip" sport = :445 2>>$seqres.full || true
+}
+if [ "$DISCONNECT_METHOD" = "iptables" ]; then
+	_register_cleanup iptables_remove_drop
+fi
+
+write_block() {
+	local idx=$1
+	local cval=$(( (idx % 26) + 65 ))  # ASCII A..Z
+	local ch=$(printf "\\%03o" $cval)
+	# Generate deterministic 64K block of single repeated character
+	# Write to expected file first, then append to remote file
+	head -c "$BLOCK_SIZE" < /dev/zero | tr '\0' "$ch" >> "$EXPECTED_FILE" || return 1
+	head -c "$BLOCK_SIZE" < /dev/zero | tr '\0' "$ch" >> "$REMOTE_FILE" || return 1
+	return 0
+}
+
+echo "cifs143: writing $BLOCKS blocks of $BLOCK_SIZE bytes; inject every $INJECT_EVERY blocks using $DISCONNECT_METHOD" >> $seqres.full
+
+i=0
+while [ $i -lt $BLOCKS ]; do
+	if ! write_block $i; then
+		_fail "write block $i failed"
+	fi
+	sync || true
+	# Induce drop after completing a block if schedule matches
+	if [ $(((i+1) % INJECT_EVERY)) -eq 0 ]; then
+		if [ "$DISCONNECT_METHOD" = "ss" ]; then
+			echo "cifs143: killing SMB connections after block $i (ss -K)" >> $seqres.full
+			ss_kill_conns
+		else
+			echo "cifs143: iptables drop window after block $i" >> $seqres.full
+			iptables_add_drop || echo "cifs143: failed to add drop rule" >> $seqres.full
+			sleep $BLACKOUT_SECS
+			iptables_remove_drop
+		fi
+	fi
+	i=$((i+1))
+done
+
+sync || true
+
+sha256sum "$REMOTE_FILE" | awk '{print $1}' > "$SHA_REMOTE" 2>>$seqres.full || _fail "sha remote"
+sha256sum "$EXPECTED_FILE" | awk '{print $1}' > "$SHA_EXPECT" 2>>$seqres.full || _fail "sha expected"
+
+if ! diff -u "$SHA_EXPECT" "$SHA_REMOTE" >> $seqres.full 2>&1; then
+	_fail "sha256 mismatch after reconnect write stress"
+fi
+
+echo "reconnect write with induced drops OK"
+
+status=0
+exit

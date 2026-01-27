@@ -1,0 +1,69 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: UNC validation error paths
+#
+# Purpose:
+#   Exercise mount.cifs UNC parsing failures: missing //, too short //, overlength share.
+#
+# Cases:
+#   1. DEV1 = host/share (no leading //) -> expect "bad UNC".
+#   2. DEV2 = // (just slashes) -> expect "UNC name too short".
+#   3. DEV3 = //host/aaaa...(>256) -> expect "share portion of UNC too long".
+#
+# Success when all cases fail with expected substrings.
+#
+# Skip:
+#   - Non-CIFS FSTYP
+#   - Not root
+#   - Cannot parse host/share from TEST_DEV
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+
+host=$(echo "$TEST_DEV" | sed -n 's#^//\([^/]*\)/.*#\1#p')
+share=$(echo "$TEST_DEV" | sed -n 's#^//[^/]*/\([^/]*\).*#\1#p')
+[ -n "$host" ] || _notrun "parse host failed"
+[ -n "$share" ] || _notrun "parse share failed"
+
+MNT2=$(mktemp -d /tmp/cifs182.mnt.XXXXXX) || _fail "mktemp"
+_register_cleanup "rmdir $MNT2 >/dev/null 2>&1 || true"
+
+base_opts=${MOUNT_OPTIONS#-o}
+if [ -z "$base_opts" ]; then
+    base_opts=$(awk -v mnt="$TEST_DIR" '$2==mnt {print $4}' /proc/mounts)
+fi
+
+fail_case() {
+    local dev="$1"; shift
+    local expect="$1"; shift
+    local err=$TMPDIR/cifs182.err.$$ 
+    if mount -t cifs "$dev" "$MNT2" -o "$base_opts" > /dev/null 2> "$err"; then
+        umount "$MNT2" >/dev/null 2>&1 || true
+        _fail "unexpected success for $dev"
+    fi
+    if ! grep -qi "$expect" "$err"; then
+        echo "cifs182: dev=$dev expected substring '$expect'" >> $seqres.full
+        echo "stderr:" >> $seqres.full
+        cat "$err" >> $seqres.full
+        _fail "missing expected error substring for $dev"
+    fi
+    rm -f "$err"
+}
+
+longshare=$(printf 'a%.0s' $(seq 1 300))
+
+DEV1="$host/$share"           # missing leading //
+DEV2="//"                      # just slashes
+DEV3="//$host/$longshare"      # overlength share
+
+fail_case "$DEV1" "bad UNC"
+fail_case "$DEV2" "UNC name too short"
+fail_case "$DEV3" "share portion of UNC too long"
+
+echo "UNC validation error handling OK"
+status=0; exit

@@ -1,0 +1,140 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: lease downgrade & break sequence across two clients (mounts)
+#
+# Scenario:
+#   1. Client1 (primary mount) opens file RW -> expect RWH lease.
+#   2. Client2 (secondary mount) opens same file READ -> both downgrade to RH.
+#   3. Client2 performs WRITE -> Client1 lease should be broken (no lease / entry removed),
+#      leaving only Client2 with RH OR two entries where one has no R/H/W flags.
+#
+# Verification source: /proc/fs/cifs/open_files (skip if absent or lease tokens not parseable).
+# We poll after each phase for expected states with bounded retries.
+#
+# Skip conditions:
+#   - Not CIFS, no TEST_DIR, leasing unsupported (cap bit 0x2), missing open_files interface.
+#   - Could not observe initial RWH lease (environment not granting write caching).
+#
+# Output: single success line; diagnostics -> $seqres.full
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ -r /proc/fs/cifs/DebugData ] || _notrun "no DebugData"
+[ -r /proc/fs/cifs/open_files ] || _notrun "no open_files interface"
+
+# Check leasing capability (bit1 0x2)
+host=$(echo "$TEST_DEV" | sed -E 's#^//([^/]+)/.*#\1#')
+[ -n "$host" ] || _notrun "parse host failed"
+cap_line=$(awk -v h="$host" 'tolower($0) ~ h {t=1} t && /Server capabilities:/ {print; exit}' /proc/fs/cifs/DebugData)
+[ -n "$cap_line" ] || _notrun "no capabilities line"
+cap_hex=$(echo "$cap_line" | sed -n 's/.*Server capabilities:[[:space:]]*0x\([0-9a-fA-F]\+\).*/\1/p')
+[ -n "$cap_hex" ] || _notrun "parse caps failed"
+cap_val=$((0x$cap_hex))
+if [ $((cap_val & 0x2)) -eq 0 ]; then _notrun "leasing unsupported"; fi
+echo "cifs170: server caps=0x$cap_hex" >> $seqres.full
+
+# Remount primary with actimeo=0 to minimize attribute caching interference.
+mline=$(awk -v mnt="$TEST_DIR" '$2==mnt {print; exit}' /proc/mounts)
+[ -n "$mline" ] || _notrun "mount entry not found"
+base_opts=${MOUNT_OPTIONS#-o}
+[ -z "$base_opts" ] && base_opts=$(echo "$mline" | awk '{print $4}')
+if ! echo "$base_opts" | grep -qw actimeo=0; then
+    _test_unmount >/dev/null 2>&1 || _notrun "cannot unmount"
+    _do "_test_mount -o actimeo=0,$base_opts" || _fail "remount actimeo=0 failed"
+    _register_cleanup "_test_unmount >/dev/null 2>&1; _do '_test_mount -o $base_opts' >/dev/null 2>&1 || true"
+fi
+
+# Secondary mount
+MNT2=$(mktemp -d /tmp/cifs170.sec.XXXXXX)
+sec_opts="actimeo=0,$base_opts"
+if ! mount -t cifs "$TEST_DEV" "$MNT2" -o "$sec_opts" 2>>$seqres.full; then
+    rmdir "$MNT2"; _notrun "secondary mount failed"
+fi
+_register_cleanup "umount $MNT2 >/dev/null 2>&1 || true; rmdir $MNT2 >/dev/null 2>&1 || true"
+
+FNAME="cifs170.testfile"
+F1="$TEST_DIR/$FNAME"
+F2="$MNT2/$FNAME"
+
+# Helper: collect lease states for file basename from open_files
+collect_states() {
+    local bn="$1"
+    grep -i "${bn}" /proc/fs/cifs/open_files 2>/dev/null |
+        sed -n 's/.*[Ll]ease[^:]*:[[:space:]]*\([A-Z][A-Z]*\).*/\1/p'
+}
+
+# Helper: dump matching lines (debug)
+dump_open_files() { grep -i "$FNAME" /proc/fs/cifs/open_files 2>/dev/null >> $seqres.full || true; }
+
+# Phase 1: Client1 open RW (create)
+exec {fd1}<> "$F1" || _fail "client1 open"
+echo "X" >&$fd1 || _fail "client1 initial write"
+
+retry=25
+while [ $retry -gt 0 ]; do
+    states=$(collect_states "$FNAME")
+    for s in $states; do
+        if [ "$s" = "RWH" ]; then phase1=1; break; fi
+    done
+    [ -n "$phase1" ] && break
+    sleep 0.2; retry=$((retry-1))
+done
+dump_open_files
+[ -n "$phase1" ] || _notrun "did not observe initial RWH lease (states: $states)"
+echo "cifs170: phase1 states=$states" >> $seqres.full
+
+# Phase 2: Client2 open READ (expect downgrade to RH on both)
+exec {fd2}< "$F2" || _fail "client2 read open"
+retry=30
+while [ $retry -gt 0 ]; do
+    states=$(collect_states "$FNAME")
+    # Expect two RH entries (allow ordering)
+    cnt=$(echo "$states" | wc -w)
+    all_rh=1
+    [ $cnt -ge 2 ] || all_rh=0
+    if [ $all_rh -eq 1 ]; then
+        for s in $states; do [ "$s" = "RH" ] || all_rh=0; done
+    fi
+    [ $all_rh -eq 1 ] && phase2=1 && break
+    sleep 0.2; retry=$((retry-1))
+done
+dump_open_files
+[ -n "$phase2" ] || _fail "did not observe dual RH leases after second open (states: $states)"
+echo "cifs170: phase2 states=$states" >> $seqres.full
+
+# Phase 3: Client2 obtains write handle and writes; expect client1 lease removal/break.
+exec {fd2w}<> "$F2" || _fail "client2 rw open"
+printf "YY" >&$fd2w || _fail "client2 write"
+
+retry=35
+phase3=""
+while [ $retry -gt 0 ]; do
+    states=$(collect_states "$FNAME")
+    # Success conditions:
+    #   a) only one RH entry remains
+    #   b) two entries but only one has RH/RWH and the other is NOT R/W/H (parsed token != R|RH|RWH|RW)
+    c=$(echo "$states" | wc -w)
+    if [ $c -eq 1 ] && echo "$states" | grep -Eq '^RH$'; then phase3=1; break; fi
+    if [ $c -eq 2 ]; then
+        good=0; bad=0
+        for s in $states; do
+            case "$s" in
+                RH|RWH|RW) good=$((good+1));;
+                R|W|H) good=$((good+1));; # still caching -> not yet
+                *) bad=$((bad+1));;
+            esac
+        done
+        if [ $good -eq 1 ] && [ $bad -eq 1 ]; then phase3=1; break; fi
+    fi
+    sleep 0.2; retry=$((retry-1))
+done
+dump_open_files
+[ -n "$phase3" ] || _fail "lease break not observed after client2 write (states: $states)"
+echo "cifs170: phase3 states=$states" >> $seqres.full
+
+echo "Lease downgrade & break sequence OK"
+status=0; exit

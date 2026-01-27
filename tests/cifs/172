@@ -1,0 +1,100 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: lease reclaim after TCP reconnect
+#
+# Goal:
+#   Open a batch of files to obtain RWH (or RH) leases, forcibly drop TCP
+#   connectivity (iptables DROP) to simulate a disconnect, remove DROP rules,
+#   then verify lease entries for all files reappear in /proc/fs/cifs/open_files
+#   within a recovery window and are not downgraded collectively to no lease.
+#
+# Acceptance:
+#   - Initial: at least N files show lease tokens (RWH/RH/RW). If too few, skip.
+#   - After reconnect: same count of files have lease tokens (token may be RH instead of RWH) within timeout.
+#
+# Skip conditions:
+#   - Not CIFS, missing TEST_DIR
+#   - /proc/fs/cifs/open_files unavailable
+#   - No leasing capability (cap bit 0x2)
+#   - Not root or missing iptables
+#
+# Output: single success line.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ -r /proc/fs/cifs/open_files ] || _notrun "no open_files interface"
+[ -r /proc/fs/cifs/DebugData ] || _notrun "no DebugData"
+[ "$(id -u)" = 0 ] || _notrun "root required for iptables"
+command -v iptables >/dev/null 2>&1 || _notrun "iptables missing"
+
+host=$(echo "$TEST_DEV" | sed -E 's#^//([^/]+)/.*#\1#')
+[ -n "$host" ] || _notrun "parse host failed"
+cap_line=$(awk -v h="$host" 'tolower($0) ~ h {t=1} t && /Server capabilities:/ {print; exit}' /proc/fs/cifs/DebugData)
+[ -n "$cap_line" ] || _notrun "no capabilities line"
+cap_hex=$(echo "$cap_line" | sed -n 's/.*Server capabilities:[[:space:]]*0x\([0-9a-fA-F]\+\).*/\1/p')
+[ -n "$cap_hex" ] || _notrun "parse caps failed"
+cap_val=$((0x$cap_hex))
+if [ $((cap_val & 0x2)) -eq 0 ]; then _notrun "leasing unsupported"; fi
+
+server_ip=$(getent ahostsv4 "$host" | awk '{print $1; exit}')
+[ -n "$server_ip" ] || _notrun "resolve server ip failed"
+
+NUM=${CIFS_LEASE_RECLAIM_FILES:-40}
+DIR="$TEST_DIR/cifs172.dir"
+rm -rf "$DIR" 2>/dev/null || true
+mkdir -p "$DIR" || _fail "mkdir"
+_register_cleanup "rm -rf '$DIR' >/dev/null 2>&1; iptables -D OUTPUT -d $server_ip -p tcp --dport 445 -j DROP 2>/dev/null || true; iptables -D INPUT -s $server_ip -p tcp --sport 445 -j DROP 2>/dev/null || true"
+
+# Create and open files
+for i in $(seq 1 $NUM); do
+    f="$DIR/f$i"; : > "$f" || _fail "create f$i"
+    eval "exec {fd}<> '$f'" || _fail "open f$i"
+    printf "x" >&$fd || _fail "write f$i"
+done
+
+collect() {
+    local dir="$1"
+    grep -F "$dir/" /proc/fs/cifs/open_files 2>/dev/null |
+        sed -n 's/^.* \([^ ]*\/f[0-9][0-9]*\) .*Lease[^:]*: *\([A-Z][A-Z]*\).*/\1 \2/p'
+}
+
+# Wait for leases
+retry=25
+have=0
+while [ $retry -gt 0 ]; do
+    lines=$(collect "$DIR")
+    have=$(echo "$lines" | awk '{print $1}' | wc -l)
+    [ "$have" -ge $((NUM/2)) ] && break
+    sleep 0.2; retry=$((retry-1))
+done
+echo "cifs172: initial_lease_entries=$have expected=$NUM" >> $seqres.full
+[ "$have" -ge $((NUM/2)) ] || _notrun "insufficient initial leases ($have)"
+
+# Snapshot baseline map
+echo "$lines" > "$DIR/base.map"
+
+# Drop traffic
+iptables -I OUTPUT -d "$server_ip" -p tcp --dport 445 -j DROP 2>>$seqres.full || _notrun "iptables OUTPUT rule fail"
+iptables -I INPUT -s "$server_ip" -p tcp --sport 445 -j DROP 2>>$seqres.full || _notrun "iptables INPUT rule fail"
+sleep 3
+iptables -D OUTPUT -d "$server_ip" -p tcp --dport 445 -j DROP 2>>$seqres.full || true
+iptables -D INPUT -s "$server_ip" -p tcp --sport 445 -j DROP 2>>$seqres.full || true
+
+# Recovery: wait for lease reappearance (equal or near baseline count)
+retry=40
+post=0
+while [ $retry -gt 0 ]; do
+    lines2=$(collect "$DIR")
+    post=$(echo "$lines2" | awk '{print $1}' | wc -l)
+    echo "cifs172: recovery poll count=$post retry=$retry" >> $seqres.full
+    [ "$post" -ge "$have" ] && break
+    sleep 0.25; retry=$((retry-1))
+done
+[ "$post" -ge "$have" ] || _fail "lease entries not fully recovered (baseline=$have recovered=$post)"
+
+echo "Lease reclaim after reconnect OK"
+status=0; exit

@@ -1,0 +1,37 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: bsize= mount option influences statfs f_bsize (if supported)
+#
+# Notes
+# - Skips if kernel/dialect does not honor configurable bsize (observed %s != requested).
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+
+_register_cleanup "_test_unmount >/dev/null 2>&1"
+_test_unmount >/dev/null 2>&1
+
+MO=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+MO=$(echo "$MO" | awk -F, '{out=""; for(i=1;i<=NF;i++){ if($i ~ /^bsize=/) continue; out=out (out?"," : "") $i } print out}')
+BS=262144
+[ -n "$MO" ] && MO="$MO,bsize=$BS" || MO="bsize=$BS"
+
+MNT=$(mktemp -d /tmp/cifs134.XXXXXX) || _fail "mktemp failed"
+_do "mount -t cifs '$TEST_DEV' '$MNT' -o '$MO'" || _fail "mount failed"
+
+sz=$(stat -f -c %s "$MNT" 2>/dev/null || echo "")
+[ -n "$sz" ] || _notrun "statfs unsupported"
+
+if [ "$sz" = "$BS" ]; then
+    echo "bsize mount option reflects in statfs OK"
+else
+    _notrun "statfs block size ($sz) != requested ($BS); kernel/dialect may not support configurable bsize"
+fi
+
+status=0
+exit

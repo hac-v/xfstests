@@ -1,0 +1,58 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: encryption cipher report via smbinfo keys
+# Goal:
+#   Mount with -o seal (if not already). Run smbinfo keys on a file/path
+#   within the mount and verify output lines for Session Id, Cipher, Session Key,
+#   Encryption key, Decryption key; ensure Cipher reports an AES variant when
+#   encryption is enabled. Skip if smbinfo not present or encryption not active.
+# Output: single success line.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+# Locate smbinfo utility: allow override via SMBINFO env var
+SMBINFO=${SMBINFO:-$(command -v smbinfo 2>/dev/null || command -v smb3info 2>/dev/null)}
+[ -n "$SMBINFO" ] || _notrun "smbinfo utility not found (install smb3-utils)"
+
+# Ensure encryption requested (if current mount not sealed remount with seal)
+if ! grep -q "seal" /proc/mounts | grep -q " $(echo "$TEST_DIR" | sed 's#/#\\/#g') "; then
+    # Capture existing opts
+    mline=$(awk -v mnt="$TEST_DIR" '$2==mnt {print; exit}' /proc/mounts)
+    [ -n "$mline" ] || _notrun "mount line not found"
+    orig_opts=$(echo "$mline" | awk '{print $4}')
+    if [ "$(id -u)" != 0 ]; then _notrun "need root to remount with seal"; fi
+    _test_unmount >/dev/null 2>&1 || _notrun "cannot unmount"
+    _do "_test_mount -o seal,${orig_opts#-o}" || _fail "remount with seal failed"
+    _register_cleanup "_test_unmount >/dev/null 2>&1 || true; _do '_test_mount -o ${orig_opts#-o}' >/dev/null 2>&1 || true"
+fi
+
+probe_file="$TEST_DIR/cifs169.$$.probe"
+: > "$probe_file" || _fail "create probe file"
+
+# Run smbinfo keys and capture
+out=$("$SMBINFO" keys "$probe_file" 2>&1)
+rc=$?
+echo "cifs169: smbinfo rc=$rc" >> $seqres.full
+echo "$out" >> $seqres.full
+[ $rc -eq 0 ] || _notrun "smbinfo keys failed rc=$rc"
+
+# Basic required lines
+echo "$out" | grep -q "Session Id:" || _fail "no Session Id line"
+echo "$out" | grep -q "Cipher:" || _fail "no Cipher line"
+echo "$out" | grep -q "Session Key:" || _fail "no Session Key line"
+echo "$out" | grep -q "Encryption key:" || _fail "no Encryption key line"
+echo "$out" | grep -q "Decryption key:" || _fail "no Decryption key line"
+
+# Extract cipher descriptor (text after first parenthesis if present)
+# Accept AES-128/256 CCM/GCM variants.
+if ! echo "$out" | awk '/Cipher:/ {line=$0} END{print line}' | grep -Eqi 'AES-128|AES-256'; then
+    _notrun "cipher line present but not AES-128/256 (encryption maybe disabled)"
+fi
+
+echo "encryption cipher via smbinfo keys OK"
+status=0; exit

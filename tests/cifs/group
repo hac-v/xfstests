@@ -1,49 +1,80 @@
+#!/bin/true
+# CIFS group list normalized (no leading spaces).
 cifs/100
- 
 cifs/101
-
 cifs/102
-
 cifs/103
-
 cifs/104
-
- cifs/105
-
- cifs/106
-
- cifs/107
-
- cifs/108
- 
- cifs/109
-
- cifs/110
-
- cifs/111
-
- cifs/112
-
- cifs/113
-
- cifs/114
-
- cifs/115
-
- cifs/116
-
- cifs/117
-
- cifs/118
-
- cifs/119
-
- cifs/120
-
- cifs/121
-
- cifs/122
-
- cifs/121
+cifs/105
+cifs/106
+cifs/107
+cifs/108
+cifs/109
+cifs/110
+cifs/111
+cifs/112
+cifs/113
+cifs/114
+cifs/115
+cifs/116
+cifs/117
+cifs/118
+cifs/119
+cifs/120
+cifs/121
+cifs/122
+cifs/148
+cifs/149
+cifs/150
+cifs/151
+cifs/152
+cifs/153
+cifs/154
+cifs/155
+cifs/156
+cifs/157
+cifs/158
+cifs/159
+cifs/160
+cifs/161
+cifs/162
+cifs/163
+cifs/164
+cifs/165
+cifs/166
+cifs/167
+cifs/168
+cifs/169
+cifs/170
+cifs/171
+cifs/172
+cifs/173
+cifs/174
+cifs/175
+cifs/176
+cifs/177
+cifs/181
+cifs/182
+cifs/183
+cifs/184
+cifs/185
+cifs/186
+cifs/187
+cifs/188
+cifs/189
+cifs/190
+cifs/191
+cifs/192
+cifs/193
+cifs/194
+cifs/195
+cifs/196
+cifs/197
+cifs/198
+cifs/199
+cifs/200
+cifs/201
+cifs/202
+cifs/203
 
 

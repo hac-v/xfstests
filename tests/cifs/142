@@ -1,0 +1,39 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: file_mode/dir_mode apply for new files/dirs
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+
+_register_cleanup "_test_unmount >/dev/null 2>&1"
+_test_unmount >/dev/null 2>&1
+
+FM=0640
+DM=0750
+
+BASE=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+BASE=$(echo "$BASE" | awk -F, '{out=""; for(i=1;i<=NF;i++){ if($i ~ /^file_mode=/ || $i ~ /^dir_mode=/) continue; out=out (out?"," : "") $i } print out}')
+MO=$BASE; [ -n "$MO" ] && MO="$MO,file_mode=$FM,dir_mode=$DM" || MO="file_mode=$FM,dir_mode=$DM"
+
+M1=$(mktemp -d /tmp/cifs142.XXXXXX) || _fail "mktemp"
+_do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO'" || _fail "mount failed"
+
+SUB="cifs142.$$.d"; mkdir -p "$M1/$SUB" || _fail "mkdir"
+F="$M1/$SUB/f"; D="$M1/$SUB/d"
+echo x > "$F" || _fail "create file"
+mkdir "$D" || _fail "create dir"
+
+fm=$(stat -c %a "$F") || _fail "stat fm"
+dm=$(stat -c %a "$D") || _fail "stat dm"
+
+[ "$fm" = "${FM#0}" ] || _fail "file mode mismatch: $fm vs ${FM#0}"
+[ "$dm" = "${DM#0}" ] || _fail "dir mode mismatch: $dm vs ${DM#0}"
+
+echo "file_mode/dir_mode mapping OK"
+
+status=0
+exit

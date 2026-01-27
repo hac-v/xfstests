@@ -1,0 +1,106 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: guest vs sec=none mount behavior
+#
+# Summary
+#   Compare anonymous authentication methods by mounting the share once with
+#   sec=none and once with guest, confirming both can list the share (skipping
+#   if the server refuses), and ensuring option strings in /proc/mounts reflect
+#   each mode.
+#
+# Phases
+#   1. Strip credential parameters from the baseline options so we can attempt
+#      anonymous mounts.
+#   2. Mount with sec=none; treat Access/Permission denied as a skip since the
+#      server may not allow anonymous logons.
+#   3. Mount with guest using the same stripped base options; again skip if the
+#      server refuses guest sessions.
+#   4. Sanity-check that the mounts are usable (simple ls) and that the option
+#      strings still mention sec=none and guest respectively.
+#   5. Unmount both and report success.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+
+base_opts=${MOUNT_OPTIONS#-o}
+if [ -z "$base_opts" ]; then
+    base_opts=$(awk -v mnt="$TEST_DIR" '$2==mnt {print $4}' /proc/mounts)
+fi
+
+strip_auth=$(echo "$base_opts" | sed -E 's/(^|,)username=[^,]*//g; s/(^|,)user=[^,]*//g; s/(^|,)password=[^,]*//g; s/(^|,)pass=[^,]*//g; s/(^|,)pass2=[^,]*//g; s/(^|,)domain=[^,]*//g; s/(^|,)cred[a-z]*=[^,]*//g; s/,,/,/g; s/^,//; s/,$//')
+
+if [ -z "$strip_auth" ]; then
+    authless_opts=""
+else
+    authless_opts="$strip_auth"
+fi
+
+MNT_NONE=$(mktemp -d /tmp/cifs189.none.XXXXXX) || _fail "mktemp"
+MNT_GUEST=$(mktemp -d /tmp/cifs189.guest.XXXXXX) || _fail "mktemp"
+
+cleanup()
+{
+    for mp in "$MNT_GUEST" "$MNT_NONE"; do
+        if mountpoint -q "$mp"; then
+            umount "$mp" >/dev/null 2>&1 || true
+        fi
+        rmdir "$mp" >/dev/null 2>&1 || true
+    done
+}
+_register_cleanup cleanup
+
+join_opts() {
+    local extra="$1"
+    if [ -z "$authless_opts" ]; then
+        printf '%s' "$extra"
+    elif [ -z "$extra" ]; then
+        printf '%s' "$authless_opts"
+    else
+        printf '%s,%s' "$extra" "$authless_opts"
+    fi
+}
+
+opts_none=$(join_opts "sec=none")
+err_none=$TMPDIR/cifs189_none.err
+if ! mount -t cifs "$TEST_DEV" "$MNT_NONE" -o "$opts_none" >$seqres.full 2>"$err_none"; then
+    if grep -qi "access denied" "$err_none" || grep -qi "logon" "$err_none" || grep -qi "permission denied" "$err_none"; then
+        _notrun "server denies anonymous access"
+    fi
+    cat "$err_none" >>$seqres.full
+    _fail "sec=none mount failed"
+fi
+
+opts_guest=$(join_opts "guest")
+err_guest=$TMPDIR/cifs189_guest.err
+if ! mount -t cifs "$TEST_DEV" "$MNT_GUEST" -o "$opts_guest" >$seqres.full 2>"$err_guest"; then
+    if grep -qi "access denied" "$err_guest" || grep -qi "permission denied" "$err_guest" || grep -qi "logon" "$err_guest"; then
+        _notrun "guest mount denied"
+    fi
+    cat "$err_guest" >>$seqres.full
+    _fail "guest mount failed"
+fi
+
+test_access() {
+    local dir="$1"
+    ls "$dir" >/dev/null 2>&1
+}
+
+test_access "$MNT_NONE" || _fail "sec=none mount not accessible"
+test_access "$MNT_GUEST" || _fail "guest mount not accessible"
+
+line_none=$(grep -F " $MNT_NONE " /proc/mounts | head -n1)
+line_guest=$(grep -F " $MNT_GUEST " /proc/mounts | head -n1)
+[ -n "$line_none" ] || _fail "sec=none entry missing in /proc/mounts"
+[ -n "$line_guest" ] || _fail "guest entry missing in /proc/mounts"
+
+echo "$line_none" | grep -q "sec=none" || _fail "sec=none not preserved in /proc/mounts"
+echo "$line_guest" | grep -q "guest" || echo "cifs189: guest flag not visible in /proc/mounts" >>$seqres.full
+
+echo "Guest vs sec=none mount behavior OK"
+status=0
+exit

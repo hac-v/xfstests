@@ -1,0 +1,166 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: statvfs/df reflect predictable space consumption
+#
+# Writes a known amount of data and verifies that both statvfs() and df report
+# a commensurate reduction in available space, then confirms the space is
+# reclaimed after unlinking the file. Allows a tolerance to account for server
+# allocation granularity or compression.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick quota
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+command -v python3 >/dev/null 2>&1 || _notrun "python3 required"
+
+MB=${CIFS200_MB:-32}
+case "$MB" in ''|*[^0-9]*) _notrun "CIFS200_MB must be integer" ;; esac
+[ "$MB" -gt 0 ] || _notrun "CIFS200_MB must be >0"
+BYTES=$((MB * 1024 * 1024))
+
+stat_line() {
+    python3 - <<'PY' "$1"
+import os, sys
+st = os.statvfs(sys.argv[1])
+print(f"{st.f_frsize} {st.f_bavail} {st.f_bfree} {st.f_blocks}")
+PY
+}
+
+read frsize bavail0 bfree0 blocks0 < <(stat_line "$TEST_DIR")
+[ -n "$frsize" ] || _fail "statvfs failed"
+
+required_blocks=$(((BYTES + frsize - 1) / frsize))
+avail_bytes=$((bavail0 * frsize))
+[ "$avail_bytes" -ge $((BYTES * 2)) ] || _notrun "insufficient free space"
+
+workdir="$TEST_DIR/cifs200.$$"
+mkdir -p "$workdir" || _fail "mkdir workdir"
+_register_cleanup "rm -rf '$workdir' >/dev/null 2>&1 || true"
+
+file="$workdir/payload.bin"
+
+df_before=$(df -k --output=avail "$TEST_DIR" | tail -1)
+
+if ! dd if=/dev/zero of="$file" bs=1M count=$MB conv=fsync status=none >>$seqres.full 2>&1; then
+    _fail "dd write failed"
+fi
+sync
+
+read _ bavail1 bfree1 blocks1 < <(stat_line "$TEST_DIR")
+df_after=$(df -k --output=avail "$TEST_DIR" | tail -1)
+
+blocks_consumed=$((bavail0 - bavail1))
+kb_before=$df_before
+kb_after=$df_after
+kb_consumed=$((kb_before - kb_after))
+expected_kb=$(((BYTES + 1023) / 1024))
+
+if [ "$blocks_consumed" -le 0 ]; then
+    echo "cifs200: bavail before=$bavail0 after=$bavail1" >>$seqres.full
+    _fail "statvfs free blocks did not decrease"
+fi
+
+min_blocks=$((required_blocks * 8 / 10))
+[ "$min_blocks" -lt 1 ] && min_blocks=1
+if [ "$blocks_consumed" -lt "$min_blocks" ]; then
+    echo "cifs200: required_blocks=$required_blocks observed=$blocks_consumed" >>$seqres.full
+    _fail "statvfs delta smaller than expected"
+fi
+
+min_kb=$((expected_kb * 8 / 10))
+[ "$min_kb" -lt 1 ] && min_kb=1
+if [ "$kb_consumed" -lt "$min_kb" ]; then
+    echo "cifs200: expected_kb=$expected_kb observed=$kb_consumed" >>$seqres.full
+    _fail "df delta smaller than expected"
+fi
+
+rm -f "$file"
+sync
+
+read _ bavail2 bfree2 blocks2 < <(stat_line "$TEST_DIR")
+df_final=$(df -k --output=avail "$TEST_DIR" | tail -1)
+
+blocks_recovered=$((bavail2 - bavail1))
+kb_recovered=$((df_final - df_after))
+
+if [ "$blocks_recovered" -lt "$min_blocks" ]; then
+    echo "cifs200: recovered blocks=$blocks_recovered need>=$min_blocks" >>$seqres.full
+    _fail "statvfs did not recover after unlink"
+fi
+
+if [ "$kb_recovered" -lt "$min_kb" ]; then
+    echo "cifs200: recovered KB=$kb_recovered need>=$min_kb" >>$seqres.full
+    _fail "df did not recover after unlink"
+fi
+
+# Repeat cycles to ensure no leak builds up and Stats counters move.
+CYCLES=${CIFS200_CYCLES:-3}
+
+parse_stats() {
+    awk -v host="$host" -v share="$share" '
+        /^[[:space:]]*[0-9]+\)/ {
+            if (match($0, /\\\\([^\\]+)\\([^[:space:]]+)/, m)) {
+                inb = (m[1]==host && m[2]==share) ? 1 : 0;
+            } else {
+                inb = 0;
+            }
+        }
+        inb && $1=="Writes:" {w=$2}
+        inb && $1=="InodesOpened:" {io=$2}
+        inb && $1=="Deletes:" {d=$2}
+        inb && NF==0 {
+            if (w!="" || io!="" || d!="") {
+                print w, io, d;
+                exit;
+            }
+            inb = 0;
+        }
+    ' /proc/fs/cifs/Stats 2>/dev/null
+}
+
+host=$(echo "$TEST_DEV" | sed -n 's#^//\([^/]*\)/.*#\1#p')
+share=$(echo "$TEST_DEV" | sed -n 's#^//[^/]+/\([^/]*\).*#\1#p')
+if [ -r /proc/fs/cifs/Stats ] && [ -n "$host" ] && [ -n "$share" ]; then
+    read writes0 inodes0 deletes0 < <(parse_stats)
+else
+    writes0=""; inodes0=""; deletes0=""
+fi
+
+for c in $(seq 1 "$CYCLES"); do
+    tmpfile="$workdir/loop.$c"
+    if ! dd if=/dev/zero of="$tmpfile" bs=1M count=$MB conv=fsync status=none >>$seqres.full 2>&1; then
+        _fail "cycle $c dd failed"
+    fi
+    sync
+    rm -f "$tmpfile"
+    sync
+done
+
+if [ -n "$writes0" ]; then
+    read writes1 inodes1 deletes1 < <(parse_stats)
+    if [ -n "$writes1" ]; then
+        if [ "$writes1" -le "$writes0" ]; then
+            echo "cifs200: Writes did not increase (before=$writes0 after=$writes1)" >>$seqres.full
+            _fail "Write counter did not move"
+        fi
+    fi
+    if [ -n "$inodes1" ]; then
+        if [ "$inodes1" -le "$inodes0" ]; then
+            echo "cifs200: InodesOpened did not increase (before=$inodes0 after=$inodes1)" >>$seqres.full
+            _fail "Inodes counter did not move"
+        fi
+    fi
+    if [ -n "$deletes1" ]; then
+        if [ "$deletes1" -le "$deletes0" ]; then
+            echo "cifs200: Deletes did not increase (before=$deletes0 after=$deletes1)" >>$seqres.full
+            _fail "Deletes counter did not move"
+        fi
+    fi
+fi
+
+echo "statvfs/df and Stats share counters reflect space usage"
+status=0
+exit

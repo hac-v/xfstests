@@ -1,0 +1,156 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: constrained max_credits open/close stress
+#
+# Remounts the share with a small max_credits value and hammers open/close and
+# append operations across many concurrent workers. Validates that requests do
+# not fail, that Active credits never exceed Max, and that credits return close
+# to baseline when the storm finishes.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto stress
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ -r /proc/fs/cifs/DebugData ] || _notrun "no DebugData"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+command -v python3 >/dev/null 2>&1 || _notrun "python3 required"
+
+TARGET_MAX=${CIFS201_MAX:-24}
+TOL=${CIFS201_TOL:-6}
+WORKERS=${CIFS201_WORKERS:-48}
+ITER=${CIFS201_ITER:-200}
+
+mount_line=$(awk -v mnt="$TEST_DIR" '$2==mnt {print; exit}' /proc/mounts)
+[ -n "$mount_line" ] || _notrun "mount entry not found"
+orig_opts=$(echo "$mount_line" | awk '{print $4}')
+
+parse_credits() {
+    awk '
+/Credits:/ {
+    for(i=1;i<=NF;i++) {
+        if($i=="Max:") m=$(i+1);
+        if($i=="Active:") a=$(i+1);
+    }
+    if(m!="" && a!="") {
+        gsub(/[,]/,"",m);
+        gsub(/[,]/,"",a);
+        print m, a;
+        exit;
+    }
+}
+/Number of credits:/ {
+    split($4, vals, ",");
+    if(length(vals) >= 2) {
+        max=vals[1];
+        act=vals[2];
+        gsub(/[^0-9]/, "", max);
+        gsub(/[^0-9]/, "", act);
+        if(max!="" && act!="") {
+            print max, act;
+            exit;
+        }
+    }
+}
+' /proc/fs/cifs/DebugData 2>/dev/null
+}
+
+read max base_active < <(parse_credits)
+[ -n "$max" ] && [ -n "$base_active" ] || _notrun "cannot parse credits"
+case $max in *[!0-9]*|"") _notrun "bad max format" ;; esac
+case $base_active in *[!0-9]*|"") _notrun "bad active format" ;; esac
+
+# Remount with smaller max_credits when possible.
+if mount -o remount,max_credits=$TARGET_MAX "$TEST_DIR" >>$seqres.full 2>&1; then
+    _register_cleanup "mount -o remount,'$orig_opts' '$TEST_DIR' >/dev/null 2>&1 || true"
+    read max base_active < <(parse_credits)
+    [ -n "$max" ] || _notrun "post-remount credits parse failed"
+else
+    echo "cifs201: remount max_credits failed; falling back to existing limit" >>$seqres.full
+fi
+
+WORKDIR="$TEST_DIR/cifs201.$$"
+mkdir -p "$WORKDIR" || _fail "mkdir workdir"
+_register_cleanup "rm -rf '$WORKDIR' >/dev/null 2>&1 || true"
+
+for w in $(seq 0 $((WORKERS-1))); do
+    printf 'seed%06d' "$w" >"$WORKDIR/file.$w" || _fail "seed file $w"
+done
+
+worker() {
+    local wid=$1
+    python3 - "$WORKDIR" "$wid" "$ITER" <<'PY'
+import errno
+import os
+import sys
+from pathlib import Path
+
+dirpath = Path(sys.argv[1])
+wid = sys.argv[2]
+loops = int(sys.argv[3])
+file_path = dirpath / f"file.{wid}"
+
+for i in range(loops):
+    try:
+        with file_path.open('rb') as fh:
+            fh.read(4096)
+    except OSError as exc:
+        print(f"worker {wid} read failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        with file_path.open('ab', buffering=0) as fh:
+            fh.write(b'x')
+    except OSError as exc:
+        print(f"worker {wid} append failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+PY
+}
+
+pids=""
+for w in $(seq 0 $((WORKERS-1))); do
+    worker "$w" >>$seqres.full 2>&1 &
+    pids="$pids $!"
+done
+
+highest=$base_active
+fail=0
+while :; do
+    alive=0
+    for p in $pids; do
+        if kill -0 $p 2>/dev/null; then
+            alive=1
+            break
+        fi
+    done
+    read mcur acur < <(parse_credits)
+    if [ -n "$acur" ] && [ "$acur" -gt "$highest" ]; then
+        highest=$acur
+    fi
+    if [ $alive -eq 0 ]; then
+        break
+    fi
+    sleep 0.05
+done
+
+wait $pids 2>/dev/null || fail=1
+[ $fail -eq 0 ] || _fail "worker reported I/O failure"
+
+sleep 1
+read _ final_active < <(parse_credits)
+[ -n "$final_active" ] || _fail "final credits parse failed"
+
+echo "cifs201: max=$max base=$base_active highest=$highest final=$final_active" >>$seqres.full
+
+if [ "$highest" -gt "$max" ]; then
+    _fail "observed active ($highest) > max ($max)"
+fi
+
+if [ "$final_active" -gt $((base_active + TOL)) ]; then
+    _fail "final active ($final_active) > baseline ($base_active)+$TOL"
+fi
+
+echo "max_credits open/close stress OK"
+status=0
+exit

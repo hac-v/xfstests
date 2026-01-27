@@ -1,0 +1,54 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: cache=none ensures immediate read coherence across mounts
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+
+_register_cleanup "_test_unmount >/dev/null 2>&1"
+_test_unmount >/dev/null 2>&1
+
+strip_opt() { echo "$1" | awk -F, -v k="$2" '{out=""; for(i=1;i<=NF;i++){ if($i ~ "^"k"=") continue; out=out (out?"," : "") $i } print out}'; }
+remove_flag() { echo "$1" | awk -F, -v f="$2" '{out=""; for(i=1;i<=NF;i++){ if($i==f) continue; out=out (out?"," : "") $i } print out}'; }
+
+BASE=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+BASE=$(strip_opt "$BASE" actimeo)
+BASE=$(strip_opt "$BASE" cache)
+BASE=$(remove_flag "$BASE" ro)
+MO1=$BASE; [ -n "$MO1" ] && MO1="$MO1,cache=none" || MO1="cache=none"
+MO2=$BASE
+
+M1=$(mktemp -d /tmp/cifs138.m1.XXXXXX) || _fail "mktemp M1 failed"
+M2=$(mktemp -d /tmp/cifs138.m2.XXXXXX) || _fail "mktemp M2 failed"
+
+_do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO1'" || _notrun "cache=none not supported"
+_do "mount -t cifs '$TEST_DEV' '$M2' -o '$MO2'" || _fail "mount M2 failed"
+
+SUB="cifs138.$$.d"; mkdir -p "$M2/$SUB" || _fail "mkdir"
+F1="$M1/$SUB/f"; F2="$M2/$SUB/f"
+echo one > "$F2" || _fail "seed write"
+
+# First read should see 'one'
+read1=$(cat "$F1") || _fail "read1 failed"
+[ "$read1" = "one" ] || _fail "unexpected read1: '$read1'"
+
+# Update from M2 and read immediately from M1; cache=none should see new data
+echo -n two >> "$F2" || _fail "append"
+
+tries=5
+ok=0
+while [ $tries -gt 0 ]; do
+    read2=$(cat "$F1") || _fail "read2 failed"
+    if [ "$read2" = "onetwo" ]; then ok=1; break; fi
+    sleep 0.2; tries=$((tries-1))
+done
+[ $ok -eq 1 ] || _fail "cache=none did not reflect new data immediately (got '$read2')"
+
+echo "cache=none read coherence OK"
+
+status=0
+exit

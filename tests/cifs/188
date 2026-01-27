@@ -1,0 +1,137 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: byte-range lock survives repeated reconnects
+#
+# Summary
+#   Extend the single-reconnect coverage (test 183) by dropping TCP multiple
+#   times while a process holds a whole-file write lock, ensuring the lock is
+#   continually re-established and still blocks conflicting access afterwards.
+#
+# Phases
+#   1. Compile a small helper that acquires/retries fcntl write locks.
+#   2. Hold the lock via the primary mount and confirm that a conflicting lock
+#      on the secondary mount fails (otherwise skip – environment ignores locks).
+#   3. Loop through CIFS188_CYCLES iterations: insert iptables DROP rules,
+#      wait CIFS188_DELAY seconds, remove the rules, allow reconnect, then test
+#      the conflicting lock again.
+#   4. Fail immediately if any post-reconnect conflict unexpectedly succeeds.
+#   5. On success, cleanly tear down the holder process and mounts.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v gcc >/dev/null 2>&1 || _notrun "gcc required"
+command -v iptables >/dev/null 2>&1 || _notrun "iptables required"
+
+host=$(echo "$TEST_DEV" | sed -n 's#^//\([^/]*\)/.*#\1#p')
+[ -n "$host" ] || _notrun "parse host failed"
+server_ip=$(getent ahostsv4 "$host" | awk '{print $1; exit}')
+[ -n "$server_ip" ] || _notrun "resolve IPv4 failed"
+
+MNT2=$(mktemp -d /tmp/cifs188.sec.XXXXXX) || _fail "mktemp"
+_register_cleanup "umount $MNT2 >/dev/null 2>&1 || true; rmdir $MNT2 >/dev/null 2>&1 || true; iptables -D OUTPUT -d $server_ip -p tcp --dport 445 -j DROP 2>/dev/null || true; iptables -D INPUT -s $server_ip -p tcp --sport 445 -j DROP 2>/dev/null || true; kill $HOLDER_PID >/dev/null 2>&1 || true"
+
+base_opts=${MOUNT_OPTIONS#-o}
+if [ -z "$base_opts" ]; then
+    base_opts=$(awk -v mnt="$TEST_DIR" '$2==mnt {print $4}' /proc/mounts)
+fi
+
+if ! mount -t cifs "$TEST_DEV" "$MNT2" -o "$base_opts" >>$seqres.full 2>&1; then
+    rmdir "$MNT2"
+    _fail "secondary mount failed"
+fi
+
+LOCKSRC=$TMPDIR/cifs188_lock.c
+cat >"$LOCKSRC" <<'EOF'
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+static void die(const char *msg)
+{
+    perror(msg);
+    exit(1);
+}
+
+int main(int argc, char **argv)
+{
+    if (argc < 3) {
+        fprintf(stderr, "usage: %s hold|try path\n", argv[0]);
+        return 2;
+    }
+    int fd = open(argv[2], O_RDWR | O_CREAT, 0666);
+    if (fd < 0)
+        die("open");
+    struct flock fl;
+    memset(&fl, 0, sizeof(fl));
+    fl.l_type = F_WRLCK;
+    fl.l_whence = SEEK_SET;
+    fl.l_start = 0;
+    fl.l_len = 0;
+    int rc = fcntl(fd, F_SETLK, &fl);
+    if (strcmp(argv[1], "hold") == 0) {
+        if (rc < 0)
+            die("lock");
+        for (;;) sleep(60);
+    } else {
+        if (rc < 0)
+            return 10;
+        return 0;
+    }
+}
+EOF
+
+LOCKBIN=$TMPDIR/cifs188_lock
+gcc -O2 -Wall -o "$LOCKBIN" "$LOCKSRC" >>$seqres.full 2>&1 || _fail "compile helper"
+
+FILE="$TEST_DIR/cifs188.file"
+: >"$FILE" || _fail "create file"
+
+"$LOCKBIN" hold "$FILE" &
+HOLDER_PID=$!
+sleep 1
+kill -0 $HOLDER_PID 2>/dev/null || _fail "holder died early"
+
+try_conflict() {
+    if "$LOCKBIN" try "$MNT2/cifs188.file" >>$seqres.full 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+if try_conflict; then
+    kill $HOLDER_PID >/dev/null 2>&1 || true
+    _notrun "record locks not enforced"
+fi
+
+CYCLES=${CIFS188_CYCLES:-3}
+DELAY=${CIFS188_DELAY:-2}
+
+for cycle in $(seq 1 $CYCLES); do
+    echo "cifs188: cycle $cycle" >>$seqres.full
+    iptables -I OUTPUT -d "$server_ip" -p tcp --dport 445 -j DROP >>$seqres.full 2>&1 || _notrun "iptables insert failed"
+    iptables -I INPUT -s "$server_ip" -p tcp --sport 445 -j DROP >>$seqres.full 2>&1 || _notrun "iptables insert failed"
+    sleep "$DELAY"
+    iptables -D OUTPUT -d "$server_ip" -p tcp --dport 445 -j DROP >>$seqres.full 2>&1 || true
+    iptables -D INPUT -s "$server_ip" -p tcp --sport 445 -j DROP >>$seqres.full 2>&1 || true
+    sleep 1
+    if try_conflict; then
+        echo "cifs188: lock lost after cycle $cycle" >>$seqres.full
+        kill $HOLDER_PID >/dev/null 2>&1 || true
+        _fail "byte-range lock not retained"
+    fi
+done
+
+kill $HOLDER_PID >/dev/null 2>&1 || true
+
+echo "Byte-range lock survived repeated reconnects OK"
+status=0
+exit

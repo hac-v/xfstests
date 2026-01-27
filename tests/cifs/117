@@ -1,0 +1,80 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: server-side copy (copy_file_range) functional test
+#
+# Behavior under test
+# - copy_file_range() copies data between files on the same SMB share, preserving
+#   size and content. On capable servers, this is implemented via FSCTL_SRV_COPYCHUNK.
+#   We validate correctness (not the server-side offload itself).
+#
+# Skip policy
+# - If python3 is missing (used to invoke copy_file_range), skip.
+#
+# Output
+# - Stable single success line; diagnostics go to $seqres.full.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+command -v sha256sum >/dev/null 2>&1 || _notrun "requires sha256sum"
+
+_register_cleanup "_test_unmount >/dev/null 2>&1; rm -rf \"$TEST_DIR/cifs117.$$\" >/dev/null 2>&1"
+
+_test_unmount > /dev/null 2>&1
+_do "_test_mount" || _fail "mount failed"
+
+W="$TEST_DIR/cifs117.$$"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+size=$((2*1024*1024)) # 2 MiB
+
+# Create deterministic source content (repeating pattern)
+python3 - "$W/src" "$size" <<'PY' || _fail "generate source failed"
+import os,sys
+p=b"0123456789abcdef"*128
+path, size = sys.argv[1], int(sys.argv[2])
+with open(path, 'wb', buffering=0) as f:
+    n=0
+    while n < size:
+        chunk = p[:min(len(p), size-n)]
+        f.write(chunk)
+        n += len(chunk)
+PY
+
+src_hash=$(sha256sum "$W/src" | awk '{print $1}') || _fail "hash src failed"
+
+# Perform copy via copy_file_range using python
+python3 - "$W/src" "$W/dst" <<'PY' || _fail "copy_file_range failed"
+import os,sys
+src,dst=sys.argv[1],sys.argv[2]
+BUFS=1<<20
+with open(src,'rb',buffering=0) as s, open(dst,'wb',buffering=0) as d:
+    while True:
+        try:
+            n=os.copy_file_range(s.fileno(), d.fileno(), BUFS)
+        except OSError as e:
+            if e.errno==0:
+                break
+            raise
+        if n==0:
+            break
+PY
+
+dst_hash=$(sha256sum "$W/dst" | awk '{print $1}') || _fail "hash dst failed"
+[ "$src_hash" = "$dst_hash" ] || _fail "hash mismatch after copy"
+
+sz_src=$(stat -c %s "$W/src")
+sz_dst=$(stat -c %s "$W/dst")
+[ "$sz_src" -eq "$sz_dst" ] || _fail "size mismatch after copy: $sz_src != $sz_dst"
+
+echo "copy_file_range basic OK"
+
+status=0
+exit

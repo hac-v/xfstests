@@ -1,0 +1,85 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: path too long / component too long error mapping
+# Goal: Ensure overly long filename component and overall path length return
+# ENAMETOOLONG (errno 36) or (some servers) EINVAL (22), not silent success.
+# Strategy:
+# 1. Create working dir.
+# 2. Use python to attempt creating: (a) single component >255 chars; (b) path >4096.
+# 3. Capture errno results; accept 36 or 22 for each failure.
+# 4. Fail if creation unexpectedly succeeds or returns different errno.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+command -v python3 >/dev/null 2>&1 || _notrun "python3 required"
+
+W="$TEST_DIR/cifs152.$$"
+mkdir -p "$W" || _fail "mkdir work"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1"
+
+OUT="$W/result"
+python3 - <<'PYEOF' "$W" >"$OUT" 2>>$seqres.full
+import os, sys, errno
+base = sys.argv[1]
+# Baseline short file
+open(os.path.join(base, 'ok.txt'),'w').close()
+
+def test_component():
+    name = 'b'*300  # >255
+    p = os.path.join(base, name)
+    try:
+        open(p,'w').close()
+        print('COMPONENT_OK')
+    except OSError as e:
+        print(f'COMPONENT_ERR {e.errno}')
+
+def test_total():
+    # Build nested dirs until near 3900 bytes then add huge final component to exceed PATH_MAX (4096)
+    path = base
+    comp = 'c'*50
+    try:
+        while len(path) + 1 + len(comp) < 3900:
+            path = os.path.join(path, comp)
+            os.makedirs(path, exist_ok=True)
+    except OSError:
+        # If server limits earlier we still proceed to long final name
+        pass
+    long_final = 'd'*1000
+    long_path = os.path.join(path, long_final)
+    try:
+        open(long_path,'w').close()
+        print('TOTAL_OK')
+    except OSError as e:
+        print(f'TOTAL_ERR {e.errno}')
+
+test_component()
+test_total()
+PYEOF
+
+cat "$OUT" >> $seqres.full
+
+comp_line=$(grep '^COMPONENT_' "$OUT" || true)
+tot_line=$(grep '^TOTAL_' "$OUT" || true)
+[ -n "$comp_line" ] || _fail "missing component result"
+[ -n "$tot_line" ] || _fail "missing total result"
+
+case "$comp_line" in
+  COMPONENT_ERR\ 36|COMPONENT_ERR\ 22) : ;; 
+  COMPONENT_OK) _fail "long component unexpectedly created" ;;
+  *) _fail "unexpected component result: $comp_line" ;;
+esac
+
+case "$tot_line" in
+  TOTAL_ERR\ 36|TOTAL_ERR\ 22) : ;;
+  TOTAL_OK) _fail "overlong path unexpectedly created" ;;
+  *) _fail "unexpected total result: $tot_line" ;;
+esac
+
+echo "path too long handling OK"
+status=0
+exit

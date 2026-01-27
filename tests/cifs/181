@@ -1,0 +1,63 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: Options length overflow handling
+#
+# Purpose:
+#   Validate mount.cifs rejects an options string > 4096 bytes with
+#   the expected error "Options string too long" and non-zero rc.
+#
+# Strategy:
+#   - Construct a long options string starting with base mount options (minus any ip=) then
+#     append repeated dummy key=value pairs until length > 4200.
+#   - Attempt mount; expect failure before actual kernel mount.
+#   - Confirm stderr contains substring "Options string too long".
+#
+# Skip:
+#   - Not root (needs mount attempt)
+#   - Non-CIFS FSTYP
+#   - TEST_DEV/TEST_DIR unset
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+
+MNT2=$(mktemp -d /tmp/cifs181.mnt.XXXXXX) || _fail "mktemp"
+_register_cleanup "umount $MNT2 >/dev/null 2>&1 || true; rmdir $MNT2 >/dev/null 2>&1 || true"
+
+base_opts=${MOUNT_OPTIONS#-o}
+if [ -z "$base_opts" ]; then
+    base_opts=$(awk -v mnt="$TEST_DIR" '$2==mnt {print $4}' /proc/mounts)
+fi
+# Remove any ip= to simplify
+base_opts=$(echo "$base_opts" | sed -E 's/(^|,)ip=[^,]*//g; s/,,/,/g; s/^,//; s/,$//')
+
+LONG="$base_opts"
+i=0
+while [ ${#LONG} -le 4205 ]; do
+    seg="foo$i=bar"; 
+    if [ -z "$LONG" ]; then LONG="$seg"; else LONG="$LONG,$seg"; fi
+    i=$((i+1))
+done
+echo "cifs181: constructed options length=${#LONG}" >> $seqres.full
+
+errfile=$TMPDIR/cifs181.err
+outlog=$TMPDIR/cifs181.out
+if mount -t cifs "$TEST_DEV" "$MNT2" -o "$LONG" >$outlog 2>$errfile; then
+    umount "$MNT2" >/dev/null 2>&1 || true
+    _fail "mount unexpectedly succeeded with oversized options"
+fi
+
+if ! grep -q "Options string too long" "$errfile"; then
+    echo "---- stderr ----" >> $seqres.full
+    cat "$errfile" >> $seqres.full
+    echo "----------------" >> $seqres.full
+    _fail "expected error message not found"
+fi
+
+echo "Options length overflow handling OK"
+status=0; exit

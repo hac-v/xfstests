@@ -1,0 +1,128 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: Byte-range lock robustness after reconnect
+#
+# Objective:
+#   Acquire an fcntl byte-range write lock on a file via one mount, force a
+#   TCP disconnect, and verify that after reconnect the lock is still
+#   effective (a conflicting lock attempt from a second mount still fails).
+#
+# Success criteria:
+#   - Initial conflicting lock attempt on second mount fails (server + client
+#     honor record locks). If it succeeds, skip (environment not enforcing).
+#   - After induced reconnect, conflicting attempt still fails. If it now
+#     succeeds, report failure (lock lost across reconnect).
+#
+# Inducing reconnect: temporarily DROP tcp port 445 traffic to server then
+# restore.
+#
+# Skip conditions:
+#   - Not CIFS
+#   - Not root (need iptables & additional mount)
+#   - Unable to parse server host -> IP
+#   - gcc missing (needs small helper binaries)
+#   - Record locking not enforced (initial conflict acquisition succeeds)
+#
+# Output: single success line on stdout.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v gcc >/dev/null 2>&1 || _notrun "gcc required"
+command -v iptables >/dev/null 2>&1 || _notrun "iptables required"
+
+host=$(echo "$TEST_DEV" | sed -n 's#^//\([^/]*\)/.*#\1#p')
+[ -n "$host" ] || _notrun "parse host failed"
+server_ip=$(getent ahostsv4 "$host" | awk '{print $1; exit}')
+[ -n "$server_ip" ] || _notrun "resolve server ip failed"
+
+# Secondary mount
+MNT2=$(mktemp -d /tmp/cifs183.mnt.XXXXXX) || _fail "mktemp"
+base_opts=${MOUNT_OPTIONS#-o}
+if [ -z "$base_opts" ]; then
+    base_opts=$(awk -v mnt="$TEST_DIR" '$2==mnt {print $4}' /proc/mounts)
+fi
+if ! mount -t cifs "$TEST_DEV" "$MNT2" -o "$base_opts" >>$seqres.full 2>&1; then
+    rmdir "$MNT2"; _fail "secondary mount failed"
+fi
+
+_register_cleanup "kill $HOLDER_PID >/dev/null 2>&1 || true; umount $MNT2 >/dev/null 2>&1 || true; rmdir $MNT2 >/dev/null 2>&1 || true; iptables -D OUTPUT -d $server_ip -p tcp --dport 445 -j DROP 2>/dev/null || true; iptables -D INPUT -s $server_ip -p tcp --sport 445 -j DROP 2>/dev/null || true"
+
+LOCKSRC=$TMPDIR/cifs183_lock.c
+cat > $LOCKSRC <<'EOF'
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include <stdlib.h>
+int main(int argc,char**argv){
+ if(argc<3){fprintf(stderr,"usage: %s hold|try path\n",argv[0]); return 2;}
+ int fd=open(argv[2],O_RDWR|O_CREAT,0666);
+ if(fd<0){perror("open"); return 1;}
+ struct flock fl; memset(&fl,0,sizeof(fl));
+ fl.l_type=F_WRLCK; fl.l_whence=SEEK_SET; fl.l_start=0; fl.l_len=0; /* whole file */
+ int rc=fcntl(fd,F_SETLK,&fl);
+ if(strcmp(argv[1],"hold")==0){
+   if(rc<0){perror("lock"); return 3;}
+   write(1,"HOLDING\n",8);
+   /* sleep long; parent will kill */
+   for(;;) sleep(60);
+ } else { /* try */
+   if(rc<0){
+     perror("lock");
+     return 10; /* conflict expected code */
+   } else {
+     write(1,"ACQUIRED\n",9);
+     return 0;
+   }
+ }
+}
+EOF
+
+gcc -O2 -Wall -o $TMPDIR/cifs183_lock $LOCKSRC >>$seqres.full 2>&1 || _fail "compile helper"
+
+F="$TEST_DIR/cifs183.file"
+: > "$F" || _fail "create file"
+
+# Start holder on primary mount
+$TMPDIR/cifs183_lock hold "$F" >$TMPDIR/cifs183_hold.out 2>$TMPDIR/cifs183_hold.err &
+HOLDER_PID=$!
+sleep 1
+kill -0 $HOLDER_PID 2>/dev/null || _fail "holder process died early"
+
+# Verify initial conflict from secondary mount
+if $TMPDIR/cifs183_lock try "$MNT2/cifs183.file" >$TMPDIR/cifs183_try1.out 2>$TMPDIR/cifs183_try1.err; then
+    echo "cifs183: initial conflicting lock acquired; environment lacks record lock enforcement" >> $seqres.full
+    kill $HOLDER_PID >/dev/null 2>&1 || true
+    _notrun "record locks not enforced"
+fi
+echo "cifs183: initial conflict as expected" >> $seqres.full
+
+# Induce reconnect
+iptables -I OUTPUT -d "$server_ip" -p tcp --dport 445 -j DROP 2>>$seqres.full || _notrun "iptables rule fail"
+iptables -I INPUT -s "$server_ip" -p tcp --sport 445 -j DROP 2>>$seqres.full || _notrun "iptables rule fail"
+sleep 3
+iptables -D OUTPUT -d "$server_ip" -p tcp --dport 445 -j DROP 2>>$seqres.full || true
+iptables -D INPUT -s "$server_ip" -p tcp --sport 445 -j DROP 2>>$seqres.full || true
+
+# Allow a brief window for reconnect
+sleep 2
+
+# Post-reconnect conflicting attempt
+if $TMPDIR/cifs183_lock try "$MNT2/cifs183.file" >$TMPDIR/cifs183_try2.out 2>$TMPDIR/cifs183_try2.err; then
+    echo "cifs183: lock lost after reconnect (conflict lock succeeded)" >> $seqres.full
+    kill $HOLDER_PID >/dev/null 2>&1 || true
+    _fail "byte-range lock not preserved across reconnect"
+fi
+
+kill $HOLDER_PID >/dev/null 2>&1 || true
+
+echo "Byte-range lock preserved across reconnect OK"
+status=0; exit

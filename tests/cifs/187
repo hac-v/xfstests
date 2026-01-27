@@ -1,0 +1,125 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: max_credits=4 pressure sanity
+#
+# Summary
+#   Force a remount that caps SMB credits at 4 (with nosharesock to avoid
+#   interacting with other mounts), hammer parallel direct I/O, and ensure the
+#   negotiated credit limit remains 4 before and after the workload.
+#
+# Phases
+#   1. Mount a private instance with max_credits=4,nosharesock, skipping if the
+#      mount helper rejects the option.
+#   2. Parse /proc/fs/cifs/DebugData to confirm the share-specific limit.
+#   3. Spawn multiple workers rapidly writing and fsyncing blocks to drive
+#      credit allocation.
+#   4. Re-read DebugData to verify the max credit value never drifts from 4.
+#   5. Report success if all workers finish cleanly and credit limits stay
+#      clamped; otherwise fail.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto stress
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ -r /proc/fs/cifs/DebugData ] || _notrun "DebugData unavailable"
+
+host=$(echo "$TEST_DEV" | sed -n 's#^//\([^/]*\)/.*#\1#p')
+share=$(echo "$TEST_DEV" | sed -n 's#^//[^/]*/\([^/]*\).*#\1#p')
+[ -n "$host" ] || _notrun "parse host failed"
+[ -n "$share" ] || _notrun "parse share failed"
+share_id="\\\\$host\\$share"
+
+MNT=$(mktemp -d /tmp/cifs187.mnt.XXXXXX) || _fail "mktemp"
+
+cleanup()
+{
+    if mountpoint -q "$MNT"; then
+        umount "$MNT" >/dev/null 2>&1 || true
+    fi
+    rmdir "$MNT" >/dev/null 2>&1 || true
+}
+_register_cleanup cleanup
+
+base_opts=${MOUNT_OPTIONS#-o}
+if [ -z "$base_opts" ]; then
+    base_opts=$(awk -v mnt="$TEST_DIR" '$2==mnt {print $4}' /proc/mounts)
+fi
+
+strip_opts=$(echo "$base_opts" | sed -E 's/(^|,)max_credits=[^,]*//g; s/(^|,)nosharesock//g; s/,,/,/g; s/^,//; s/,$//')
+if [ -n "$strip_opts" ]; then
+    mount_opts="max_credits=4,nosharesock,$strip_opts"
+else
+    mount_opts="max_credits=4,nosharesock"
+fi
+
+err=$TMPDIR/cifs187.err
+if ! mount -t cifs "$TEST_DEV" "$MNT" -o "$mount_opts" >$seqres.full 2>"$err"; then
+    if grep -qi "Invalid argument" "$err"; then
+        _notrun "max_credits option unsupported"
+    fi
+    cat "$err" >>$seqres.full
+    _fail "mount with max_credits=4 failed"
+fi
+
+parse_credits() {
+    awk -v share="$share_id" '
+        /Shares:/ {inshare=0}
+        index($0, share) {inshare=1}
+        inshare && /Number of credits:/ {
+            split($0, a, ":");
+            if (length(a) >= 2) {
+                split(a[2], b, ",");
+                gsub(/[^0-9]/, "", b[1]);
+                gsub(/[^0-9]/, "", b[2]);
+                print b[1], b[2];
+                exit
+            }
+        }
+    ' /proc/fs/cifs/DebugData
+}
+
+read max_credit active_credit < <(parse_credits)
+[ -n "$max_credit" ] || _notrun "unable to parse credit info"
+[ "$max_credit" -eq 4 ] || _fail "expected max credits 4, saw $max_credit"
+
+WORKDIR="$MNT/cifs187.dir"
+mkdir -p "$WORKDIR" || _fail "mkdir workdir"
+
+BLOCKS=32
+SIZE=$((256 * 1024))
+WORKERS=8
+
+worker() {
+    local idx=$1
+    for iter in $(seq 1 $BLOCKS); do
+        dd if=/dev/zero of="$WORKDIR/file.$idx" bs=$SIZE count=1 conv=fsync oflag=direct status=none || exit 1
+        rm -f "$WORKDIR/file.$idx" || exit 1
+    done
+}
+
+pids=""
+for w in $(seq 1 $WORKERS); do
+    worker "$w" &
+    pids="$pids $!"
+done
+
+fail=0
+for p in $pids; do
+    if ! wait "$p"; then
+        fail=1
+    fi
+done
+
+[ $fail -eq 0 ] || _fail "worker encountered failure"
+
+read max_credit2 active_credit2 < <(parse_credits)
+[ -n "$max_credit2" ] || _fail "post-run credit parse failed"
+[ "$max_credit2" -eq 4 ] || _fail "max credits changed unexpectedly ($max_credit2)"
+
+echo "max_credits=4 pressure OK"
+status=0
+exit

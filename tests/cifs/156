@@ -1,0 +1,48 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: hard vs soft behavior on network loss
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ "$(id -u)" = 0 ] || _notrun "root/iptables required"
+command -v iptables >/dev/null 2>&1 || _notrun "iptables required"
+
+host=$(echo "$TEST_DEV" | sed -E 's#^//([^/]+)/.*#\1#')
+server_ip=$(getent ahostsv4 "$host" | awk '{print $1; exit}')
+[ -n "$server_ip" ] || _notrun "resolve host failed"
+
+make_mount() { dir=$1; extra=$2; mkdir -p "$dir" || _fail "mkdir $dir"; mount -t cifs -o "$extra" "$TEST_DEV" "$dir" >>$seqres.full 2>&1 || _fail "mount $extra"; }
+
+HARD_MNT="$TEST_DIR-hard.$$"; SOFT_MNT="$TEST_DIR-soft.$$"
+_register_cleanup "umount '$HARD_MNT' >/dev/null 2>&1; umount '$SOFT_MNT' >/dev/null 2>&1; rmdir '$HARD_MNT' '$SOFT_MNT' >/dev/null 2>&1"
+
+base_opts="username=$USER,password=$PASS,noperm"
+[ -n "$CIFS_USER" ] && base_opts="username=$CIFS_USER,password=$CIFS_PASS,noperm"
+
+make_mount "$HARD_MNT" "hard,$base_opts"
+make_mount "$SOFT_MNT" "soft,$base_opts"
+
+dd if=/dev/zero of="$HARD_MNT/big" bs=1M count=8 oflag=sync 2>>$seqres.full || true
+cp "$HARD_MNT/big" "$SOFT_MNT/big" 2>>$seqres.full || true
+
+iptables -I OUTPUT -d "$server_ip" -p tcp --dport 445 -j DROP || _notrun "iptables add fail"
+iptables -I INPUT -s "$server_ip" -p tcp --sport 445 -j DROP || true
+_register_cleanup "iptables -D OUTPUT -d '$server_ip' -p tcp --dport 445 >/dev/null 2>&1; iptables -D INPUT -s '$server_ip' -p tcp --sport 445 >/dev/null 2>&1"
+
+(dd if="$HARD_MNT/big" of=/dev/null bs=1M count=16 2>>$seqres.full; echo HARD_DONE > "$TEST_DIR/hard_status") &
+HP=$!
+(dd if="$SOFT_MNT/big" of=/dev/null bs=1M count=16 2>>$seqres.full; echo SOFT_DONE > "$TEST_DIR/soft_status") &
+SP=$!
+
+sleep 10
+
+hard_done=0; [ -f "$TEST_DIR/hard_status" ] && hard_done=1
+soft_done=0; [ -f "$TEST_DIR/soft_status" ] && soft_done=1
+
+if [ $soft_done -ne 1 ]; then _fail "soft read did not finish"; fi
+if [ $hard_done -eq 1 ]; then _fail "hard read finished unexpectedly"; fi
+echo "hard vs soft behavior OK"
+status=0; exit

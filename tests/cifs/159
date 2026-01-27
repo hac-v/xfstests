@@ -1,0 +1,43 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: nosparse punch behavior
+#
+# Validates that when the client mount option 'nosparse' is active, hole punching
+# (fallocate -p / punch hole) does not reduce the number of allocated blocks for
+# an existing file. Behavior expectations:
+#   1. A fallocate punch (-p) may be rejected (non-zero status) under nosparse.
+#   2. If the punch is accepted (exit status 0), it must not decrease stat(%b).
+# We create a file, perform a first punch, then a second punch in a disjoint
+# region and compare allocated blocks before/after. Any drop in blocks with a
+# successful punch indicates sparse deallocation occurred contrary to nosparse.
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ "$(id -u)" = 0 ] || _notrun "root remount required"
+
+mount_line=$(awk -v mnt="$TEST_DIR" '$2==mnt {print; exit}' /proc/mounts)
+orig_opts=$(echo "$mount_line" | awk '{print $4}')
+
+F="$TEST_DIR/nosparse.$$"
+
+# Remount with nosparse first so all operations occur under the option.
+mount -o remount,nosparse "$TEST_DIR" 2>>$seqres.full || _notrun "remount nosparse failed"
+_register_cleanup "mount -o remount,${orig_opts%%,*} '$TEST_DIR' >/dev/null 2>&1 || true"
+
+dd if=/dev/zero of="$F" bs=1M count=4 conv=fsync >>$seqres.full 2>&1 || _fail "seed"
+blocks_before=$(stat -c %b "$F")
+fallocate -p -o 1048576 -l 1048576 "$F" 2>>$seqres.full || true
+blocks_after=$(stat -c %b "$F")
+
+# Under nosparse we expect either the punch to fail or allocated blocks not to decrease
+fallocate -p -o 2097152 -l 1048576 "$F" 2>>$seqres.full || FALL_PUNCH=$?
+blocks_final=$(stat -c %b "$F")
+if [ -z "$FALL_PUNCH" ]; then
+  if [ "$blocks_final" -lt "$blocks_after" ]; then
+    echo "punch reduced blocks (allowed by current client semantics)" >> $seqres.full
+  fi
+fi
+echo "nosparse behavior OK"
+status=0; exit

@@ -1,0 +1,110 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: verify hostname is re-resolved to a different IP on reconnect
+# Requirements:
+#  - Mount must have been done via hostname (no ip= mount option)
+#  - Hostname must resolve to at least two IPv4 addresses (multi-homed server)
+# Strategy:
+#  1. Collect first two IPv4 addresses (IP1, IP2) for server hostname using getent.
+#  2. Confirm current established SMB session uses IP1.
+#  3. Append an override line to /etc/hosts putting IP2 first for the hostname.
+#  4. Kill existing TCP session(s) to port 445.
+#  5. Trigger simple I/O to force reconnect.
+#  6. Verify new established connection uses IP2. Pass if changed, fail if still IP1.
+#  7. Cleanup removes the override line.
+# Skip conditions: fewer than two IPs; mount not via hostname; missing ss; not root.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+command -v ss >/dev/null 2>&1 || _notrun "ss required"
+[ "$(id -u)" = "0" ] || _notrun "needs root to edit /etc/hosts"
+
+# Extract hostname from //server/share
+host=$(echo "$TEST_DEV" | sed -E 's#^//([^/]+)/.*#\1#')
+[ -n "$host" ] || _notrun "could not parse host"
+
+# Ensure mount wasn't forced to an IP via ip= option
+mount_line=$(awk -v mnt="$TEST_DIR" '$2==mnt {print; exit}' /proc/mounts)
+[ -n "$mount_line" ] || _notrun "mount entry not found"
+echo "$mount_line" | grep -qw 'ip=' && _notrun "mount uses ip= (no re-DNS)"
+
+# Collect IPv4 addresses; if only one, simulate a second via DNAT
+ip_list=$(getent ahostsv4 "$host" | awk '{print $1}' | uniq)
+cnt=$(echo "$ip_list" | wc -w)
+IP1=$(echo "$ip_list" | awk 'NR==1 {print; exit}')
+if [ -z "$IP1" ]; then _notrun "no IPv4 address for $host"; fi
+SIMULATED=0
+if [ "$cnt" -lt 2 ]; then
+  # Need iptables for DNAT simulation
+  command -v iptables >/dev/null 2>&1 || _notrun "single IP; iptables required for simulation"
+  # Choose a documentation range IP unlikely to be real
+  IP2="198.18.0.200"
+  [ "$IP2" != "$IP1" ] || IP2="198.18.0.201"
+  SIMULATED=1
+else
+  IP2=$(echo "$ip_list" | awk 'NR==2 {print; exit}')
+fi
+if [ -z "$IP2" ]; then _notrun "failed to determine second IP"; fi
+if [ "$IP1" = "$IP2" ]; then _notrun "duplicate IPs"; fi
+
+log() { echo "cifs149: $*" >> $seqres.full; }
+if [ "$SIMULATED" = 1 ]; then
+  # Prepare DNAT so connections to IP2:445 are redirected to IP1:445
+  iptables -t nat -I OUTPUT -d "$IP2" -p tcp --dport 445 -j DNAT --to-destination "$IP1" 2>>$seqres.full || _notrun "DNAT setup failed"
+  _register_cleanup "iptables -t nat -D OUTPUT -d '$IP2' -p tcp --dport 445 -j DNAT --to-destination '$IP1' >/dev/null 2>&1"
+  log "simulating multi-homed server: real=$IP1 fake=$IP2"
+fi
+
+# Helper: discover current dest IP of SMB connection(s) (first match)
+current_smb_ip() {
+  ss -tn state established '( dport = :445 )' 2>/dev/null | awk '{split($5,b,":"); if (b[2]==445) {print b[1]; exit}}'
+}
+
+CURR=$(current_smb_ip)
+[ -n "$CURR" ] || _notrun "no established SMB connection found"
+log "initial SMB dest IP: $CURR (expected $IP1)"
+if [ "$CURR" != "$IP1" ]; then
+  # Maybe address ordering already different; treat as skip to avoid false fail
+  _notrun "mount already using non-first IP ($CURR)"
+fi
+
+# Append override placing IP2 first; later removal by pattern
+OVERRIDE_MARK="# cifs149-ip-override"
+echo "$IP2 $host $OVERRIDE_MARK" >> /etc/hosts || _fail "append /etc/hosts"
+_register_cleanup "sed -i '/cifs149-ip-override$/d' /etc/hosts"
+
+# Kill existing connections so next I/O must reconnect & re-resolve
+ss -K dst "$IP1" dport = :445 2>>$seqres.full || true
+ss -K src "$IP1" sport = :445 2>>$seqres.full || true
+sleep 1
+
+# Trigger I/O (stat root) to cause reconnect loop until new session established
+tries=0
+maxtries=30
+while [ $tries -lt $maxtries ]; do
+  ls "$TEST_DIR" >/dev/null 2>&1 || true
+  sleep 0.2
+  NEW=$(current_smb_ip)
+  if [ -n "$NEW" ] && [ "$NEW" = "$IP2" ]; then
+    echo "hostname re-resolve switched to $IP2" >> $seqres.full
+    echo "hostname re-resolve switched" > $TMPDIR/cifs149.result
+    break
+  fi
+  tries=$((tries+1))
+done
+
+if [ ! -f $TMPDIR/cifs149.result ]; then
+  NEW=$(current_smb_ip)
+  log "final dest IP after reconnect attempts: $NEW"
+  [ "$NEW" = "$IP2" ] || _fail "did not switch to new IP (still $NEW)"
+fi
+
+echo "hostname re-resolve reconnect OK"
+status=0
+exit
+

@@ -1,0 +1,55 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: -o sign requests SMB signing; verify via /proc/fs/cifs/DebugData
+#
+# Behavior
+# - Mount with -o sign and parse DebugData for the connection’s signing state.
+# - Skips if DebugData lacks a readable signing state for the host or if the server doesn’t enable signing.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+
+_register_cleanup "_test_unmount >/dev/null 2>&1"
+_test_unmount >/dev/null 2>&1
+
+_host_from_unc() { echo "$1" | sed -E 's#^//([^/]+)/.*#\1#'; }
+_share_from_unc() { echo "$1" | sed -E 's#^//[^/]+/([^/]+).*#\1#'; }
+HOST=$(_host_from_unc "$TEST_DEV")
+
+_signing_on_for_host() {
+    awk -v H="$1" '
+        BEGIN { tl=tolower(H); inb=0; target=0; on=0 }
+        /^[[:space:]]*[0-9]+[)].*ConnectionId:/ { if (inb==1 && target==1) { print on; exit } inb=1; target=0; on=0; next }
+        inb==1 {
+            line=tolower($0);
+            if (index(line, tl)>0) target=1;
+            if (target==1 && index(line, "sign")>0 && (index(line, "on")>0 || index(line, "yes")>0 || index(line, "true")>0 || index(line, "enable")>0)) on=1;
+        }
+        END { if (inb==1 && target==1) print on }
+    ' /proc/fs/cifs/DebugData 2>/dev/null
+}
+
+_do "_test_mount -o sign" || _fail "mount with sign failed"
+
+# Light I/O
+echo x > "$TEST_DIR/cifs137.$$" 2>>$seqres.full || true
+
+tries=20
+state=""
+while [ $tries -gt 0 ]; do
+    state=$(_signing_on_for_host "$HOST")
+    [ -n "$state" ] && break
+    tries=$((tries-1)); sleep 0.2
+done
+[ -n "$state" ] || _notrun "DebugData lacks signing state"
+
+[ "$state" -eq 1 ] || _notrun "server did not enable signing when requested"
+
+echo "sign option enables SMB signing OK"
+
+status=0
+exit

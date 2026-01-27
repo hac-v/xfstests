@@ -1,0 +1,278 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: Deferred-close handle reuse semantics (and cleanup)
+#
+# What this test validates
+# - Read-only deferred handles (flag 0x8000) are reused for read reopens only;
+#   reopening for write must allocate a new handle (different FID).
+# - Write-mode deferred handles (flag 0x8001) are reused for both write and read reopens.
+# - Deferred entries for both cases are cleaned up after closetimeo expires.
+#
+# Method
+# - Use /proc/fs/cifs/open_files to detect entries, flags, and stable FIDs.
+# - Compare FIDs across reopen operations to confirm reuse policy.
+#
+# Preconditions
+# - FSTYP=cifs; /proc/fs/cifs/open_files available; effective closetimeo > 0.
+#
+# Pass criteria
+# - Read case: same FID for read->read; different FID for read->write.
+# - Write case: same FID for write->write and write->read.
+# - No lingering entries after timeout in both cases.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+_register_cleanup "_test_unmount >/dev/null 2>&1; rm -rf \"$TEST_DIR/cifs125.$$\" >/dev/null 2>&1"
+
+_test_unmount > /dev/null 2>&1
+
+# Keep test quick but reliable
+CTO=3
+_do "_test_mount -o closetimeo=$CTO" || _fail "mount failed"
+
+[ -r /proc/fs/cifs/open_files ] || _notrun "requires /proc/fs/cifs/open_files"
+
+# If the environment forces closetimeo=0, deferred close is disabled; skip.
+mt_opts=$(awk -v dir="$TEST_DIR" '$2==dir && $3=="cifs" {print $4}' /proc/self/mounts)
+ctoval=$(echo "$mt_opts" | awk -F, '{for (i=1;i<=NF;i++){ if ($i ~ /^closetimeo=/){ split($i,a,"="); print a[2]; exit } }}')
+if [ "${ctoval:-}" = "0" ]; then
+    _fail "closetimeo=0 disables deferred close on this mount"
+fi
+
+W="$TEST_DIR/cifs125.$$"
+mkdir -p "$W" || _fail "mkdir failed"
+
+# Snapshot file OFF the CIFS share to avoid polluting /proc view
+SNAP=$(mktemp -t cifs125_open.XXXXXX)
+_register_cleanup "rm -f '$SNAP' >/dev/null 2>&1; _test_unmount >/dev/null 2>&1; rm -rf \"$TEST_DIR/cifs125.$$\" >/dev/null 2>&1"
+
+snapshot_open_files() {
+    sed -e 's/\r$//' /proc/fs/cifs/open_files 2>/dev/null | grep -v '^#' > "$SNAP" || true
+    echo "---- /proc/fs/cifs/open_files snapshot ----" >> $seqres.full
+    cat "$SNAP" >> $seqres.full
+}
+
+# Find a line for basename with specific flags (4th column)
+find_by_flag() {
+    local base="$1"; local wantflag="$2"
+    snapshot_open_files
+    local want_dec
+    want_dec=$(printf "%d" "$wantflag" 2>/dev/null) || want_dec=0
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        set -- $line
+        [ $# -lt 8 ] && continue
+        local flag="$4"
+        local fname="${*:8}"
+        local flag_dec
+        flag_dec=$(printf "%d" "$flag" 2>/dev/null) || flag_dec=0
+        if [ $((flag_dec & want_dec)) -eq $want_dec ] && [[ "$fname" == *"$base"* ]]; then
+            echo "$line"
+            return 0
+        fi
+    done < "$SNAP"
+    return 1
+}
+
+# Find a line for basename with specific persistent fid
+find_by_fid() {
+    local base="$1"; local wantfid="$2"
+    snapshot_open_files
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        set -- $line
+        [ $# -lt 8 ] && continue
+        local fid="$3"
+        local fname="${*:8}"
+        if [ "$fid" = "$wantfid" ] && [[ "$fname" == *"$base"* ]]; then
+            echo "$line"
+            return 0
+        fi
+    done < "$SNAP"
+    return 1
+}
+
+wait_for_fid() {
+    local base="$1"; local wantfid="$2"; local tries=${3:-60}; local sleep_s=${4:-0.1}
+    local line; local attempt=0; local tries_orig=$tries
+    while [ $tries -gt 0 ]; do
+        attempt=$((tries_orig-tries+1))
+        line=$(find_by_fid "$base" "$wantfid") && { echo "$line"; return 0; }
+        echo "wait_for_fid miss attempt=$attempt base=$base fid=$wantfid" >> $seqres.full
+        # Fallback: awk heuristic matching numeric-equal
+        snapshot_open_files
+        line=$(awk -v fid="$wantfid" -v base="$base" '
+            NF>=8 {
+                fname=$8; for(i=9;i<=NF;i++) fname=fname" " $i;
+                fidcol=$3"";
+                if ("fid:" fidcol == "fid:" fid || fidcol ~ ("^" fid "$") ) {
+                    if (index(fname, base)>0) { print $0; exit 0 }
+                }
+            }
+            END{ exit 1 }
+        ' "$SNAP" 2>/dev/null) && { echo "$line"; return 0; }
+        echo "wait_for_fid fallback miss attempt=$attempt base=$base fid=$wantfid" >> $seqres.full
+        tries=$((tries-1)); sleep "$sleep_s"
+    done
+    echo "wait_for_fid timeout base=$base fid=$wantfid attempts=$tries_orig" >> $seqres.full
+    return 1
+}
+
+# Wait until a line appears for basename with the given flag
+wait_for_flag() {
+    local base="$1"; local wantflag="$2"; local tries=${3:-60}; local sleep_s=${4:-0.1}
+    local line
+    while [ $tries -gt 0 ]; do
+        line=$(find_by_flag "$base" "$wantflag") && { echo "$line"; return 0; }
+        # Fallback grep heuristic
+        snapshot_open_files
+        line=$(grep -E "(^|[[:space:]])${wantflag}([[:space:]]|$)" "$SNAP" | grep -F -- "$base" | head -n1) && { echo "$line"; return 0; }
+        tries=$((tries-1)); sleep "$sleep_s"
+    done
+    return 1
+}
+
+wait_for_absent() {
+    local base="$1"; local tries=${2:-60}; local sleep_s=${3:-0.1}
+    while [ $tries -gt 0 ]; do
+        snapshot_open_files
+        awk -v base="$base" '
+            NF >= 8 {
+                fname=$8; for(i=9;i<=NF;i++) fname=fname" "$i;
+                if (index(fname, base)>0) { found=1; exit }
+            }
+            END { if (!found) exit 0; else exit 1 }
+        ' "$SNAP" && return 0
+        tries=$((tries-1)); sleep "$sleep_s"
+    done
+    return 1
+}
+
+# Find the first line for a given basename
+find_by_base() {
+    local base="$1"
+    snapshot_open_files
+    awk -v base="$base" '
+        NF >= 8 {
+            fname=$8; for(i=9;i<=NF;i++) fname=fname" "$i;
+            if (index(fname, base)>0) { print $0; exit 0 }
+        }
+        END { exit 1 }
+    ' "$SNAP"
+}
+
+wait_for_base() {
+    local base="$1"; local tries=${2:-60}; local sleep_s=${3:-0.1}
+    local line
+    while [ $tries -gt 0 ]; do
+        line=$(find_by_base "$base") && { echo "$line"; return 0; }
+        tries=$((tries-1)); sleep "$sleep_s"
+    done
+    return 1
+}
+
+get_fid() { echo "$1" | awk '{print $3}'; }
+
+# Files for distinct scenarios
+FR="$W/read_case_$$_$RANDOM"
+FW="$W/write_case_$$_$RANDOM"
+echo "data" > "$FR" || _fail "create FR failed"
+echo "data" > "$FW" || _fail "create FW failed"
+base_r=$(basename -- "$FR")
+base_w=$(basename -- "$FW")
+
+# Ensure no leftover entries from creation I/O
+sleep $((CTO + 1))
+wait_for_absent "$base_r" 5 0.05 || echo "pre-test: lingering entry for $base_r" >> $seqres.full
+wait_for_absent "$base_w" 5 0.05 || echo "pre-test: lingering entry for $base_w" >> $seqres.full
+
+# 1) Read handle reused for reads only
+
+exec 7<"$FR" || _fail "open read failed"
+dd if=/proc/self/fd/7 of=/dev/null bs=1 count=1 status=none || true
+exec 7<&-
+
+# Detect deferred read entry (0x8000) immediately after close, else poll
+snapshot_open_files
+line_r_def=$(awk -v base="$base_r" '
+    NF >= 8 { fname=$8; for(i=9;i<=NF;i++) fname=fname" " $i; if ($4=="0x8000" && index(fname, base)>0) { print $0; exit 0 } }
+    END { exit 1 }
+' "$SNAP" 2>/dev/null) || line_r_def=""
+if [ -z "$line_r_def" ]; then
+    line_r_def=$(wait_for_flag "$base_r" "0x8000" 100 0.05) || _fail "deferred read entry not visible after close"
+fi
+fid_r=$(get_fid "$line_r_def")
+echo "read deferred: $line_r_def (fid=$fid_r)" >> $seqres.full
+
+# Reopen for read -> expect same fid
+exec 7<"$FR" || _fail "reopen read failed"
+dd if=/proc/self/fd/7 of=/dev/null bs=1 count=1 status=none || true
+line_r2=$(wait_for_fid "$base_r" "$fid_r" 100 0.05) || _fail "no read entry after reopen"
+fid_r2=$(get_fid "$line_r2")
+echo "read reopen: $line_r2 (fid=$fid_r2)" >> $seqres.full
+exec 7<&-
+[ "$fid_r2" = "$fid_r" ] || _fail "read handle not reused for read"
+
+# Reopen for write -> expect a different fid (no cross-mode reuse for read handle)
+exec 8>>"$FR" || _fail "reopen write on read_case failed"
+echo Z >&8 || true
+line_rw=$(find_by_flag "$base_r" "0x8001") || _fail "no write-mode entry on read_case"
+fid_rw=$(get_fid "$line_rw")
+echo "read->write reopen: $line_rw (fid=$fid_rw)" >> $seqres.full
+exec 8>&-
+[ "$fid_rw" != "$fid_r" ] || _fail "read handle incorrectly reused for write"
+
+# Ensure cleanup for read_case
+sleep $((CTO + 2))
+wait_for_absent "$base_r" 60 0.05 || _fail "read_case deferred entries not cleaned"
+
+# 2) Write handle reused for writes and reads
+exec 9>>"$FW" || _fail "open write failed"
+echo X >&9 || true
+exec 9>&-
+
+# Detect deferred write entry (0x8001) immediately after close, else poll
+snapshot_open_files
+line_w_def=$(awk -v base="$base_w" '
+    NF >= 8 { fname=$8; for(i=9;i<=NF;i++) fname=fname" " $i; if ($4=="0x8001" && index(fname, base)>0) { print $0; exit 0 } }
+    END { exit 1 }
+' "$SNAP" 2>/dev/null) || line_w_def=""
+if [ -z "$line_w_def" ]; then
+    line_w_def=$(wait_for_flag "$base_w" "0x8001" 100 0.05) || _fail "deferred write entry not visible after close"
+fi
+fid_w=$(get_fid "$line_w_def")
+echo "write deferred: $line_w_def (fid=$fid_w)" >> $seqres.full
+
+# Reopen for write -> expect same fid
+exec 9>>"$FW" || _fail "reopen write failed"
+echo Y >&9 || true
+line_w2=$(find_by_flag "$base_w" "0x8001") || _fail "no write entry after reopen"
+fid_w2=$(get_fid "$line_w2")
+echo "write reopen: $line_w2 (fid=$fid_w2)" >> $seqres.full
+exec 9>&-
+[ "$fid_w2" = "$fid_w" ] || _fail "write handle not reused for write"
+
+# Reopen for read -> expect same fid (cross-mode reuse allowed for write handle)
+exec 7<"$FW" || _fail "reopen read on write_case failed"
+dd if=/proc/self/fd/7 of=/dev/null bs=1 count=1 status=none || true
+line_wr=$(find_by_flag "$base_w" "0x8000") || _fail "no read-mode entry on write_case"
+fid_wr=$(get_fid "$line_wr")
+echo "write->read reopen: $line_wr (fid=$fid_wr)" >> $seqres.full
+exec 7<&-
+[ "$fid_wr" = "$fid_w" ] || _fail "write handle not reused for read"
+
+# Cleanup: nothing left after timeout
+sleep $((CTO + 2))
+wait_for_absent "$base_w" 60 0.05 || _fail "write_case deferred entries not cleaned"
+
+echo "deferred close reuse semantics (R-only vs W->R/W) and cleanup OK"
+
+status=0
+exit

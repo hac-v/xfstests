@@ -1,0 +1,121 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: validate mount.cifs username and domain limits
+#
+# Verifies mount.cifs accepts 256-character usernames (truncating anything
+# longer to the allowed length) and domains (rejecting values longer than 256),
+# recording the final values in the verbose fake mount option string. Avoids
+# prompting by restricting runs to fake mounts (-f).
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick metadata
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+case "$TEST_DEV" in
+//*) ;;
+*) _notrun "TEST_DEV must be UNC" ;;
+esac
+
+command -v mount.cifs >/dev/null 2>&1 || _notrun "mount.cifs unavailable"
+command -v python3 >/dev/null 2>&1 || _notrun "python3 required"
+
+MNT="$TEST_DIR/cifs193.mnt.$$"
+mkdir -p "$MNT" || _fail "mkdir mountpoint"
+_register_cleanup "rmdir '$MNT' >/dev/null 2>&1 || true"
+
+USER256=$(python3 - <<'PY'
+print('u' * 256, end='')
+PY
+)
+USER257=$(python3 - <<'PY'
+print('u' * 256 + 'z', end='')
+PY
+)
+USER_TRUNC=${USER257:0:256}
+
+BASE_USER="tester"
+
+DOM256=$(python3 - <<'PY'
+print('d' * 256, end='')
+PY
+)
+DOM257=$(python3 - <<'PY'
+print('d' * 256 + 'q', end='')
+PY
+)
+
+logdir=${TMPDIR:-/tmp}/cifs193.$$
+mkdir -p "$logdir" || _fail "mkdir logdir"
+_register_cleanup "rm -rf '$logdir' >/dev/null 2>&1 || true"
+
+run_fake_mount() {
+    local user=$1
+    local domain=$2
+    local logfile=$3
+    local opts="user=$user"
+    if [ "$domain" != "__OMIT__" ]; then
+        opts="$opts,domain=$domain"
+    fi
+    PASSWD=placeholder mount.cifs "$TEST_DEV" "$MNT" \
+        -f -v -o "$opts" >"$logfile" 2>&1
+    return $?
+}
+
+log256="$logdir/user256.log"
+run_fake_mount "$USER256" "__OMIT__" "$log256"
+rc=$?
+cat "$log256" >>$seqres.full 2>/dev/null || true
+[ $rc -eq 0 ] || _fail "mount.cifs rejected 256-character username"
+
+grep -q "user=$USER256" "$log256" || _fail "kernel options missing 256-char username"
+
+log257="$logdir/user257.log"
+run_fake_mount "$USER257" "__OMIT__" "$log257"
+rc=$?
+cat "$log257" >>$seqres.full 2>/dev/null || true
+[ $rc -eq 0 ] || _fail "mount.cifs rejected >256 username"
+
+grep -q "user=$USER_TRUNC" "$log257" || _fail "truncated username not recorded"
+! grep -q "$USER257" "$log257" || _fail "untruncated username leaked"
+
+logempty="$logdir/user-empty.log"
+run_fake_mount "" "__OMIT__" "$logempty"
+rc=$?
+cat "$logempty" >>$seqres.full 2>/dev/null || true
+[ $rc -eq 0 ] || _fail "mount.cifs failed with empty username"
+
+# Blank username should fall back to current user; ensure string present
+current_user=$(id -un)
+grep -q "user=$current_user" "$logempty" || _fail "blank username fallback missing"
+
+logdom256="$logdir/dom256.log"
+run_fake_mount "$BASE_USER" "$DOM256" "$logdom256"
+rc=$?
+cat "$logdom256" >>$seqres.full 2>/dev/null || true
+[ $rc -eq 0 ] || _fail "mount.cifs rejected 256-character domain"
+
+grep -q "domain=$DOM256" "$logdom256" || _fail "kernel options missing 256-char domain"
+
+logdom257="$logdir/dom257.log"
+run_fake_mount "$BASE_USER" "$DOM257" "$logdom257"
+rc=$?
+cat "$logdom257" >>$seqres.full 2>/dev/null || true
+[ $rc -ne 0 ] || _fail "mount.cifs accepted >256 domain"
+
+grep -q "domain name too long" "$logdom257" || _fail "missing domain overflow error"
+
+logdomblank="$logdir/dom-blank.log"
+run_fake_mount "$BASE_USER" "" "$logdomblank"
+rc=$?
+cat "$logdomblank" >>$seqres.full 2>/dev/null || true
+[ $rc -eq 0 ] || _fail "mount.cifs rejected empty domain"
+
+grep -q "domain=" "$logdomblank" || _fail "blank domain option missing"
+
+echo "mount.cifs username length handling OK"
+status=0
+exit

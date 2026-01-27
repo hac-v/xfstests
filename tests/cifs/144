@@ -1,12 +1,15 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# CIFS: forceuid/forcegid enforce client-side ownership mapping
+# CIFS: sustained read with induced network disconnects (auto reconnect & data integrity)
 #
-# What this test validates
-# - Mount with uid/gid and forceuid/forcegid.
-# - Files created on this mount report the forced %u:%g regardless of server mapping.
-# - Skip if mount rejects the options.
+# What this test does
+# - Prepares a deterministic multi-megabyte file on the share.
+# - Reads it sequentially in blocks while intermittently dropping traffic
+#   (iptables DROP rules) to force reconnects.
+# - Verifies the aggregated read buffer's sha256 matches the server file.
+#
+# Skips if iptables/getent not available or server IP cannot be resolved.
 
 . ./common/preamble
 . ./common/rc
@@ -14,30 +17,85 @@ _begin_fstest auto quick
 
 [ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
 [ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+command -v getent >/dev/null 2>&1 || _notrun "getent not available"
+if command -v ss >/dev/null 2>&1; then
+	DISCONNECT_METHOD=ss
+elif command -v iptables >/dev/null 2>&1; then
+	DISCONNECT_METHOD=iptables
+else
+	_notrun "need ss or iptables"
+fi
 
 _register_cleanup "_test_unmount >/dev/null 2>&1"
 _test_unmount >/dev/null 2>&1
+_do "_test_mount" || _fail "mount failed"
 
-# Choose forced ids (prefer qa_user_* if set, else fixed large ids)
-UIDX=${qa_user_uid:-55555}
-GIDX=${qa_user_gid:-44444}
+host=$(echo "$TEST_DEV" | sed -E 's#^//([^/]+)/.*#\1#')
+[ -n "$host" ] || _notrun "could not parse host"
+server_ip=$(getent hosts "$host" | awk '{print $1; exit}')
+[ -n "$server_ip" ] || _notrun "could not resolve server IP"
 
-# Build mount options with uid/gid + forceuid/forcegid, stripping any prior uid/gid/force*
-BASE=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
-BASE=$(echo "$BASE" | awk -F, '{out=""; for(i=1;i<=NF;i++){ if($i ~ /^uid=/ || $i ~ /^gid=/ || $i=="forceuid" || $i=="forcegid") continue; out=out (out?"," : "") $i } print out}')
-MO=$BASE; [ -n "$MO" ] && MO="$MO,uid=$UIDX,gid=$GIDX,forceuid,forcegid" || MO="uid=$UIDX,gid=$GIDX,forceuid,forcegid"
+SUB="cifs144.$$.d"
+mkdir -p "$TEST_DIR/$SUB" || _fail "mkdir"
+REMOTE_FILE="$TEST_DIR/$SUB/reconnect_read.bin"
 
-MNT=$(mktemp -d /tmp/cifs144.XXXXXX) || _fail "mktemp failed"
-_do "mount -t cifs '$TEST_DEV' '$MNT' -o '$MO'" || _notrun "forceuid/forcegid not supported"
+# Generate deterministic pattern file (server side) if not present: 4MB
+if [ ! -s "$REMOTE_FILE" ]; then
+	BS=$((64*1024)); CNT=64
+	idx=0
+	while [ $idx -lt $CNT ]; do
+		cval=$(( (idx % 26) + 65 ))
+		ch=$(printf "\\%03o" $cval)
+		head -c "$BS" < /dev/zero | tr '\0' "$ch" >> "$REMOTE_FILE" || _fail "seed write"
+		idx=$((idx+1))
+	done
+	sync || true
+fi
 
-SUB="cifs144.$$.d"; mkdir -p "$MNT/$SUB" || _fail "mkdir"
-F="$MNT/$SUB/f"
-echo x > "$F" || _fail "create"
+LOCAL_TMP=$(mktemp -t cifs144_local.XXXXXX) || _fail "mktemp local"
+SHA_REMOTE=$(mktemp -t cifs144_rsha.XXXXXX) || _fail "mktemp rsha"
+SHA_LOCAL=$(mktemp -t cifs144_lsha.XXXXXX) || _fail "mktemp lsha"
+_register_cleanup "rm -f '$LOCAL_TMP' '$SHA_REMOTE' '$SHA_LOCAL' >/dev/null 2>&1"
 
-own=$(stat -c '%u:%g' "$F") || _fail "stat"
-[ "$own" = "$UIDX:$GIDX" ] || _fail "ownership mismatch: $own vs $UIDX:$GIDX"
+BLOCK_SIZE=$((64*1024))
+DROP_EVERY=8
+DROP_SECS=2
 
-echo "forceuid/forcegid ownership mapping OK"
+iptables_add_drop() { iptables -I OUTPUT -d "$server_ip" -j DROP 2>/dev/null || return 1; iptables -I INPUT -s "$server_ip" -j DROP 2>/dev/null || true; }
+iptables_remove_drop() { while iptables -D OUTPUT -d "$server_ip" -j DROP 2>/dev/null; do :; done; while iptables -D INPUT -s "$server_ip" -j DROP 2>/dev/null; do :; done; }
+ss_kill_conns() { ss -tn 2>/dev/null | grep -E "[.:]445\b" | grep "$server_ip" >> $seqres.full 2>&1 || true; ss -K dst "$server_ip" dport = :445 2>>$seqres.full || true; ss -K src "$server_ip" sport = :445 2>>$seqres.full || true; }
+if [ "$DISCONNECT_METHOD" = "iptables" ]; then _register_cleanup iptables_remove_drop; fi
+
+size=$(stat -c %s "$REMOTE_FILE") || _fail "stat remote"
+blocks=$(( (size + BLOCK_SIZE - 1) / BLOCK_SIZE ))
+echo "cifs144: reading $blocks blocks (size=$size) injecting disconnect every $DROP_EVERY blocks via $DISCONNECT_METHOD" >> $seqres.full
+
+idx=0
+while [ $idx -lt $blocks ]; do
+	# Read block via a fresh open each time so a killed connection is fully re-established
+	# dd will return partial (short) read for the last block automatically
+	dd if="$REMOTE_FILE" bs=$BLOCK_SIZE skip=$idx count=1 status=none >> "$LOCAL_TMP" || _fail "dd block $idx failed"
+	if [ $(((idx+1) % DROP_EVERY)) -eq 0 ]; then
+		if [ "$DISCONNECT_METHOD" = "ss" ]; then
+			echo "cifs144: killing SMB connections after block $idx (ss -K)" >> $seqres.full
+			ss_kill_conns
+		else
+			echo "cifs144: iptables drop window after block $idx" >> $seqres.full
+			iptables_add_drop || echo "cifs144: failed to add drop" >> $seqres.full
+			sleep $DROP_SECS
+			iptables_remove_drop
+		fi
+	fi
+	idx=$((idx+1))
+done
+
+sha256sum "$REMOTE_FILE" | awk '{print $1}' > "$SHA_REMOTE" 2>>$seqres.full || _fail "sha remote"
+sha256sum "$LOCAL_TMP" | awk '{print $1}' > "$SHA_LOCAL" 2>>$seqres.full || _fail "sha local"
+if ! diff -u "$SHA_REMOTE" "$SHA_LOCAL" >> $seqres.full 2>&1; then
+	_fail "sha256 mismatch after reconnect read stress"
+fi
+
+echo "reconnect read with induced drops OK"
 
 status=0
 exit

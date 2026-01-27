@@ -1,0 +1,80 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: SMB signing enabled with -o sign
+#
+# Behavior under test
+# - Mount with -o sign and verify that DebugData for our connection shows
+#   signing enabled. If DebugData lacks a recognizable signing indicator,
+#   skip with diagnostics.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+_host_from_unc() { echo "$1" | sed -E 's#^//([^/]+)/.*#\1#'; }
+_share_from_unc() { echo "$1" | sed -E 's#^//[^/]+/([^/]+).*#\1#'; }
+_unc_windows() { local h=$(_host_from_unc "$1"); local s=$(_share_from_unc "$1"); printf "\\\\%s\\%s" "$h" "$s"; }
+
+HOST=$(_host_from_unc "$TEST_DEV")
+UNCW=$(_unc_windows "$TEST_DEV")
+[ -n "$HOST" ] || _notrun "could not derive host"
+
+_dd_signing_on_for_host()
+{
+    local host="$1" snap
+    snap=$(cat /proc/fs/cifs/DebugData 2>/dev/null) || return 2
+    echo "$snap" >> $seqres.full
+    awk -v host_lc="${host,,}" '
+        BEGIN { RS="^[[:space:]]*[0-9]+[)].*ConnectionId:"; found=0 }
+        NR==1 { next }
+        {
+            block=tolower($0)
+            if (index(block, host_lc)) {
+                found=1
+                if (block ~ /sign/ && block ~ /(on|yes|true|enable)/) {
+                    print 1
+                } else {
+                    print 0
+                }
+                exit
+            }
+        }
+        END {
+            if (!found)
+                print ""
+        }
+    ' <<< "$snap"
+}
+
+_register_cleanup "_test_unmount >/dev/null 2>&1; rm -rf \"$TEST_DIR/cifs118.$$.w\" >/dev/null 2>&1"
+
+_test_unmount > /dev/null 2>&1
+_do "_test_mount -o sign" || _fail "mount with -o sign failed"
+
+# light I/O
+mkdir -p "$TEST_DIR/cifs118.$$.w" 2>>$seqres.full || true
+echo 1 > "$TEST_DIR/cifs118.$$.w/poke" 2>>$seqres.full || true
+
+tries=15
+state=""
+while [ $tries -gt 0 ]; do
+    state=$(_dd_signing_on_for_host "$HOST")
+    [ -n "$state" ] && break
+    tries=$((tries-1)); sleep 0.2
+done
+
+[ -n "$state" ] || _notrun "DebugData lacks signing state for $UNCW"
+
+if [ "$state" -eq 1 ]; then
+    echo "SMB signing enabled OK"
+else
+    _notrun "server/share did not enable signing for $UNCW (requested with -o sign)"
+fi
+
+status=0
+exit
