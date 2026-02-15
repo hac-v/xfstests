@@ -16,7 +16,10 @@ _register_cleanup "_test_unmount >/dev/null 2>&1; rm -rf '$TEST_DIR/cifs147.$$' 
 
 _test_unmount >/dev/null 2>&1
 _do "_test_mount" || _fail "mount failed"
-python3 - <<'PYEOF' "$W/watch" > "$OUT" 2>>$seqres.full &
+W="$TEST_DIR/cifs147.$$"
+OUT=$(mktemp -t cifs147.out.XXXXXX) || _fail "mktemp out"
+mkdir -p "$W/watch" || _fail "mkdir watch dir"
+python3 - "$W/watch" <<'PYEOF' > "$OUT" 2>>$seqres.full &
 import os, sys, fcntl, struct
 REQ = 0xc009cf0b
 try:

@@ -24,10 +24,12 @@ _begin_fstest auto quick
 [ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
 
 _host_from_unc() { echo "$1" | sed -E 's#^//([^/]+)/.*#\1#'; }
+_share_from_unc() { echo "$1" | sed -E 's#^//[^/]+/([^/]+).*#\1#'; }
 HOST=$(_host_from_unc "$TEST_DEV")
+SHARE=$(_share_from_unc "$TEST_DEV")
 
-_dd_counts_for_host() {
-    local host="$1"; local tries=20; local delay=0.1
+_dd_counts_for_unc() {
+    local host="$1"; local share="$2"; local tries=20; local delay=0.1
     local snap
     while [ $tries -gt 0 ]; do
         snap=$(cat /proc/fs/cifs/DebugData 2>/dev/null)
@@ -38,21 +40,36 @@ _dd_counts_for_host() {
         tries=$((tries-1))
         sleep $delay
     done
-    echo "$snap" | awk -v HOST="$host" '
-        BEGIN { lhost=tolower(HOST); inb=0; has_host=0; has_ns=0; conn=0; ns=0 }
+    echo "$snap" | awk -v HOST="$host" -v SHARE="$share" '
+        BEGIN {
+            lhost=tolower(HOST)
+            lshare=tolower(SHARE)
+            inb=0; has_unc=0; has_ns=0; conn=0; ns=0; nonns=0
+        }
         /^[[:space:]]*[0-9]+[)]/ && index($0, "ConnectionId:")>0 {
-            if (inb==1 && has_host==1) { conn++; if (has_ns==1) ns++; }
-            inb=1; has_host=0; has_ns=0
+            if (inb==1 && has_unc==1) {
+                conn++
+                if (has_ns==1) ns++
+                if (has_ns==0) nonns++
+            }
+            inb=1; has_unc=0; has_ns=0
             next
         }
         {
             line=tolower($0)
-            if (index(line, lhost)>0) has_host=1
+            # Match share blocks like: \\host\share ...
+            if (index(line, "\\\\" lhost "\\" lshare " ")>0 ||
+                line ~ ("\\\\" lhost "\\" lshare "$"))
+                has_unc=1
             if (index(line, "nosharesock")>0) has_ns=1
         }
         END {
-            if (inb==1 && has_host==1) { conn++; if (has_ns==1) ns++; }
-            print conn, ns
+            if (inb==1 && has_unc==1) {
+                conn++
+                if (has_ns==1) ns++
+                if (has_ns==0) nonns++
+            }
+            print conn, ns, nonns
         }
     '
 }
@@ -63,15 +80,15 @@ _register_cleanup "_test_unmount >/dev/null 2>&1"
 _test_unmount > /dev/null 2>&1
 _do "_test_mount" || _fail "mount TEST_DEV failed"
 
-read conn1 ns1 < <(_dd_counts_for_host "$HOST")
-echo "phase1: host=$HOST conn=$conn1 ns=$ns1" >> $seqres.full
+read conn1 ns1 nonns1 < <(_dd_counts_for_unc "$HOST" "$SHARE")
+echo "phase1: host=$HOST share=$SHARE conn=$conn1 ns=$ns1 nonns=$nonns1" >> $seqres.full
 
 if [ -z "$conn1" ] || [ "$conn1" -lt 1 ]; then
-    _fail "phase1: no ConnectionId blocks found for host $HOST"
+    _fail "phase1: no ConnectionId blocks found for //$HOST/$SHARE"
 fi
 
-if [ -n "$ns1" ] && [ "$ns1" -ne 0 ]; then
-    _fail "phase1: unexpected nosharesock flag present in DebugData"
+if [ -z "$nonns1" ] || [ "$nonns1" -lt 1 ]; then
+    _fail "phase1: expected at least one non-nosharesock ConnectionId block for //$HOST/$SHARE"
 fi
 
 _test_unmount
@@ -79,11 +96,11 @@ _test_unmount
 # Phase 2: nosharesock mount should show nosharesock in DebugData for our host
 _do "_test_mount -o nosharesock" || _fail "mount TEST_DEV (nosharesock) failed"
 
-read conn2 ns2 < <(_dd_counts_for_host "$HOST")
-echo "phase2: host=$HOST conn=$conn2 ns=$ns2" >> $seqres.full
+read conn2 ns2 nonns2 < <(_dd_counts_for_unc "$HOST" "$SHARE")
+echo "phase2: host=$HOST share=$SHARE conn=$conn2 ns=$ns2 nonns=$nonns2" >> $seqres.full
 
 if [ -z "$conn2" ] || [ "$conn2" -lt 1 ]; then
-    _fail "phase2: no ConnectionId blocks found for host $HOST"
+    _fail "phase2: no ConnectionId blocks found for //$HOST/$SHARE"
 fi
 
 if [ -z "$ns2" ] || [ "$ns2" -lt 1 ]; then

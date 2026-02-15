@@ -39,8 +39,8 @@ size=$((1024*1024))    # 1 MiB
 off=$((256*1024))      # 256 KiB
 len=$((256*1024))      # 256 KiB
 
-# Create file filled with 'A' to distinguish from zeros
-yes A | head -c "$size" > "$W/f" 2>>$seqres.full || _fail "create patterned file failed"
+# Create file filled with raw 'A' bytes (no newlines) to distinguish from zeros
+head -c "$size" /dev/zero | tr '\000' 'A' > "$W/f" 2>>$seqres.full || _fail "create patterned file failed"
 
 # Sanity: pre-hole region should be all 'A'
 pre_cnt=$(dd if="$W/f" bs=4096 count=1 skip=$(((off/4096)-1)) 2>>$seqres.full | tr -d 'A' | wc -c)

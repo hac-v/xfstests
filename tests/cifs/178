@@ -1,0 +1,69 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# CIFS: extended attributes round-trip and cross-mount visibility
+#
+# Validate that user xattrs can be set/read/replaced/removed on one mount and
+# immediately observed from another mount of the same share.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick metadata
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+
+command -v setfattr >/dev/null 2>&1 || _notrun "setfattr required"
+command -v getfattr >/dev/null 2>&1 || _notrun "getfattr required"
+
+base_opts=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^[[:space:]]*-o[[:space:]]*//' -e 's/^[[:space:]]*//')
+if [ -z "$base_opts" ]; then
+    base_opts=$(awk -v mnt="$TEST_DIR" '$2==mnt {print $4}' /proc/mounts)
+fi
+if ! echo "$base_opts" | grep -Eq '(^|,)(credentials=|username=|user=)'; then
+    if [ -n "$CIFS_CRED_FILE" ] && [ -r "$CIFS_CRED_FILE" ]; then
+        base_opts="${base_opts:+$base_opts,}credentials=$CIFS_CRED_FILE"
+    elif [ -r /root/.cifs-cred-xfstest ]; then
+        base_opts="${base_opts:+$base_opts,}credentials=/root/.cifs-cred-xfstest"
+    elif [ -n "$CIFS_USER" ] && [ -n "$CIFS_PASS" ]; then
+        base_opts="${base_opts:+$base_opts,}username=$CIFS_USER,password=$CIFS_PASS"
+    fi
+fi
+
+MNT2=$(mktemp -d /tmp/cifs178.mnt.XXXXXX) || _fail "mktemp"
+_register_cleanup "umount '$MNT2' >/dev/null 2>&1 || true; rmdir '$MNT2' >/dev/null 2>&1 || true; rm -rf '$TEST_DIR/cifs178.dir' >/dev/null 2>&1 || true"
+
+if ! mount -t cifs "$TEST_DEV" "$MNT2" -o "$base_opts" >>$seqres.full 2>&1; then
+    rmdir "$MNT2" >/dev/null 2>&1 || true
+    _notrun "secondary mount failed"
+fi
+
+DIR="$TEST_DIR/cifs178.dir"
+FILE="$DIR/file"
+mkdir -p "$DIR" || _fail "mkdir"
+echo "payload" > "$FILE" || _fail "create file"
+
+# Detect support
+if ! setfattr -n user.cifs178 -v first "$FILE" >>$seqres.full 2>&1; then
+    if setfattr -n user.cifs178 -v first "$FILE" 2>&1 | grep -Eqi 'Operation not supported|Not supported|EOPNOTSUPP'; then
+        _notrun "user xattr unsupported on this backend/mount"
+    fi
+    _fail "initial setfattr failed"
+fi
+
+val=$(getfattr --only-values -n user.cifs178 "$MNT2/cifs178.dir/file" 2>>$seqres.full || true)
+[ "$val" = "first" ] || _fail "cross-mount xattr read mismatch (want=first got=$val)"
+
+setfattr -n user.cifs178 -v second "$MNT2/cifs178.dir/file" >>$seqres.full 2>&1 || _fail "replace xattr failed"
+val2=$(getfattr --only-values -n user.cifs178 "$FILE" 2>>$seqres.full || true)
+[ "$val2" = "second" ] || _fail "updated xattr not visible on primary mount"
+
+setfattr -x user.cifs178 "$FILE" >>$seqres.full 2>&1 || _fail "remove xattr failed"
+if getfattr -n user.cifs178 "$MNT2/cifs178.dir/file" >>$seqres.full 2>&1; then
+    _fail "xattr still present after removal"
+fi
+
+echo "extended attributes round-trip OK"
+status=0
+exit

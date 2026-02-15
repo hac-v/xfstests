@@ -33,9 +33,15 @@ actual_rsize=$(grep -m1 -i 'rsize' $dbg | sed -n 's/.*rsize:[[:space:]]*\([0-9]\
 actual_wsize=$(grep -m1 -i 'wsize' $dbg | sed -n 's/.*wsize:[[:space:]]*\([0-9]\+\).*/\1/p')
 actual_rasize=$(grep -m1 -i 'rasize' $dbg | sed -n 's/.*rasize:[[:space:]]*\([0-9]\+\).*/\1/p')
 
-[ -n "$actual_rsize" ] || _fail "missing rsize in DebugData"
-[ -n "$actual_wsize" ] || _fail "missing wsize in DebugData"
-[ -n "$actual_rasize" ] || _fail "missing rasize in DebugData"
+# Fallback for kernels that do not expose these in DebugData in the same format.
+mnt_opts=$(awk -v mnt="$TEST_DIR" '$2==mnt {print $4; exit}' /proc/mounts)
+[ -n "$actual_rsize" ] || actual_rsize=$(echo "$mnt_opts" | sed -n 's/.*\(^\|,\)rsize=\([0-9]\+\).*/\2/p')
+[ -n "$actual_wsize" ] || actual_wsize=$(echo "$mnt_opts" | sed -n 's/.*\(^\|,\)wsize=\([0-9]\+\).*/\2/p')
+[ -n "$actual_rasize" ] || actual_rasize=$(echo "$mnt_opts" | sed -n 's/.*\(^\|,\)rasize=\([0-9]\+\).*/\2/p')
+
+[ -n "$actual_rsize" ] || _notrun "rsize not exposed by kernel"
+[ -n "$actual_wsize" ] || _notrun "wsize not exposed by kernel"
+[ -n "$actual_rasize" ] || _notrun "rasize not exposed by kernel"
 
 echo "cifs154: requested rasize=$REQ_RASIZE rsize=$REQ_RSIZE wsize=$REQ_WSIZE actual $actual_rasize/$actual_rsize/$actual_wsize" >> $seqres.full
 

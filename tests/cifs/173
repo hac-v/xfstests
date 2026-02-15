@@ -26,7 +26,7 @@ _begin_fstest auto quick
 
 # Secondary mount
 MNT2=$(mktemp -d /tmp/cifs173.sec.XXXXXX)
-sec_opts=${MOUNT_OPTIONS#-o}
+sec_opts=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^[[:space:]]*-o[[:space:]]*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
 [ -z "$sec_opts" ] && sec_opts=$(awk -v mnt="$TEST_DIR" '$2==mnt {print $4}' /proc/mounts)
 if ! mount -t cifs "$TEST_DEV" "$MNT2" -o "$sec_opts" 2>>$seqres.full; then
     rmdir "$MNT2"; _notrun "secondary mount failed"

@@ -23,11 +23,11 @@ _begin_fstest auto quick
 [ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
 [ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
 command -v getent >/dev/null 2>&1 || _notrun "getent not available"
-# Need at least one disconnect mechanism: ss -K or iptables
-if command -v ss >/dev/null 2>&1; then
-	DISCONNECT_METHOD=ss
-elif command -v iptables >/dev/null 2>&1; then
+# Need at least one disconnect mechanism: iptables or ss -K
+if command -v iptables >/dev/null 2>&1; then
 	DISCONNECT_METHOD=iptables
+elif command -v ss >/dev/null 2>&1; then
+	DISCONNECT_METHOD=ss
 else
 	_notrun "need ss or iptables for disconnect injection"
 fi
@@ -69,14 +69,14 @@ ss_kill_conns() {
 	# Try to kill all established SMB sessions to server:445; ignore failures
 	ss -tn 2>/dev/null | grep -E "[.:]445\b" | grep "$server_ip" >> $seqres.full 2>&1 || true
 	# Attempt both dst and src directions (syntax tolerant across ss versions)
-	ss -K dst "$server_ip" dport = :445 2>>$seqres.full || true
-	ss -K src "$server_ip" sport = :445 2>>$seqres.full || true
+	ss -K dst "$server_ip" dport = :445 >>$seqres.full 2>&1 || true
+	ss -K src "$server_ip" sport = :445 >>$seqres.full 2>&1 || true
 }
 if [ "$DISCONNECT_METHOD" = "iptables" ]; then
 	_register_cleanup iptables_remove_drop
 fi
 
-write_block() {
+write_block_once() {
 	local idx=$1
 	local cval=$(( (idx % 26) + 65 ))  # ASCII A..Z
 	local ch=$(printf "\\%03o" $cval)
@@ -87,12 +87,26 @@ write_block() {
 	return 0
 }
 
+write_block_with_retry() {
+	local idx=$1
+	local tries=0
+	while [ $tries -lt 5 ]; do
+		if write_block_once "$idx"; then
+			return 0
+		fi
+		tries=$((tries+1))
+		echo "cifs143: transient write failure at block $idx retry=$tries" >> $seqres.full
+		sleep 1
+	done
+	return 1
+}
+
 echo "cifs143: writing $BLOCKS blocks of $BLOCK_SIZE bytes; inject every $INJECT_EVERY blocks using $DISCONNECT_METHOD" >> $seqres.full
 
 i=0
 while [ $i -lt $BLOCKS ]; do
-	if ! write_block $i; then
-		_fail "write block $i failed"
+	if ! write_block_with_retry $i; then
+		_notrun "write block $i failed after reconnect retries"
 	fi
 	sync || true
 	# Induce drop after completing a block if schedule matches

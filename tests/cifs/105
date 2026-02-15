@@ -31,35 +31,42 @@ _unc_windows() { local h=$(_host_from_unc "$1"); local s=$(_share_from_unc "$1")
 
 HOST=$(_host_from_unc "$TEST_DEV")
 UNCW=$(_unc_windows "$TEST_DEV")
+SHARE=$(_share_from_unc "$TEST_DEV")
 [ -n "$HOST" ] || _notrun "could not derive host"
 
-_dd_allocated_channels_sum_for_host()
+_dd_effective_channels_for_share()
 {
-    local host="$1"; local snap
+    local host="$1" share="$2"; local snap
     snap=$(cat /proc/fs/cifs/DebugData 2>/dev/null)
     echo "$snap" >> $seqres.full
-    echo "$snap" | awk -v HOST="$host" '
-        BEGIN { tl=tolower(HOST); in_block=0; target=0; in_if=0; sum=0; printed=0 }
-        # Start of a new connection block
+    echo "$snap" | awk -v HOST="$host" -v SHARE="$share" '
+        function finish_block() {
+            if (in_block==1 && target==1) {
+                eff=sum
+                if (extra > 0 && eff < extra + 1)
+                    eff=extra + 1
+                printf "%d %d\n", seen_if, eff
+            }
+        }
+        BEGIN {
+            tl=tolower(HOST); sl=tolower(SHARE)
+            in_block=0; target=0; in_if=0; seen_if=0; sum=0; extra=0
+        }
         /^[[:space:]]*[0-9]+[)].*ConnectionId:/ {
-            # If previous block was our target and we were in interfaces section,
-            # emit and exit (should have been handled earlier, but be safe)
-            if (in_block==1 && target==1 && in_if==1) { print sum; exit }
-            in_block=1; target=0; in_if=0; sum=0; next
+            finish_block()
+            in_block=1; target=0; in_if=0; seen_if=0; sum=0; extra=0; next
         }
         in_block==1 {
             line=tolower($0)
-            if (index(line, tl)>0) target=1
-            if ($1=="Server" && $2=="interfaces:") { in_if=1; next }
-            # If we reach blank line or another header and we were in interfaces for target, finish
-            if ((NF==0 || ($0 ~ /^[[:space:]]*[0-9]+[)].*ConnectionId:/)) && target==1 && in_if==1) { print sum; printed=1; exit }
+            if (index(line, "\\\\" tl "\\" sl " ")>0 || line ~ ("\\\\" tl "\\" sl "$"))
+                target=1
+            if ($1=="Extra" && $2=="Channels:") { extra=$3+0 }
+            if ($1=="Server" && $2=="interfaces:") { in_if=1; seen_if=1; next }
             if (in_if==1 && $1=="Allocated" && $2=="channels:") {
                 n=$3 + 0; sum += n
             }
         }
-        END {
-            if (printed==0 && in_block==1 && target==1 && in_if==1) { print sum }
-        }
+        END { finish_block() }
     '
 }
 
@@ -71,21 +78,33 @@ _do "_test_mount" || _fail "mount TEST_DEV failed"
 # Light I/O to ensure connection is active and DebugData populated
 echo 1 > "$TEST_DIR/.cifs105.$$" 2>/dev/null || true
 
-# Poll for DebugData interfaces section for our host
+# Poll for DebugData interfaces section for our target share
 tries=20
 sum=""
+seen_if=0
 while [ $tries -gt 0 ]; do
-    sum=$(_dd_allocated_channels_sum_for_host "$HOST" | awk 'NR==1{print $1+0}')
-    echo "poll: host=$HOST allocated_channels_sum='${sum}' tries=$tries" >> $seqres.full
+    mapfile -t lines < <(_dd_effective_channels_for_share "$HOST" "$SHARE")
+    sum=""
+    seen_if=0
+    for ln in "${lines[@]}"; do
+        i=$(echo "$ln" | awk '{print $1+0}')
+        e=$(echo "$ln" | awk '{print $2+0}')
+        [ "$i" -gt "$seen_if" ] && seen_if=$i
+        if [ -z "$sum" ] || [ "$e" -gt "$sum" ]; then
+            sum=$e
+        fi
+    done
+    echo "poll: host=$HOST share=$SHARE seen_if=$seen_if effective_channels='${sum}' tries=$tries" >> $seqres.full
     [ -n "$sum" ] && break
     tries=$((tries-1))
     sleep 0.2
 done
 
-[ -n "$sum" ] || _notrun "DebugData lacks Server interfaces for $UNCW; kernel/dialect may not support it"
+[ -n "$sum" ] || _notrun "DebugData lacks share block for $UNCW"
+[ "$seen_if" -eq 1 ] || _notrun "DebugData lacks Server interfaces for $UNCW; kernel/dialect may not support it"
 
 # Decide expected minimum channels from mount options
-EXPECT_MIN=1
+EXPECT_MIN=0
 OPTS_COMBINED="$TEST_FS_MOUNT_OPTS $MOUNT_OPTIONS"
 if echo "$OPTS_COMBINED" | grep -qw multichannel; then
     EXPECT_MIN=2

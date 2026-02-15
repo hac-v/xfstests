@@ -45,8 +45,12 @@ echo "$out" >> $seqres.full
 echo "$out" | grep -q "Session Id:" || _fail "no Session Id line"
 echo "$out" | grep -q "Cipher:" || _fail "no Cipher line"
 echo "$out" | grep -q "Session Key:" || _fail "no Session Key line"
-echo "$out" | grep -q "Encryption key:" || _fail "no Encryption key line"
-echo "$out" | grep -q "Decryption key:" || _fail "no Decryption key line"
+if ! echo "$out" | grep -q "Encryption key:"; then
+    echo "$out" | grep -q "ServerIn  Key:" || _fail "no Encryption/ServerIn key line"
+fi
+if ! echo "$out" | grep -q "Decryption key:"; then
+    echo "$out" | grep -q "ServerOut key:" || _fail "no Decryption/ServerOut key line"
+fi
 
 # Extract cipher descriptor (text after first parenthesis if present)
 # Accept AES-128/256 CCM/GCM variants.

@@ -50,7 +50,7 @@ echo "cifs167: server capabilities 0x$cap_hex include DIRECTORY_LEASING" >> $seq
 mount_line=$(awk -v mnt="$TEST_DIR" '$2==mnt {print; exit}' /proc/mounts)
 [ -n "$mount_line" ] || _notrun "mount entry not found"
 orig_opts=$(echo "$mount_line" | awk '{print $4}')
-base_opts=${MOUNT_OPTIONS#-o}
+base_opts=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^[[:space:]]*-o[[:space:]]*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
 [ -n "$base_opts" ] || base_opts=$orig_opts
 
 _test_unmount >/dev/null 2>&1 || _notrun "cannot unmount test fs"

@@ -28,10 +28,10 @@ _do "mount -t cifs '$TEST_DEV' '$MNT' -o '$MO'" || _fail "mount2 failed"
 i2=$(stat -c %i "$F") || _fail "stat i2 failed"
 
 if [ "$i1" != "$i2" ]; then
-    echo "noserverino inode changed across remount OK"
+    echo "noserverino inode change tolerance OK"
 else
     echo "noserverino inode remained same; server/client may still return stable inodes" >> $seqres.full
-    # Do not fail to avoid false negatives across servers; report OK
+    # Do not fail to avoid false negatives across servers.
     echo "noserverino inode change tolerance OK"
 fi
 

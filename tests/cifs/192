@@ -27,6 +27,10 @@ _begin_fstest auto stress
 [ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
 [ -r /proc/fs/cifs/DebugData ] || _notrun "DebugData unavailable"
 
+mount_opts=$(awk -v mnt="$TEST_DIR" '$2==mnt {print $4; exit}' /proc/mounts)
+echo "$mount_opts" | grep -Eq '(^|,)(file_mode|dir_mode)=' && \
+    _notrun "fixed file_mode/dir_mode mount options prevent mode validation"
+
 command -v iptables >/dev/null 2>&1 || _notrun "iptables required"
 command -v sha256sum >/dev/null 2>&1 || _notrun "sha256sum required"
 command -v python3 >/dev/null 2>&1 || _notrun "python3 required"

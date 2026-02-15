@@ -31,27 +31,40 @@ _unc_posix() { local h=$(_host_from_unc "$1"); local s=$(_share_from_unc "$1"); 
 HOST=$(_host_from_unc "$TEST_DEV")
 UNCW=$(_unc_windows "$TEST_DEV")
 UNCP=$(_unc_posix "$TEST_DEV")
+SHARE=$(_share_from_unc "$TEST_DEV")
 [ -n "$HOST" ] || _notrun "could not derive host"
 
-_dd_allocated_channels_sum_for_host()
+_dd_effective_channels_for_share()
 {
-    local host="$1"; local snap
+    local host="$1" share="$2"; local snap
     snap=$(cat /proc/fs/cifs/DebugData 2>/dev/null)
     echo "$snap" >> $seqres.full
-    echo "$snap" | awk -v HOST="$host" '
-        BEGIN { tl=tolower(HOST); in_block=0; target=0; in_if=0; sum=0; printed=0 }
+    echo "$snap" | awk -v HOST="$host" -v SHARE="$share" '
+        function finish_block() {
+            if (in_block==1 && target==1) {
+                eff=sum
+                if (extra > 0 && eff < extra + 1)
+                    eff=extra + 1
+                printf "%d\n", eff
+            }
+        }
+        BEGIN {
+            tl=tolower(HOST); sl=tolower(SHARE)
+            in_block=0; target=0; in_if=0; sum=0; extra=0
+        }
         /^[[:space:]]*[0-9]+[)].*ConnectionId:/ {
-            if (in_block==1 && target==1 && in_if==1) { print sum; printed=1; exit }
-            in_block=1; target=0; in_if=0; sum=0; next
+            finish_block()
+            in_block=1; target=0; in_if=0; sum=0; extra=0; next
         }
         in_block==1 {
             line=tolower($0)
-            if (index(line, tl)>0) target=1
+            if (index(line, "\\\\" tl "\\" sl " ")>0 || line ~ ("\\\\" tl "\\" sl "$"))
+                target=1
+            if ($1=="Extra" && $2=="Channels:") { extra=$3+0 }
             if ($1=="Server" && $2=="interfaces:") { in_if=1; next }
-            if ((NF==0 || ($0 ~ /^[[:space:]]*[0-9]+[)].*ConnectionId:/)) && target==1 && in_if==1) { print sum; printed=1; exit }
             if (in_if==1 && $1=="Allocated" && $2=="channels:") { n=$3+0; sum+=n }
         }
-        END { if (printed==0 && in_block==1 && target==1 && in_if==1) print sum }
+        END { finish_block() }
     '
 }
 
@@ -90,7 +103,7 @@ echo 1 > "$TEST_DIR/.cifs106.$$" 2>/dev/null || true
 tries=30
 sum=""
 while [ $tries -gt 0 ]; do
-    sum=$(_dd_allocated_channels_sum_for_host "$HOST" | awk 'NR==1{print $1+0}')
+    sum=$(_dd_effective_channels_for_share "$HOST" "$SHARE" | awk 'BEGIN{m=""} {if (m=="" || $1+0>m) m=$1+0} END{if(m!="") print m}')
     echo "multichannel: DebugData sum='${sum}' tries=$tries" >> $seqres.full
     [ -n "$sum" ] && [ "$sum" -ge 2 ] && break
     tries=$((tries-1)); sleep 0.2

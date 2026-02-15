@@ -37,9 +37,18 @@ server_ip=$(getent ahostsv4 "$host" | awk '{print $1; exit}')
 MNT2=$(mktemp -d /tmp/cifs188.sec.XXXXXX) || _fail "mktemp"
 _register_cleanup "umount $MNT2 >/dev/null 2>&1 || true; rmdir $MNT2 >/dev/null 2>&1 || true; iptables -D OUTPUT -d $server_ip -p tcp --dport 445 -j DROP 2>/dev/null || true; iptables -D INPUT -s $server_ip -p tcp --sport 445 -j DROP 2>/dev/null || true; kill $HOLDER_PID >/dev/null 2>&1 || true"
 
-base_opts=${MOUNT_OPTIONS#-o}
+base_opts=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^[[:space:]]*-o[[:space:]]*//' -e 's/^[[:space:]]*//')
 if [ -z "$base_opts" ]; then
     base_opts=$(awk -v mnt="$TEST_DIR" '$2==mnt {print $4}' /proc/mounts)
+fi
+if ! echo "$base_opts" | grep -Eq '(^|,)(credentials=|username=|user=)'; then
+    if [ -n "$CIFS_CRED_FILE" ] && [ -r "$CIFS_CRED_FILE" ]; then
+        base_opts="${base_opts:+$base_opts,}credentials=$CIFS_CRED_FILE"
+    elif [ -r /root/.cifs-cred-xfstest ]; then
+        base_opts="${base_opts:+$base_opts,}credentials=/root/.cifs-cred-xfstest"
+    elif [ -n "$CIFS_USER" ] && [ -n "$CIFS_PASS" ]; then
+        base_opts="${base_opts:+$base_opts,}username=$CIFS_USER,password=$CIFS_PASS"
+    fi
 fi
 
 if ! mount -t cifs "$TEST_DEV" "$MNT2" -o "$base_opts" >>$seqres.full 2>&1; then

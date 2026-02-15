@@ -54,8 +54,17 @@ run_with_passes() {
     local password=$1
     local password2=$2
     local logfile=$3
-    PASSWD="$password" PASSWD2="$password2" mount.cifs "$TEST_DEV" "$MNT" \
-        -f -o "user=testcase" >"$logfile" 2>&1
+    local opts="user=testcase,noprompt"
+    # Prevent interactive prompt when intentionally testing empty primary password.
+    [ -z "$password" ] && opts="$opts,pass="
+    if command -v setsid >/dev/null 2>&1; then
+        PASSWD="$password" PASSWD2="$password2" setsid -w \
+            mount.cifs "$TEST_DEV" "$MNT" -f -o "$opts" \
+            </dev/null >"$logfile" 2>&1
+    else
+        PASSWD="$password" PASSWD2="$password2" mount.cifs "$TEST_DEV" "$MNT" \
+            -f -o "$opts" </dev/null >"$logfile" 2>&1
+    fi
     return $?
 }
 

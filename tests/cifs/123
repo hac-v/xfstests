@@ -24,7 +24,7 @@ _begin_fstest auto quick
 _register_cleanup "[ -n \"$CHILD\" ] && kill $CHILD >/dev/null 2>&1; exec 3>&- 2>/dev/null; _test_unmount >/dev/null 2>&1; rm -rf \"$TEST_DIR/cifs123.$$\" >/dev/null 2>&1"
 
 _test_unmount > /dev/null 2>&1
-_do "_test_mount" || _fail "mount failed"
+_do "_test_mount -o closetimeo=0" || _fail "mount failed"
 
 # Ensure cifs open_files proc entry exists on this kernel
 if [ ! -r /proc/fs/cifs/open_files ]; then

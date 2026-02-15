@@ -40,10 +40,29 @@ cleanup()
 }
 _register_cleanup cleanup
 
-base_opts=${MOUNT_OPTIONS#-o}
+base_opts=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^[[:space:]]*-o[[:space:]]*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
 if [ -z "$base_opts" ]; then
     base_opts=$(awk -v mnt="$TEST_DIR" '$2==mnt {print $4}' /proc/mounts)
 fi
+
+ensure_auth_opts() {
+    local in="$1"
+    if echo "$in" | grep -Eq '(^|,)(credentials=|username=|user=|guest)(,|$)'; then
+        echo "$in"
+        return
+    fi
+    if [ -n "$CIFS_CRED_FILE" ] && [ -r "$CIFS_CRED_FILE" ]; then
+        echo "${in:+$in,}credentials=$CIFS_CRED_FILE"
+    elif [ -r /root/.cifs-cred-xfstest ]; then
+        echo "${in:+$in,}credentials=/root/.cifs-cred-xfstest"
+    elif [ -n "$CIFS_USER" ] && [ -n "$CIFS_PASS" ]; then
+        echo "${in:+$in,}username=$CIFS_USER,password=$CIFS_PASS"
+    else
+        echo "$in"
+    fi
+}
+
+base_opts=$(ensure_auth_opts "$base_opts")
 
 strip_cache() {
     echo "$base_opts" | sed -E 's/(^|,)cache=[^,]*//g; s/,,/,/g; s/^,//; s/,$//'

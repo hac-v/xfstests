@@ -24,6 +24,7 @@ _begin_fstest auto quick
 [ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
 [ "$(id -u)" = 0 ] || _notrun "root required"
 [ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+command -v mount.cifs >/dev/null 2>&1 || _notrun "mount.cifs unavailable"
 
 host=$(echo "$TEST_DEV" | sed -n 's#^//\([^/]*\)/.*#\1#p')
 share=$(echo "$TEST_DEV" | sed -n 's#^//[^/]*/\([^/]*\).*#\1#p')
@@ -33,21 +34,21 @@ share=$(echo "$TEST_DEV" | sed -n 's#^//[^/]*/\([^/]*\).*#\1#p')
 MNT2=$(mktemp -d /tmp/cifs182.mnt.XXXXXX) || _fail "mktemp"
 _register_cleanup "rmdir $MNT2 >/dev/null 2>&1 || true"
 
-base_opts=${MOUNT_OPTIONS#-o}
+base_opts=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^[[:space:]]*-o[[:space:]]*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
 if [ -z "$base_opts" ]; then
     base_opts=$(awk -v mnt="$TEST_DIR" '$2==mnt {print $4}' /proc/mounts)
 fi
 
 fail_case() {
     local dev="$1"; shift
-    local expect="$1"; shift
-    local err=$TMPDIR/cifs182.err.$$ 
-    if mount -t cifs "$dev" "$MNT2" -o "$base_opts" > /dev/null 2> "$err"; then
+    local expect_re="$1"; shift
+    local err=${TMPDIR:-/tmp}/cifs182.err.$$ 
+    if mount.cifs "$dev" "$MNT2" -f -o "$base_opts" > /dev/null 2> "$err"; then
         umount "$MNT2" >/dev/null 2>&1 || true
         _fail "unexpected success for $dev"
     fi
-    if ! grep -qi "$expect" "$err"; then
-        echo "cifs182: dev=$dev expected substring '$expect'" >> $seqres.full
+    if ! grep -Eqi "$expect_re" "$err"; then
+        echo "cifs182: dev=$dev expected pattern '$expect_re'" >> $seqres.full
         echo "stderr:" >> $seqres.full
         cat "$err" >> $seqres.full
         _fail "missing expected error substring for $dev"
@@ -61,9 +62,9 @@ DEV1="$host/$share"           # missing leading //
 DEV2="//"                      # just slashes
 DEV3="//$host/$longshare"      # overlength share
 
-fail_case "$DEV1" "bad UNC"
-fail_case "$DEV2" "UNC name too short"
-fail_case "$DEV3" "share portion of UNC too long"
+fail_case "$DEV1" "bad UNC|UNC name too short"
+fail_case "$DEV2" "UNC name too short|bad UNC"
+fail_case "$DEV3" "share portion of UNC too long|UNC name too long"
 
 echo "UNC validation error handling OK"
 status=0; exit

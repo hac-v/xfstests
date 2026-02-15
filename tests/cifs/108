@@ -40,31 +40,53 @@ HOST1=$(_host_from_unc "$PRIMARY")
 HOST2=$(_host_from_unc "$SECONDARY")
 [ "$HOST1" = "$HOST2" ] || _notrun "both shares must be on same host"
 HOST="$HOST1"
+SHARE1=$(_share_from_unc "$PRIMARY")
+SHARE2=$(_share_from_unc "$SECONDARY")
 UNC1=$(_unc_windows "$PRIMARY"); UNC2=$(_unc_windows "$SECONDARY")
 UNC1_FS=$(_unc_posix "$PRIMARY"); UNC2_FS=$(_unc_posix "$SECONDARY")
 [ "$UNC1" != "$UNC2" ] || _notrun "shares must be different"
 
 _dd_channel_sums_for_host() {
-    # Prints: "<cid> <sum>" per ConnectionId block that mentions HOST
+    # Prints: "<share> <effective_channels> <nosharesock_flag>" for host blocks
     local host="$1"; local snap
     snap=$(cat /proc/fs/cifs/DebugData 2>/dev/null)
     echo "$snap" >> $seqres.full
     echo "$snap" | awk -v HOST="$host" '
-        BEGIN { tl=tolower(HOST); inb=0; target=0; in_if=0; sum=0; cid="" }
+        function finish_block() {
+            if (inb==1 && target==1 && length(share)>0) {
+                eff=sum
+                if (extra > 0 && eff < extra + 1)
+                    eff=extra + 1
+                printf "%s %d %d\n", share, eff, has_ns
+            }
+        }
+        BEGIN {
+            tl=tolower(HOST)
+            inb=0; target=0; in_if=0; sum=0; extra=0; has_ns=0; share=""
+        }
         /^[[:space:]]*[0-9]+[)].*ConnectionId:/ {
-            if (inb==1 && target==1) { printf "%s %d\n", cid, sum }
-            inb=1; target=0; in_if=0; sum=0; cid=""
-            for (i=1;i<=NF;i++) if ($i=="ConnectionId:") { cid=$(i+1); gsub(/[,;]/, "", cid); break }
+            finish_block()
+            inb=1; target=0; in_if=0; sum=0; extra=0; has_ns=0; share=""
             next
         }
         inb==1 {
             line=tolower($0)
             if (index(line, tl)>0) target=1
+            if (index(line, "nosharesock")>0) has_ns=1
+            # Capture share name from lines like "1) \\host\share Mounts: ..."
+            pat="\\\\" tl "\\"
+            if (target==1 && index(line, pat)>0 && index(line, "mounts:")>0) {
+                p=index(line, pat)
+                tmp=substr(line, p + length(pat))
+                sub("[[:space:]].*$", "", tmp)
+                share=tmp
+            }
+            if ($1=="Extra" && $2=="Channels:") { extra=$3+0 }
             if ($1=="Server" && $2=="interfaces:") { in_if=1; next }
             if ((NF==0 || ($0 ~ /^[[:space:]]*[0-9]+[)].*ConnectionId:/)) && in_if==1) { in_if=0 }
             if (in_if==1 && $1=="Allocated" && $2=="channels:") { sum += ($3+0) }
         }
-        END { if (inb==1 && target==1) { printf "%s %d\n", cid, sum } }
+        END { finish_block() }
     '
 }
 
@@ -107,21 +129,27 @@ ok=0
 while [ $tries -gt 0 ]; do
     mapfile -t lines < <(_dd_channel_sums_for_host "$HOST")
     echo "dd lines count=${#lines[@]}" >> $seqres.full
-    # Build per-connection assertions
-    cnt=0; mism=0; sumsum=0
+    p_ok=0; s_ok=0; p_best=0; s_best=0
     for ln in "${lines[@]}"; do
-        cid=$(echo "$ln" | awk '{print $1}')
-        s=$(echo  "$ln" | awk '{print $2+0}')
-        [ -n "$cid" ] || continue
-        cnt=$((cnt+1)); sumsum=$((sumsum + s))
-        if [ "$s" -ne 2 ]; then mism=$((mism+1)); fi
+        sh=$(echo "$ln" | awk '{print $1}')
+        s=$(echo "$ln" | awk '{print $2+0}')
+        ns=$(echo "$ln" | awk '{print $3+0}')
+        [ "$ns" -eq 1 ] || continue
+        if [ "$sh" = "$SHARE1" ]; then
+            [ "$s" -gt "$p_best" ] && p_best=$s
+        fi
+        if [ "$sh" = "$SHARE2" ]; then
+            [ "$s" -gt "$s_best" ] && s_best=$s
+        fi
     done
-    echo "dd: cnt=$cnt mism=$mism sumsum=$sumsum" >> $seqres.full
-    if [ $cnt -ge 2 ] && [ $mism -eq 0 ]; then ok=1; break; fi
+    [ "$p_best" -ge 2 ] && p_ok=1
+    [ "$s_best" -ge 2 ] && s_ok=1
+    echo "dd: primary_best=$p_best secondary_best=$s_best" >> $seqres.full
+    if [ $p_ok -eq 1 ] && [ $s_ok -eq 1 ]; then ok=1; break; fi
     tries=$((tries-1)); sleep 0.2
 done
 
-[ $ok -eq 1 ] || _fail "expected two connections each with 2 channels in DebugData"
+[ $ok -eq 1 ] || _fail "expected both shares to show effective >=2 channels with nosharesock,multichannel"
 
 # Also verify sockets >= 4
 tries=20

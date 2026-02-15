@@ -18,10 +18,10 @@ _begin_fstest auto quick
 [ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
 [ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
 command -v getent >/dev/null 2>&1 || _notrun "getent not available"
-if command -v ss >/dev/null 2>&1; then
-	DISCONNECT_METHOD=ss
-elif command -v iptables >/dev/null 2>&1; then
+if command -v iptables >/dev/null 2>&1; then
 	DISCONNECT_METHOD=iptables
+elif command -v ss >/dev/null 2>&1; then
+	DISCONNECT_METHOD=ss
 else
 	_notrun "need ss or iptables"
 fi
@@ -63,7 +63,7 @@ DROP_SECS=2
 
 iptables_add_drop() { iptables -I OUTPUT -d "$server_ip" -j DROP 2>/dev/null || return 1; iptables -I INPUT -s "$server_ip" -j DROP 2>/dev/null || true; }
 iptables_remove_drop() { while iptables -D OUTPUT -d "$server_ip" -j DROP 2>/dev/null; do :; done; while iptables -D INPUT -s "$server_ip" -j DROP 2>/dev/null; do :; done; }
-ss_kill_conns() { ss -tn 2>/dev/null | grep -E "[.:]445\b" | grep "$server_ip" >> $seqres.full 2>&1 || true; ss -K dst "$server_ip" dport = :445 2>>$seqres.full || true; ss -K src "$server_ip" sport = :445 2>>$seqres.full || true; }
+ss_kill_conns() { ss -tn 2>/dev/null | grep -E "[.:]445\b" | grep "$server_ip" >> $seqres.full 2>&1 || true; ss -K dst "$server_ip" dport = :445 >>$seqres.full 2>&1 || true; ss -K src "$server_ip" sport = :445 >>$seqres.full 2>&1 || true; }
 if [ "$DISCONNECT_METHOD" = "iptables" ]; then _register_cleanup iptables_remove_drop; fi
 
 size=$(stat -c %s "$REMOTE_FILE") || _fail "stat remote"

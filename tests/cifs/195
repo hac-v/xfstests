@@ -46,12 +46,13 @@ if ! mount -o remount,ro "$TEST_DIR" >>$seqres.full 2>&1; then
 fi
 
 # Ensure write rejection
-if printf 'more' >>"$mangle_file" 2>/tmp/cifs195.err; then
-    cat /tmp/cifs195.err >>$seqres.full 2>/dev/null || true
-    rm -f /tmp/cifs195.err
+errf1=${TMPDIR:-/tmp}/cifs195.err1.$$ 
+if printf 'more' 2>"$errf1" >>"$mangle_file"; then
+    cat "$errf1" >>$seqres.full 2>/dev/null || true
+    rm -f "$errf1"
     _fail "write succeeded after remount ro"
 fi
-rm -f /tmp/cifs195.err
+rm -f "$errf1"
 
 # Phase 2: remount back to original options (assumed rw)
 if ! mount -o remount,"$orig_opts" "$TEST_DIR" >>$seqres.full 2>&1; then
@@ -69,12 +70,13 @@ if ! mount -o remount,ro "$TEST_DIR" >>$seqres.full 2>&1; then
     _notrun "second remount ro unsupported"
 fi
 
-if printf 'nope' >>"$mangle_file" 2>/tmp/cifs195.err; then
-    cat /tmp/cifs195.err >>$seqres.full 2>/dev/null || true
-    rm -f /tmp/cifs195.err
+errf2=${TMPDIR:-/tmp}/cifs195.err2.$$ 
+if printf 'nope' 2>"$errf2" >>"$mangle_file"; then
+    cat "$errf2" >>$seqres.full 2>/dev/null || true
+    rm -f "$errf2"
     _fail "write succeeded after second remount ro"
 fi
-rm -f /tmp/cifs195.err
+rm -f "$errf2"
 
 if ! mount -o remount,"$orig_opts" "$TEST_DIR" >>$seqres.full 2>&1; then
     _fail "remount rw after ro failed"

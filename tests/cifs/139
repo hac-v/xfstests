@@ -41,12 +41,16 @@ M2=$(mktemp -d /tmp/cifs139.ns.XXXXXX) || _fail "mktemp2"
 before=$(count_sockets_for_share "$HOST" "$SHARE")
 
 _do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO_SH'" || _fail "mount shared"
+mid=$(count_sockets_for_share "$HOST" "$SHARE")
+[ -n "$mid" ] || _notrun "DebugData parse error"
+[ "$mid" -gt "$before" ] || _notrun "cannot observe baseline socket count for share"
 _do "mount -t cifs '$TEST_DEV' '$M2' -o '$MO_NS'" || _notrun "nosharesock not supported"
 
 after=$(count_sockets_for_share "$HOST" "$SHARE")
 [ -n "$before" ] && [ -n "$after" ] || _notrun "DebugData parse error"
+[ "$after" -gt 0 ] || _notrun "cannot observe sockets for share in DebugData"
 
-[ "$after" -ge $((before+1)) ] || _fail "nosharesock did not create separate socket (before=$before after=$after)"
+[ "$after" -ge $((mid+1)) ] || _fail "nosharesock did not create separate socket (before=$before mid=$mid after=$after)"
 
 echo "nosharesock creates separate sockets OK"
 

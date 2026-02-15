@@ -44,9 +44,18 @@ cleanup()
 }
 _register_cleanup cleanup
 
-base_opts=${MOUNT_OPTIONS#-o}
+base_opts=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^[[:space:]]*-o[[:space:]]*//' -e 's/^[[:space:]]*//')
 if [ -z "$base_opts" ]; then
     base_opts=$(awk -v mnt="$TEST_DIR" '$2==mnt {print $4}' /proc/mounts)
+fi
+if ! echo "$base_opts" | grep -Eq '(^|,)(credentials=|username=|user=)'; then
+    if [ -n "$CIFS_CRED_FILE" ] && [ -r "$CIFS_CRED_FILE" ]; then
+        base_opts="${base_opts:+$base_opts,}credentials=$CIFS_CRED_FILE"
+    elif [ -r /root/.cifs-cred-xfstest ]; then
+        base_opts="${base_opts:+$base_opts,}credentials=/root/.cifs-cred-xfstest"
+    elif [ -n "$CIFS_USER" ] && [ -n "$CIFS_PASS" ]; then
+        base_opts="${base_opts:+$base_opts,}username=$CIFS_USER,password=$CIFS_PASS"
+    fi
 fi
 
 strip_opts=$(echo "$base_opts" | sed -E 's/(^|,)max_credits=[^,]*//g; s/(^|,)nosharesock//g; s/,,/,/g; s/^,//; s/,$//')
@@ -60,6 +69,9 @@ err=$TMPDIR/cifs187.err
 if ! mount -t cifs "$TEST_DEV" "$MNT" -o "$mount_opts" >$seqres.full 2>"$err"; then
     if grep -qi "Invalid argument" "$err"; then
         _notrun "max_credits option unsupported"
+    fi
+    if grep -Eqi "Permission denied|mount error\(13\)|No username specified|authentication" "$err"; then
+        _notrun "mount auth failed for max_credits validation"
     fi
     cat "$err" >>$seqres.full
     _fail "mount with max_credits=4 failed"

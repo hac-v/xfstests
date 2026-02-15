@@ -43,7 +43,13 @@ h2=$(stat -c %h "$W/b") || _fail "stat b failed"
 [ "$h1" -eq 2 ] || _fail "expected link count 2 on a, got $h1"
 [ "$h2" -eq 2 ] || _fail "expected link count 2 on b, got $h2"
 
-printf "!" >> "$W/b" || _fail "append via b failed"
+append_err=$( { printf "!" >> "$W/b"; } 2>&1 )
+if [ $? -ne 0 ]; then
+    if echo "$append_err" | grep -qiE 'invalid argument|not supported|EOPNOTSUPP|ENOTSUP|operation not supported'; then
+        _notrun "write-through-hardlink not supported on this server/share"
+    fi
+    _fail "append via b failed: $append_err"
+fi
 back=$(cat "$W/a") || _fail "read a after write via b failed"
 [ "$back" = "alpha!" ] || _fail "content mismatch after cross-write: $back"
 

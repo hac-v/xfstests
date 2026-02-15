@@ -50,7 +50,7 @@ echo "cifs171: server caps=0x$cap_hex" >> $seqres.full
 mline=$(awk -v mnt="$TEST_DIR" '$2==mnt {print; exit}' /proc/mounts)
 [ -n "$mline" ] || _notrun "mount entry not found"
 orig_opts=$(echo "$mline" | awk '{print $4}')
-base_opts=${MOUNT_OPTIONS#-o}
+base_opts=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^[[:space:]]*-o[[:space:]]*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
 [ -z "$base_opts" ] && base_opts=$orig_opts
 
 # Ensure closetimeo=30, actimeo=0 present
