@@ -1,42 +1,64 @@
 # CIFS xfstests README
 
-This document gives a quick explanation of what each CIFS test does.
+This document describes the CIFS/SMB client test suite for xfstests.
 
-**Total: 187 tests (cifs/001–289)** covering:
+**Total: 189 tests (cifs/001–289)** covering:
 - POSIX I/O semantics, permissions, ACLs, xattr, locking
 - 45+ mount options, module parameters, remount transitions
 - Reconnect/resilience, lease/oplock handling, credit management
 - All userspace-accessible IOCTLs and FSCTLs
 - SMB3 encryption, compression, multichannel, deferred close
 - Data corruption corner cases and 10+ bug regression tests
-- Performance benchmarks (dir leases, caching, copy_file_range)
+- Performance benchmarks (dir leases, caching, copy_file_range, deferred close)
 - Unicode/i18n, large files, concurrent stress, rsize/wsize sweep
+- NTFS alternate data streams, quota, key dump
+- Kernel module parameter validation (enable_oplocks, disable_legacy_dialects, drop_dir_cache)
 
 ## How to run CIFS tests
 
-- Configure [local.config](../local.config) with CIFS test share details.
+- Configure [local.config](local.config) with CIFS test share details.
 - Run as root:
-  - `sudo ./check -s smb3 cifs/100`
-  - `sudo ./check -s smb3 cifs/{120..200}`
+  ```bash
+  # Single test
+  sudo ./check cifs/100
+
+  # Range of tests
+  sudo ./check cifs/{208..289}
+
+  # All CIFS tests
+  sudo ./check $(ls tests/cifs/ | grep -E '^[0-9]+$' | sort -n | sed 's/^/cifs\//')
+  ```
+
+## Supported backends
+
+| Backend | Status | Notes |
+|---|---|---|
+| **Samba** | ✅ Tested | Local or remote Samba server |
+| **Windows Server** | ✅ Tested | SMB3.1.1, multichannel |
+| **Azure Files** | ✅ Compatible | Premium/Standard SMB shares |
+
+Some tests will skip (`[not run]`) if the backend doesn't support a specific
+feature (e.g., compression, directory leases, VSS snapshots). This is expected
+behavior — the tests are capability-aware.
 
 ## Prerequisites checklist (production/CI)
 
 Use this checklist before trusting CIFS test results for production gating.
 
 ### 1) Server and share setup
-- Samba server reachable from test host.
+- SMB server (Samba, Windows, or Azure Files) reachable from test host.
 - Dedicated test shares exist (test + scratch), for example:
-  - `//<host>/xfstest`
-  - `//<host>/xfstest_scratch`
+  - `//<host>/testshare`
+  - `//<host>/scratchshare`
 - Shares are writable by the test user.
 - Optional feature tests require corresponding server support:
-  - multichannel, compression, signing, encryption.
+  - multichannel, compression, signing, encryption, directory leases.
 
 ### 2) Credentials and auth
 - Credential file exists and is root-readable only (recommended):
   - `/root/.cifs-cred-xfstest`
   - `chmod 600 /root/.cifs-cred-xfstest`
-- [local.config](../local.config) includes `credentials=...` in:
+- [local.config](local.config) includes `credentials=...` in:
   - `CIFS_MOUNT_OPTIONS`
   - `MOUNT_OPTIONS`
   - `TEST_FS_MOUNT_OPTS`
@@ -59,7 +81,7 @@ Use this checklist before trusting CIFS test results for production gating.
 - Do not reuse production shares.
 - Ensure no stale DROP firewall rules before run.
 - Use a clean result directory and review:
-  - [results/check.log](../results/check.log)
+  - `results/check.log`
   - `results/smb3/cifs/*.full`
   - `results/smb3/cifs/*.out.bad`
 
@@ -77,6 +99,12 @@ This CIFS test suite is intended to work with:
 - **Windows Server SMB shares**
 - **Azure Files SMB shares**
 
+### Recommended mount options
+
+```
+-o credentials=/root/.cifs-cred-xfstest,vers=3.1.1,dir_mode=0777,file_mode=0777,serverino,actimeo=1,mfsymlinks,reparse=nfs
+```
+
 ### Important compatibility rule
 
 Pass/fail interpretation must be **capability-based**:
@@ -86,7 +114,7 @@ Pass/fail interpretation must be **capability-based**:
 
 ### Backend-specific configuration guidance
 
-- Keep backend-specific values in [local.config](../local.config):
+- Keep backend-specific values in [local.config](local.config):
   - `TEST_DEV`, `SCRATCH_DEV`
   - auth/mount opts via `CIFS_MOUNT_OPTIONS`, `MOUNT_OPTIONS`, `TEST_FS_MOUNT_OPTS`
 - Use non-interactive auth (`credentials=...`) for all backends.
@@ -210,9 +238,10 @@ Pass/fail interpretation must be **capability-based**:
 
 ## Where to debug failures
 
-- Result summary: [results/check.log](../results/check.log)
+- Result summary: `results/check.log`
 - Per-test full logs: `results/smb3/cifs/<test>.full`
 - Output diffs: `results/smb3/cifs/<test>.out.bad`
+- Test results report: [cifs-results.md](cifs-results.md)
 
 ### cifs/206-207 (xattr, persistent handles)
 - **206**: Extended attributes round-trip and cross-mount visibility.
