@@ -1,0 +1,116 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: POSIX ACLs via cifsacl mount option
+#
+# Behavior under test
+# - Mount with cifsacl to enable CIFS-mapped POSIX ACL support.
+# - setfacl/getfacl round-trip: set a user ACL, verify getfacl returns it.
+# - Default ACLs on directory propagate to newly created files.
+# - Removing ACLs restores base permissions.
+# - Skip if cifsacl mount or setfacl/getfacl are unavailable.
+#
+# Output
+# - Single success line; diagnostics go to $seqres.full.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+
+command -v setfacl >/dev/null 2>&1 || _notrun "requires setfacl"
+command -v getfacl >/dev/null 2>&1 || _notrun "requires getfacl"
+
+M1=""
+_cleanup_220() {
+    [ -n "$M1" ] && _do "umount -l '$M1'" >/dev/null 2>&1 || true
+    [ -n "$M1" ] && rmdir "$M1" >/dev/null 2>&1 || true
+}
+_register_cleanup _cleanup_220
+
+_test_unmount >/dev/null 2>&1
+
+_strip_acl_opts() {
+    echo "$1" | awk -F, '{
+        out=""
+        for(i=1;i<=NF;i++){
+            if($i ~ /^(cifsacl|nocifsacl)$/) continue
+            out = out (out ? "," : "") $i
+        }
+        print out
+    }'
+}
+
+BASE=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+STRIPPED=$(_strip_acl_opts "$BASE")
+MO="$STRIPPED"
+[ -n "$MO" ] && MO="$MO,cifsacl" || MO="cifsacl"
+
+M1=$(mktemp -d /tmp/cifs220.XXXXXX) || _fail "mktemp failed"
+if ! _do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO'" 2>>"$seqres.full"; then
+    rmdir "$M1" 2>/dev/null
+    M1=""
+    _notrun "cifsacl mount not supported by server/client"
+fi
+
+SUB="cifs220.$$.d"
+mkdir -p "$M1/$SUB" || _fail "mkdir workspace failed"
+
+# --- Test 1: setfacl / getfacl round-trip on a file ---
+F="$M1/$SUB/aclfile"
+echo "acl_test" > "$F" || _fail "create file failed"
+
+# Try to set a user ACL entry
+if ! setfacl -m u:1000:rw "$F" 2>>"$seqres.full"; then
+    _notrun "setfacl not supported on this CIFS mount"
+fi
+
+# Verify getfacl returns the ACL
+acl_out=$(getfacl -n "$F" 2>>"$seqres.full")
+echo "cifs220: getfacl output:" >> "$seqres.full"
+echo "$acl_out" >> "$seqres.full"
+
+echo "$acl_out" | grep -q "user:1000:rw" || \
+    _fail "getfacl missing user:1000:rw entry"
+
+echo "cifs220: setfacl/getfacl round-trip OK" >> "$seqres.full"
+
+# --- Test 2: default ACL on directory ---
+D="$M1/$SUB/acldir"
+mkdir "$D" || _fail "mkdir acldir failed"
+
+if setfacl -d -m u:1000:rwx "$D" 2>>"$seqres.full"; then
+    # Create a file inside; it should inherit the default ACL
+    echo "inherited" > "$D/child" || _fail "create child failed"
+    child_acl=$(getfacl -n "$D/child" 2>>"$seqres.full")
+    echo "cifs220: child ACL:" >> "$seqres.full"
+    echo "$child_acl" >> "$seqres.full"
+
+    # Check that user:1000 appears in the child's ACL
+    if echo "$child_acl" | grep -q "user:1000"; then
+        echo "cifs220: default ACL inheritance OK" >> "$seqres.full"
+    else
+        echo "cifs220: [warn] default ACL not inherited (server-dependent)" >> "$seqres.full"
+    fi
+else
+    echo "cifs220: [skip] default ACL not supported" >> "$seqres.full"
+fi
+
+# --- Test 3: remove ACL restores base permissions ---
+setfacl -b "$F" 2>>"$seqres.full"
+acl_after=$(getfacl -n "$F" 2>>"$seqres.full")
+echo "cifs220: after ACL removal:" >> "$seqres.full"
+echo "$acl_after" >> "$seqres.full"
+
+# After removal, there should be no named user entries
+if echo "$acl_after" | grep -q "user:1000"; then
+    _fail "ACL entry persisted after removal"
+fi
+
+echo "posix ACL via cifsacl OK"
+
+status=0
+exit

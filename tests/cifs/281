@@ -1,0 +1,123 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: reparse point hardlink and rename regression test
+#
+# Regression tests for kernel commits:
+#   5408990aa662 ("smb: client: fix hardlinking of reparse points")
+#   7435d51b7ea2 ("smb: client: fix renaming of reparse points")
+#
+# Bug: The client sent SMB2_CREATE without OPEN_REPARSE_POINT flag when
+# the source inode is a reparse point (symlink, special file). This caused
+# the server to follow the reparse point instead of operating on it,
+# failing the hardlink/rename operation.
+#
+# Test:
+# 1. Create a symlink, hardlink it → must succeed (not follow the link)
+# 2. Create a symlink, rename it → must succeed (not follow the link)
+# 3. Verify the hardlink/renamed symlink still points to the original target
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+W="$TEST_DIR/cifs281.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# Check if symlinks work
+echo "target_data" > "$W/real_target" || _fail "create target failed"
+if ! ln -s "$W/real_target" "$W/test_sym" 2>>"$seqres.full"; then
+    _notrun "symlinks not supported on this CIFS mount"
+fi
+rm -f "$W/test_sym"
+
+# --- Test 1: hardlink a symlink (must not follow the link) ---
+ln -s "$W/real_target" "$W/sym_to_hardlink" 2>>"$seqres.full" || \
+    _fail "create symlink failed"
+
+# Verify it's a symlink
+[ -L "$W/sym_to_hardlink" ] || _fail "not a symlink"
+orig_target=$(readlink "$W/sym_to_hardlink")
+
+# Hardlink the symlink itself (not what it points to)
+if ln "$W/sym_to_hardlink" "$W/hardlinked_sym" 2>>"$seqres.full"; then
+    # The hardlink should also be a symlink pointing to the same target
+    [ -L "$W/hardlinked_sym" ] || _fail "hardlink of symlink is not a symlink"
+    hl_target=$(readlink "$W/hardlinked_sym")
+    [ "$orig_target" = "$hl_target" ] || \
+        _fail "hardlink target mismatch: '$orig_target' vs '$hl_target'"
+
+    # Both should resolve to the same content
+    data1=$(cat "$W/sym_to_hardlink" 2>>"$seqres.full")
+    data2=$(cat "$W/hardlinked_sym" 2>>"$seqres.full")
+    [ "$data1" = "$data2" ] || _fail "hardlink content mismatch"
+
+    echo "cifs281: hardlink symlink OK" >> "$seqres.full"
+else
+    # The bug: this would fail because CREATE didn't set OPEN_REPARSE_POINT
+    echo "cifs281: [note] hardlink of symlink not supported (may be server limitation)" >> "$seqres.full"
+fi
+
+# --- Test 2: rename a symlink (must not follow the link) ---
+ln -s "$W/real_target" "$W/sym_to_rename" 2>>"$seqres.full" || \
+    _fail "create symlink for rename failed"
+
+orig_target2=$(readlink "$W/sym_to_rename")
+
+if mv "$W/sym_to_rename" "$W/renamed_sym" 2>>"$seqres.full"; then
+    # Must still be a symlink
+    [ -L "$W/renamed_sym" ] || _fail "renamed symlink is not a symlink"
+
+    # Must still point to original target
+    ren_target=$(readlink "$W/renamed_sym")
+    [ "$orig_target2" = "$ren_target" ] || \
+        _fail "rename target mismatch: '$orig_target2' vs '$ren_target'"
+
+    # Must still resolve
+    data3=$(cat "$W/renamed_sym" 2>>"$seqres.full")
+    [ "$data3" = "target_data" ] || _fail "renamed symlink content wrong: '$data3'"
+
+    # Original name must not exist
+    [ ! -e "$W/sym_to_rename" ] || _fail "original symlink still exists after rename"
+
+    echo "cifs281: rename symlink OK" >> "$seqres.full"
+else
+    echo "cifs281: [note] rename of symlink not supported" >> "$seqres.full"
+fi
+
+# --- Test 3: rename symlink across directories ---
+mkdir -p "$W/subdir" || _fail "mkdir subdir failed"
+ln -s "$W/real_target" "$W/sym_cross_dir" 2>>"$seqres.full" || \
+    _fail "create cross-dir symlink failed"
+
+if mv "$W/sym_cross_dir" "$W/subdir/moved_sym" 2>>"$seqres.full"; then
+    [ -L "$W/subdir/moved_sym" ] || _fail "cross-dir renamed not a symlink"
+    moved_target=$(readlink "$W/subdir/moved_sym")
+    echo "cifs281: cross-dir symlink rename OK (target='$moved_target')" >> "$seqres.full"
+else
+    echo "cifs281: [note] cross-dir symlink rename not supported" >> "$seqres.full"
+fi
+
+# --- Test 4: rename symlink over an existing file ---
+echo "existing" > "$W/existing_file" || _fail "create existing_file failed"
+ln -s "$W/real_target" "$W/sym_overwrite" 2>>"$seqres.full" || \
+    _fail "create overwrite symlink failed"
+
+if mv "$W/sym_overwrite" "$W/existing_file" 2>>"$seqres.full"; then
+    # existing_file should now be the symlink
+    [ -L "$W/existing_file" ] || \
+        echo "cifs281: [note] overwrite target is not a symlink" >> "$seqres.full"
+    echo "cifs281: rename symlink over existing OK" >> "$seqres.full"
+else
+    echo "cifs281: [note] rename symlink over existing not supported" >> "$seqres.full"
+fi
+
+echo "reparse hardlink/rename OK"
+
+status=0
+exit

@@ -1,0 +1,93 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: inotify / fsnotify event delivery on CIFS mounts
+#
+# Behavior under test
+# - inotify_add_watch on a CIFS directory detects local file operations.
+# - IN_CREATE fires when a file is created.
+# - IN_DELETE fires when a file is removed.
+# - IN_MODIFY fires when a file is written.
+# - IN_MOVED_FROM / IN_MOVED_TO fires on rename.
+# - Events are for local operations only (remote changes may not trigger).
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v inotifywait >/dev/null 2>&1 || _notrun "requires inotifywait (inotify-tools)"
+
+W="$TEST_DIR/cifs238.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+EVENTS_LOG="$tmp.inotify_events"
+
+# Start inotifywait in background monitoring the directory
+inotifywait -m -e create,delete,modify,moved_from,moved_to \
+    --format '%e %f' "$W" > "$EVENTS_LOG" 2>>"$seqres.full" &
+INOTIFY_PID=$!
+sleep 0.5
+
+# Verify inotifywait is running
+kill -0 $INOTIFY_PID 2>/dev/null || _notrun "inotifywait failed to start on CIFS mount"
+
+# --- Generate events ---
+
+# CREATE
+echo "hello" > "$W/newfile" || _fail "create failed"
+sleep 0.3
+
+# MODIFY
+echo "world" >> "$W/newfile" || _fail "modify failed"
+sleep 0.3
+
+# MOVED_FROM + MOVED_TO (rename)
+mv "$W/newfile" "$W/renamed" || _fail "rename failed"
+sleep 0.3
+
+# DELETE
+rm "$W/renamed" || _fail "delete failed"
+sleep 0.3
+
+# Stop inotifywait
+kill $INOTIFY_PID 2>/dev/null
+wait $INOTIFY_PID 2>/dev/null || true
+
+echo "cifs238: captured events:" >> "$seqres.full"
+cat "$EVENTS_LOG" >> "$seqres.full"
+
+# --- Verify events ---
+create_seen=false
+modify_seen=false
+moved_from_seen=false
+moved_to_seen=false
+delete_seen=false
+
+while IFS= read -r line; do
+    case "$line" in
+        *CREATE*newfile*) create_seen=true ;;
+        *MODIFY*newfile*) modify_seen=true ;;
+        *MOVED_FROM*newfile*) moved_from_seen=true ;;
+        *MOVED_TO*renamed*) moved_to_seen=true ;;
+        *DELETE*renamed*) delete_seen=true ;;
+    esac
+done < "$EVENTS_LOG"
+
+$create_seen || _fail "IN_CREATE not seen"
+# MODIFY may or may not fire depending on cache mode; log but don't hard-fail
+if ! $modify_seen; then
+    echo "cifs238: [note] IN_MODIFY not seen (may depend on cache mode)" >> "$seqres.full"
+fi
+$moved_from_seen || _fail "IN_MOVED_FROM not seen"
+$moved_to_seen || _fail "IN_MOVED_TO not seen"
+$delete_seen || _fail "IN_DELETE not seen"
+
+echo "inotify events OK"
+
+status=0
+exit

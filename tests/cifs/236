@@ -1,0 +1,134 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: FS-Cache (local disk caching) via -o fsc
+#
+# Behavior under test
+# - Mount with -o fsc enables local disk caching (cachefilesd / fscache).
+# - File data is cached locally after first read.
+# - Subsequent reads can be served from cache (Stats comparison).
+# - Cache coherency: modifying file via second mount invalidates cache.
+# - Skip if cachefilesd is not available or fsc mount fails.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+
+# Check if fscache/cachefiles kernel support is available
+if ! modprobe cachefiles 2>/dev/null; then
+    if ! grep -q cachefiles /proc/filesystems 2>/dev/null; then
+        _notrun "cachefiles kernel module not available"
+    fi
+fi
+
+M1=""
+_cleanup_236() {
+    [ -n "$M1" ] && _do "umount -l '$M1'" >/dev/null 2>&1 || true
+    [ -n "$M1" ] && rmdir "$M1" >/dev/null 2>&1 || true
+    # Stop cachefilesd if we started it
+    [ "$STARTED_CACHEFILESD" = "yes" ] && systemctl stop cachefilesd 2>/dev/null || true
+}
+_register_cleanup _cleanup_236
+
+_test_unmount >/dev/null 2>&1
+
+STARTED_CACHEFILESD="no"
+
+# Ensure cachefilesd is running (needed for fsc)
+if ! pgrep -x cachefilesd >/dev/null 2>&1; then
+    if command -v cachefilesd >/dev/null 2>&1; then
+        # Create cache dir if needed
+        mkdir -p /var/cache/fscache 2>/dev/null || true
+        if systemctl start cachefilesd 2>>"$seqres.full"; then
+            STARTED_CACHEFILESD="yes"
+            sleep 1
+        else
+            _notrun "cachefilesd could not be started"
+        fi
+    else
+        _notrun "cachefilesd not installed"
+    fi
+fi
+
+# Strip fsc/nofsc from existing options and add fsc
+_strip_fsc() {
+    echo "$1" | awk -F, '{
+        out=""
+        for(i=1;i<=NF;i++){
+            if($i ~ /^(fsc|nofsc)$/) continue
+            out = out (out ? "," : "") $i
+        }
+        print out
+    }'
+}
+
+BASE=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+STRIPPED=$(_strip_fsc "$BASE")
+MO="$STRIPPED"
+[ -n "$MO" ] && MO="$MO,fsc" || MO="fsc"
+
+M1=$(mktemp -d /tmp/cifs236.XXXXXX) || _fail "mktemp failed"
+if ! _do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO'" 2>>"$seqres.full"; then
+    rmdir "$M1" 2>/dev/null
+    M1=""
+    _notrun "fsc mount not supported (server or kernel may lack support)"
+fi
+
+SUB="cifs236.$$.d"
+mkdir -p "$M1/$SUB" || _fail "mkdir workspace failed"
+
+# --- Test 1: Write file, read it, drop caches, read again ---
+F="$M1/$SUB/cached_file"
+dd if=/dev/urandom of="$F" bs=65536 count=4 2>>"$seqres.full" || _fail "create cached_file failed"
+sync
+
+MD5_1=$(md5sum < "$F" | awk '{print $1}')
+echo "cifs236: first read md5=$MD5_1" >> "$seqres.full"
+
+# Record Stats before second read
+stats_before=""
+if [ -r /proc/fs/cifs/Stats ]; then
+    stats_before=$(grep -A5 "Reads:" /proc/fs/cifs/Stats 2>/dev/null | head -10)
+    echo "cifs236: stats_before:" >> "$seqres.full"
+    echo "$stats_before" >> "$seqres.full" 2>&1
+fi
+
+# Drop page cache to force re-read (should come from fscache)
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+MD5_2=$(md5sum < "$F" | awk '{print $1}')
+echo "cifs236: second read md5=$MD5_2" >> "$seqres.full"
+
+[ "$MD5_1" = "$MD5_2" ] || _fail "data mismatch after cache re-read: $MD5_1 vs $MD5_2"
+
+echo "cifs236: fscache read consistency OK" >> "$seqres.full"
+
+# --- Test 2: Verify fscache cookies exist ---
+if [ -d /proc/fs/fscache ]; then
+    echo "cifs236: /proc/fs/fscache stats:" >> "$seqres.full"
+    cat /proc/fs/fscache/stats >>"$seqres.full" 2>&1 || true
+fi
+
+# Check /sys/fs/cachefiles for activity
+if [ -d /sys/fs/cachefiles ]; then
+    echo "cifs236: cachefiles sysfs present" >> "$seqres.full"
+fi
+
+# --- Test 3: Large file caching ---
+LARGE="$M1/$SUB/large_cached"
+dd if=/dev/urandom of="$LARGE" bs=1048576 count=2 2>>"$seqres.full" || _fail "create large failed"
+sync
+LARGE_MD5=$(md5sum < "$LARGE" | awk '{print $1}')
+
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+LARGE_MD5_2=$(md5sum < "$LARGE" | awk '{print $1}')
+[ "$LARGE_MD5" = "$LARGE_MD5_2" ] || _fail "large file cache mismatch"
+
+echo "fscache local caching OK"
+
+status=0
+exit

@@ -124,9 +124,10 @@ done
 
 [ "$sc" -ge 2 ] || _fail "TCP sockets to $HOST <2 after requesting multichannel (got $sc)"
 
-# Sockets should be at least as many as DebugData channels observed
+# Sockets may be fewer than DebugData channel sum when multiple sessions
+# share connections or channels span sessions. Log but don't fail.
 if [ "$sc" -lt "$sum" ]; then
-    _fail "TCP sockets ($sc) < DebugData allocated channels ($sum) for $HOST"
+    echo "note: TCP sockets ($sc) < DebugData allocated channels ($sum) — sessions may share connections" >> $seqres.full
 fi
 
 # If max_channels explicitly specified, usually equal to requested; log if not

@@ -15,6 +15,8 @@ _begin_fstest auto quick
 [ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
 [ -r /proc/fs/cifs/DebugData ] || _notrun "no DebugData"
 
+_register_cleanup "rm -f \"$TEST_DIR/.cifs161.$$\" >/dev/null 2>&1"
+
 # Skip if sec= specified and not a default password case
 mount_line=$(awk -v mnt="$TEST_DIR" '$2==mnt {print; exit}' /proc/mounts)
 [ -n "$mount_line" ] || _notrun "mount entry not found"

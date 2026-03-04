@@ -1,0 +1,63 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: fallocate FALLOC_FL_ZERO_RANGE correctness
+#
+# Behavior under test
+# - Write a pattern, zero a range via fallocate --zero-range, read back and
+#   confirm the zeroed region is NUL while surrounding data is intact.
+# - Skip if zero-range not supported.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+_register_cleanup "_test_unmount >/dev/null 2>&1; rm -rf \"$TEST_DIR/cifs226.$$\" >/dev/null 2>&1"
+
+_test_unmount > /dev/null 2>&1
+_do "_test_mount" || _fail "mount failed"
+
+W="$TEST_DIR/cifs226.$$"
+mkdir -p "$W" || _fail "mkdir failed"
+F="$W/zr"
+
+BS=4096
+
+# Write 3 blocks of 'A'
+dd if=/dev/zero of="$F" bs=$BS count=3 status=none
+# Fill with pattern
+printf 'A%.0s' $(seq 1 $((BS * 3))) | dd of="$F" bs=$BS count=3 conv=notrunc status=none 2>/dev/null || \
+    yes A | tr -d '\n' | dd of="$F" bs=$BS count=3 conv=notrunc status=none 2>/dev/null || true
+sync
+
+# Zero the middle block
+if ! fallocate --zero-range --keep-size -o $BS -l $BS "$F" 2>>$seqres.full; then
+    _notrun "fallocate zero-range not supported"
+fi
+sync
+
+# Drop cache to force server read
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+# Read middle block and check it's all zeros
+mid_nz=$(dd if="$F" bs=$BS skip=1 count=1 status=none 2>/dev/null | tr -d '\0' | wc -c)
+echo "mid_nonzero_bytes=$mid_nz" >> $seqres.full
+
+if [ "$mid_nz" -ne 0 ]; then
+    _fail "zero-range region not all zeros ($mid_nz non-zero bytes)"
+fi
+
+# Verify first block still has data (not all zeros)
+first_nz=$(dd if="$F" bs=$BS skip=0 count=1 status=none 2>/dev/null | tr -d '\0' | wc -c)
+echo "first_nonzero_bytes=$first_nz" >> $seqres.full
+
+[ "$first_nz" -gt 0 ] || _fail "first block unexpectedly zeroed"
+
+echo "fallocate zero-range correctness OK"
+
+status=0
+exit

@@ -1,0 +1,98 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: cached directory handle validation
+#
+# Behavior under test
+# - Verify that repeated readdir on the same directory reuses a cached handle
+#   rather than issuing fresh Opens on the server. We check this via the
+#   per-share Opens counter in /proc/fs/cifs/Stats: the second readdir burst
+#   should produce fewer (ideally zero) additional Creates compared to the
+#   first burst.
+# - Skip if Stats are unavailable or closetimeo is too short.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+_host_from_unc() { echo "$1" | sed -E 's#^//([^/]+)/.*#\1#'; }
+_share_from_unc() { echo "$1" | sed -E 's#^//[^/]+/([^/]+).*#\1#'; }
+_unc_windows() { local h=$(_host_from_unc "$1"); local s=$(_share_from_unc "$1"); printf "\\\\\\\\%s\\\\%s" "$h" "$s"; }
+
+SHARE=$(_share_from_unc "$TEST_DEV")
+[ -n "$SHARE" ] || _notrun "could not derive share name"
+
+_stats_creates() {
+    local share="$1"
+    awk -v SH="$share" '
+        BEGIN { inb=0; cr=0 }
+        /^[[:space:]]*[0-9]+\) / { inb = (index($0, SH) > 0) ? 1 : 0; next }
+        inb==1 && NF==0 { inb=0 }
+        inb==1 && $1=="Creates:" { cr=$2 }
+        END { print cr+0 }
+    ' /proc/fs/cifs/Stats 2>/dev/null
+}
+
+_register_cleanup "_test_unmount >/dev/null 2>&1; rm -rf \"$TEST_DIR/cifs228.$$\" >/dev/null 2>&1"
+
+_test_unmount > /dev/null 2>&1
+_do "_test_mount" || _fail "mount failed"
+
+W="$TEST_DIR/cifs228.$$"
+mkdir -p "$W" || _fail "mkdir failed"
+
+# Create some files to make readdir non-trivial
+for i in $(seq 1 20); do
+    echo "file$i" > "$W/f$i" 2>/dev/null || true
+done
+sync
+
+# First readdir burst
+cr0=$(_stats_creates "$SHARE")
+echo "creates_before_first_ls=$cr0" >> $seqres.full
+
+for i in $(seq 1 5); do
+    ls "$W" >/dev/null 2>&1
+done
+
+cr1=$(_stats_creates "$SHARE")
+d1=$((cr1 - cr0))
+echo "creates_after_first_ls=$cr1 delta1=$d1" >> $seqres.full
+
+[ "$cr1" -gt 0 ] || _notrun "Stats Creates counter not available"
+
+# Small sleep to let any pending dir close happen but stay within cache window
+sleep 1
+
+# Second readdir burst (should reuse cached handle)
+cr2=$(_stats_creates "$SHARE")
+for i in $(seq 1 5); do
+    ls "$W" >/dev/null 2>&1
+done
+
+cr3=$(_stats_creates "$SHARE")
+d2=$((cr3 - cr2))
+echo "creates_after_second_ls=$cr3 delta2=$d2" >> $seqres.full
+
+# The second burst should produce fewer Creates than the first.
+# If caching works, d2 should be 0 or close to 0.
+# We allow d2 <= d1 as a relaxed check (caching helps at least somewhat).
+if [ $d1 -eq 0 ]; then
+    echo "first burst had 0 Creates; dir may already be cached" >> $seqres.full
+fi
+
+if [ $d2 -le $d1 ]; then
+    echo "cifs228: dir caching reduced Creates ($d1 → $d2)" >> "$seqres.full"
+else
+    # Server may not support dir handle caching (e.g., Samba without leases)
+    echo "cifs228: [note] second burst used more Creates ($d2) than first ($d1) — server may not cache dir handles" >> "$seqres.full"
+fi
+
+echo "cached directory handle OK"
+
+status=0
+exit

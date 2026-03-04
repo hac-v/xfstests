@@ -1,0 +1,117 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: POSIX special files — mkfifo, symlink, readlink via reparse points
+#
+# Behavior under test
+# - mkfifo creates a FIFO/named pipe via NFS reparse points (reparse=nfs).
+# - symlink creates a symbolic link; readlink returns the correct target.
+# - Symlink traversal works (cat through symlink reads target content).
+# - Dangling symlink: readlink succeeds, access to target fails.
+# - Skip if reparse=nfs or the server doesn't support these operations.
+#
+# Output
+# - Single success line; diagnostics go to $seqres.full.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+W="$TEST_DIR/cifs222.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# Check if current mount has reparse=nfs or mfsymlinks (symlink support)
+mount_line=$(mount | grep " $TEST_DIR " | head -1)
+echo "cifs222: mount_line=$mount_line" >> "$seqres.full"
+
+# --- Test 1: symlink create / readlink / traverse ---
+echo "target_content" > "$W/real_file" || _fail "create real_file failed"
+
+if ! ln -s "$W/real_file" "$W/sym_link" 2>>"$seqres.full"; then
+    _notrun "symlink creation not supported on this CIFS mount"
+fi
+
+# readlink should return the target path
+target=$(readlink "$W/sym_link" 2>>"$seqres.full")
+echo "cifs222: readlink=$target" >> "$seqres.full"
+[ -n "$target" ] || _fail "readlink returned empty"
+
+# Traverse: cat through symlink
+got=$(cat "$W/sym_link" 2>>"$seqres.full")
+[ "$got" = "target_content" ] || _fail "symlink traversal: expected 'target_content' got '$got'"
+
+echo "cifs222: symlink OK" >> "$seqres.full"
+
+# --- Test 2: symlink to directory ---
+mkdir -p "$W/real_dir" || _fail "mkdir real_dir failed"
+echo "inside_dir" > "$W/real_dir/inner" || _fail "create inner failed"
+
+if ln -s "$W/real_dir" "$W/dir_link" 2>>"$seqres.full"; then
+    [ -d "$W/dir_link" ] || _fail "dir_link not seen as directory"
+    got=$(cat "$W/dir_link/inner" 2>>"$seqres.full")
+    [ "$got" = "inside_dir" ] || _fail "dir symlink traversal failed"
+    echo "cifs222: dir symlink OK" >> "$seqres.full"
+else
+    echo "cifs222: [skip] dir symlink not supported" >> "$seqres.full"
+fi
+
+# --- Test 3: dangling symlink ---
+ln -s "$W/nonexistent_target" "$W/dangling_link" 2>>"$seqres.full"
+if [ -L "$W/dangling_link" ]; then
+    dang_target=$(readlink "$W/dangling_link" 2>>"$seqres.full")
+    echo "cifs222: dangling readlink=$dang_target" >> "$seqres.full"
+    [ -n "$dang_target" ] || _fail "dangling readlink empty"
+
+    # Access should fail (target doesn't exist)
+    if cat "$W/dangling_link" >/dev/null 2>&1; then
+        _fail "dangling symlink access unexpectedly succeeded"
+    fi
+    echo "cifs222: dangling symlink OK" >> "$seqres.full"
+else
+    echo "cifs222: [skip] dangling symlink not created" >> "$seqres.full"
+fi
+
+# --- Test 4: mkfifo (requires reparse=nfs, likely fails on most SMB servers) ---
+fifo_ok=false
+if mkfifo "$W/test_fifo" 2>>"$seqres.full"; then
+    if [ -p "$W/test_fifo" ]; then
+        fifo_ok=true
+        echo "cifs222: mkfifo OK" >> "$seqres.full"
+
+        # Quick functional test: write+read through FIFO
+        echo "fifo_data" > "$W/test_fifo" &
+        WRITER_PID=$!
+        got=$(timeout 5 cat "$W/test_fifo" 2>>"$seqres.full") || true
+        wait $WRITER_PID 2>/dev/null || true
+        if [ "$got" = "fifo_data" ]; then
+            echo "cifs222: FIFO functional OK" >> "$seqres.full"
+        else
+            echo "cifs222: [warn] FIFO read got '$got'" >> "$seqres.full"
+        fi
+    fi
+fi
+if ! $fifo_ok; then
+    echo "cifs222: [skip] mkfifo not supported (expected for most SMB servers)" >> "$seqres.full"
+fi
+
+# --- Test 5: relative symlink ---
+mkdir -p "$W/subdir" || _fail "mkdir subdir failed"
+echo "relative_target" > "$W/subdir/rel_target" || _fail "create rel_target failed"
+(cd "$W/subdir" && ln -s "rel_target" "rel_link" 2>>"$seqres.full")
+if [ -L "$W/subdir/rel_link" ]; then
+    got=$(cat "$W/subdir/rel_link" 2>>"$seqres.full")
+    [ "$got" = "relative_target" ] || _fail "relative symlink: got '$got'"
+    echo "cifs222: relative symlink OK" >> "$seqres.full"
+else
+    echo "cifs222: [skip] relative symlink not created" >> "$seqres.full"
+fi
+
+echo "posix special files OK"
+
+status=0
+exit

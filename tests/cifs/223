@@ -1,0 +1,152 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: umask interaction with POSIX mount extensions
+#
+# Behavior under test
+# - With POSIX extensions (unix or modefromsid), umask should influence the
+#   effective mode of newly created files and directories.
+# - umask 022: file created with mode 0666 → effective 0644; dir with 0777 → 0755.
+# - umask 077: file → 0600; dir → 0700.
+# - Without POSIX extensions, file_mode/dir_mode mount options dominate
+#   and umask has no effect (this is verified as a control).
+#
+# Output
+# - Single success line; diagnostics go to $seqres.full.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+
+M1=""
+_cleanup_223() {
+    [ -n "$M1" ] && _do "umount -l '$M1'" >/dev/null 2>&1 || true
+    [ -n "$M1" ] && rmdir "$M1" >/dev/null 2>&1 || true
+}
+_register_cleanup _cleanup_223
+
+_test_unmount >/dev/null 2>&1
+
+_strip_mode_opts() {
+    echo "$1" | awk -F, '{
+        out=""
+        for(i=1;i<=NF;i++){
+            if($i ~ /^(modefromsid|file_mode=|dir_mode=|noperm|perm|cifsacl|nounix|unix)/) continue
+            out = out (out ? "," : "") $i
+        }
+        print out
+    }'
+}
+
+BASE=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+STRIPPED=$(_strip_mode_opts "$BASE")
+
+# Try to mount with POSIX extensions for real umask testing
+POSIX_MODE=""
+for try_opt in "unix" "modefromsid"; do
+    MO="$STRIPPED"
+    [ -n "$MO" ] && MO="$MO,$try_opt" || MO="$try_opt"
+
+    M1=$(mktemp -d /tmp/cifs223.XXXXXX) || _fail "mktemp failed"
+    if _do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO'" 2>>"$seqres.full"; then
+        POSIX_MODE="$try_opt"
+        echo "cifs223: mounted with $try_opt" >> "$seqres.full"
+        break
+    fi
+    rmdir "$M1" 2>/dev/null
+    M1=""
+done
+
+[ -n "$POSIX_MODE" ] || _notrun "server does not support unix or modefromsid (needed for umask testing)"
+
+SUB="cifs223.$$.d"
+mkdir -p "$M1/$SUB" || _fail "mkdir workspace failed"
+
+# --- Test 1: umask 022 ---
+(
+    umask 022
+    echo "umask022" > "$M1/$SUB/file_022" || exit 1
+    mkdir "$M1/$SUB/dir_022" || exit 1
+) || _fail "umask 022 file/dir creation failed"
+
+fm=$(stat -c %a "$M1/$SUB/file_022")
+dm=$(stat -c %a "$M1/$SUB/dir_022")
+echo "cifs223: umask 022: file=$fm dir=$dm" >> "$seqres.full"
+
+# With modefromsid/unix, expect umask to apply:
+# file: 0666 & ~022 = 0644; dir: 0777 & ~022 = 0755
+# Some servers may vary; accept common results
+case "$fm" in
+    644|664) echo "cifs223: umask 022 file mode=$fm OK" >> "$seqres.full" ;;
+    *)
+        echo "cifs223: [warn] umask 022 file mode=$fm (expected 644)" >> "$seqres.full"
+        ;;
+esac
+
+case "$dm" in
+    755|775) echo "cifs223: umask 022 dir mode=$dm OK" >> "$seqres.full" ;;
+    *)
+        echo "cifs223: [warn] umask 022 dir mode=$dm (expected 755)" >> "$seqres.full"
+        ;;
+esac
+
+# --- Test 2: umask 077 ---
+(
+    umask 077
+    echo "umask077" > "$M1/$SUB/file_077" || exit 1
+    mkdir "$M1/$SUB/dir_077" || exit 1
+) || _fail "umask 077 file/dir creation failed"
+
+fm2=$(stat -c %a "$M1/$SUB/file_077")
+dm2=$(stat -c %a "$M1/$SUB/dir_077")
+echo "cifs223: umask 077: file=$fm2 dir=$dm2" >> "$seqres.full"
+
+case "$fm2" in
+    600) echo "cifs223: umask 077 file mode=$fm2 OK" >> "$seqres.full" ;;
+    *)
+        echo "cifs223: [warn] umask 077 file mode=$fm2 (expected 600)" >> "$seqres.full"
+        ;;
+esac
+
+case "$dm2" in
+    700) echo "cifs223: umask 077 dir mode=$dm2 OK" >> "$seqres.full" ;;
+    *)
+        echo "cifs223: [warn] umask 077 dir mode=$dm2 (expected 700)" >> "$seqres.full"
+        ;;
+esac
+
+# --- Test 3: umask 000 (most permissive) ---
+(
+    umask 000
+    echo "umask000" > "$M1/$SUB/file_000" || exit 1
+    mkdir "$M1/$SUB/dir_000" || exit 1
+) || _fail "umask 000 file/dir creation failed"
+
+fm3=$(stat -c %a "$M1/$SUB/file_000")
+dm3=$(stat -c %a "$M1/$SUB/dir_000")
+echo "cifs223: umask 000: file=$fm3 dir=$dm3" >> "$seqres.full"
+
+case "$fm3" in
+    666|664|644) echo "cifs223: umask 000 file mode=$fm3 OK" >> "$seqres.full" ;;
+    *)
+        echo "cifs223: [warn] umask 000 file mode=$fm3 (expected 666)" >> "$seqres.full"
+        ;;
+esac
+
+# --- Test 4: verify different umask values produce different modes ---
+# Key invariant: umask 077 should produce more restrictive modes than umask 022
+fm_val=$((8#$fm))
+fm2_val=$((8#$fm2))
+if [ "$fm2_val" -gt "$fm_val" ]; then
+    _fail "umask 077 produced more permissive mode ($fm2) than umask 022 ($fm)"
+fi
+echo "cifs223: umask ordering OK (022→$fm >= 077→$fm2)" >> "$seqres.full"
+
+echo "posix umask interaction OK"
+
+status=0
+exit

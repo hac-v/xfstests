@@ -1,0 +1,100 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: POSIX large file (>2 GiB, >4 GiB) boundary test
+#
+# Behavior under test
+# - Files larger than 2 GiB (32-bit signed limit) work correctly.
+# - Files larger than 4 GiB (32-bit unsigned limit) work correctly.
+# - stat reports correct size for large files.
+# - pread/pwrite at offsets beyond 4 GiB return correct data.
+#
+# Output
+# - Single success line; diagnostics go to $seqres.full.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+# Check free space — need at least ~5 GiB (sparse, so mainly metadata)
+avail_kb=$(df -k --output=avail "$TEST_DIR" 2>/dev/null | tail -1)
+if [ -n "$avail_kb" ] && [ "$avail_kb" -lt 1048576 ]; then
+    _notrun "insufficient free space (need ~1 GiB, have ${avail_kb} KiB)"
+fi
+
+W="$TEST_DIR/cifs215.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# --- Test 1: file with size > 2 GiB ---
+# Use truncate to create a sparse file (fast, no actual I/O for the gap)
+OFF_2G=$((2 * 1024 * 1024 * 1024))  # 2147483648
+truncate -s "$((OFF_2G + 4096))" "$W/big2g" 2>>"$seqres.full" || \
+    _fail "truncate >2G failed"
+
+sz=$(stat -c %s "$W/big2g")
+expected=$((OFF_2G + 4096))
+[ "$sz" -eq "$expected" ] || _fail ">2G size: expected $expected got $sz"
+
+# Write and read at the >2G boundary
+python3 -c "
+import os
+fd = os.open('$W/big2g', os.O_RDWR)
+off = $OFF_2G
+os.pwrite(fd, b'PAST_2G!', off)
+data = os.pread(fd, 8, off)
+assert data == b'PAST_2G!', f'read at 2G+: {data!r}'
+os.close(fd)
+" 2>>"$seqres.full" || _fail "pwrite/pread at >2G failed"
+
+echo "cifs215: >2G boundary OK" >> "$seqres.full"
+
+# --- Test 2: file with size > 4 GiB ---
+OFF_4G=$((4 * 1024 * 1024 * 1024))  # 4294967296
+truncate -s "$((OFF_4G + 8192))" "$W/big4g" 2>>"$seqres.full" || \
+    _fail "truncate >4G failed"
+
+sz=$(stat -c %s "$W/big4g")
+expected=$((OFF_4G + 8192))
+[ "$sz" -eq "$expected" ] || _fail ">4G size: expected $expected got $sz"
+
+python3 -c "
+import os
+fd = os.open('$W/big4g', os.O_RDWR)
+off = $OFF_4G + 100
+os.pwrite(fd, b'PAST_4G_MARK', off)
+data = os.pread(fd, 12, off)
+assert data == b'PAST_4G_MARK', f'read at 4G+: {data!r}'
+os.close(fd)
+" 2>>"$seqres.full" || _fail "pwrite/pread at >4G failed"
+
+echo "cifs215: >4G boundary OK" >> "$seqres.full"
+
+# --- Test 3: verify stat consistency after reopen ---
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+sz2=$(stat -c %s "$W/big4g")
+[ "$sz2" -eq "$expected" ] || _fail ">4G size after reopen: expected $expected got $sz2"
+
+got=$(python3 -c "
+import os
+fd = os.open('$W/big4g', os.O_RDONLY)
+data = os.pread(fd, 12, $OFF_4G + 100)
+os.close(fd)
+print(data.decode(), end='')
+" 2>>"$seqres.full")
+[ "$got" = "PAST_4G_MARK" ] || _fail ">4G data after reopen: got '$got'"
+
+# Cleanup large files early to free space
+rm -f "$W/big2g" "$W/big4g"
+
+echo "posix large file OK"
+
+status=0
+exit

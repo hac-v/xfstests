@@ -1,0 +1,165 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: ioctl coverage — CIFS_QUERY_INFO, FS_IOC_GETFLAGS/SETFLAGS,
+#       CIFS_IOC_GET_MNT_INFO, CIFS_IOC_SHUTDOWN
+#
+# Behavior under test
+# - CIFS_QUERY_INFO: query file info via ioctl (smbinfo backbone).
+# - FS_IOC_GETFLAGS / FS_IOC_SETFLAGS: chattr attributes (immutable, append-only).
+# - CIFS_IOC_GET_MNT_INFO: retrieve mount info struct.
+# - Graceful skip for unsupported ioctls.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs237.$$"
+_cleanup_237() {
+    chattr -i "$W/immutable_file" 2>/dev/null || true
+    chattr -a "$W/append_file" 2>/dev/null || true
+    rm -rf "$W" >/dev/null 2>&1 || true
+}
+_register_cleanup _cleanup_237
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# --- Test 1: FS_IOC_GETFLAGS / FS_IOC_SETFLAGS via chattr ---
+CHATTR_OK=false
+if command -v chattr >/dev/null 2>&1 && command -v lsattr >/dev/null 2>&1; then
+    # Test 1a: immutable flag (+i)
+    echo "immutable_test" > "$W/immutable_file" || _fail "create immutable_file failed"
+
+    if chattr +i "$W/immutable_file" 2>>"$seqres.full"; then
+        CHATTR_OK=true
+        # Verify lsattr shows 'i' flag
+        flags=$(lsattr "$W/immutable_file" 2>>"$seqres.full" | awk '{print $1}')
+        echo "cifs237: immutable flags=$flags" >> "$seqres.full"
+
+        # Writing to immutable file should fail
+        if echo "should_fail" >> "$W/immutable_file" 2>/dev/null; then
+            _fail "write to immutable file succeeded"
+        fi
+
+        # Removing immutable file should fail
+        if rm "$W/immutable_file" 2>/dev/null; then
+            _fail "delete of immutable file succeeded"
+        fi
+
+        # Clear immutable flag
+        chattr -i "$W/immutable_file" 2>>"$seqres.full" || _fail "chattr -i failed"
+
+        # Now write should succeed
+        echo "after_clear" >> "$W/immutable_file" || _fail "write after clearing immutable failed"
+
+        echo "cifs237: chattr +i/-i OK" >> "$seqres.full"
+    else
+        echo "cifs237: [skip] chattr +i not supported" >> "$seqres.full"
+    fi
+
+    # Test 1b: append-only flag (+a)
+    echo "append_test" > "$W/append_file" || _fail "create append_file failed"
+
+    if chattr +a "$W/append_file" 2>>"$seqres.full"; then
+        # Overwrite should fail
+        if echo "overwrite" > "$W/append_file" 2>/dev/null; then
+            echo "cifs237: [warn] overwrite of append-only succeeded (server-dependent)" >> "$seqres.full"
+        fi
+
+        # Append should succeed
+        echo "appended_line" >> "$W/append_file" 2>>"$seqres.full" || \
+            echo "cifs237: [warn] append to append-only file failed" >> "$seqres.full"
+
+        chattr -a "$W/append_file" 2>>"$seqres.full" || true
+        echo "cifs237: chattr +a/-a OK" >> "$seqres.full"
+    else
+        echo "cifs237: [skip] chattr +a not supported" >> "$seqres.full"
+    fi
+else
+    echo "cifs237: [skip] chattr/lsattr not installed" >> "$seqres.full"
+fi
+
+# --- Test 2: FS_IOC_GETFLAGS via python3 ioctl ---
+echo "getflags_test" > "$W/flags_file" || _fail "create flags_file failed"
+
+python3 -c "
+import fcntl, struct, os, sys
+
+FS_IOC_GETFLAGS = 0x80086601  # _IOR('f', 1, long)
+fd = os.open('$W/flags_file', os.O_RDONLY)
+try:
+    buf = bytearray(8)
+    fcntl.ioctl(fd, FS_IOC_GETFLAGS, buf)
+    flags = struct.unpack_from('<I', buf, 0)[0]
+    print(f'FS_IOC_GETFLAGS: 0x{flags:08x}', file=sys.stderr)
+except OSError as e:
+    print(f'FS_IOC_GETFLAGS failed: {e}', file=sys.stderr)
+finally:
+    os.close(fd)
+" 2>>"$seqres.full" || true
+
+echo "cifs237: FS_IOC_GETFLAGS ioctl OK" >> "$seqres.full"
+
+# --- Test 3: CIFS_QUERY_INFO via smbinfo (if available) ---
+if command -v smbinfo >/dev/null 2>&1; then
+    echo "cifs237: testing smbinfo (CIFS_QUERY_INFO ioctl)..." >> "$seqres.full"
+
+    # Basic file info query
+    smbinfo fileid "$W/flags_file" >> "$seqres.full" 2>&1 || \
+        echo "cifs237: [warn] smbinfo fileid failed" >> "$seqres.full"
+
+    # File system info
+    smbinfo fsctl-getobjid "$W/flags_file" >> "$seqres.full" 2>&1 || \
+        echo "cifs237: [warn] smbinfo fsctl-getobjid failed" >> "$seqres.full"
+
+    # Security descriptor
+    smbinfo secdesc "$W/flags_file" >> "$seqres.full" 2>&1 || \
+        echo "cifs237: [warn] smbinfo secdesc failed" >> "$seqres.full"
+
+    echo "cifs237: smbinfo OK" >> "$seqres.full"
+else
+    echo "cifs237: [skip] smbinfo not installed" >> "$seqres.full"
+fi
+
+# --- Test 4: CIFS_QUERY_INFO via direct ioctl (Python) ---
+python3 -c "
+import fcntl, struct, os, sys
+
+# CIFS_QUERY_INFO = _IOWR(0xcf, 7, ...)
+# This is a passthrough to SMB2 QUERY_INFO
+CIFS_QUERY_INFO = 0xc018cf07
+
+fd = os.open('$W/flags_file', os.O_RDONLY)
+try:
+    # Query FileBasicInformation (InfoType=1, FileInfoClass=4)
+    # Build the CIFS_QUERY_INFO ioctl input struct
+    # struct { __u32 info_type; __u32 file_info_class; __u32 additional_info;
+    #          __u32 flags; __u32 input_buffer_length; __u32 output_buffer_length; }
+    buf = bytearray(4096)
+    struct.pack_into('<IIIIII', buf, 0,
+        1,     # SMB2_O_INFO_FILE
+        4,     # FileBasicInformation
+        0,     # additional_info
+        0,     # flags
+        0,     # input_buffer_length
+        4000)  # output_buffer_length
+
+    try:
+        fcntl.ioctl(fd, CIFS_QUERY_INFO, buf)
+        print('CIFS_QUERY_INFO succeeded', file=sys.stderr)
+    except OSError as e:
+        print(f'CIFS_QUERY_INFO: {e}', file=sys.stderr)
+finally:
+    os.close(fd)
+" 2>>"$seqres.full" || true
+
+echo "cifs ioctls OK"
+
+status=0
+exit

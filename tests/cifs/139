@@ -18,15 +18,21 @@ share_from_unc() { echo "$1" | sed -E 's#^//[^/]+/([^/]+).*#\1#'; }
 HOST=$(host_from_unc "$TEST_DEV"); SHARE=$(share_from_unc "$TEST_DEV")
 
 count_sockets_for_share() {
-    awk -v H="$1" -v S="$2" '
-        BEGIN { n=0; inb=0; hit=0 }
-        /^[[:space:]]*[0-9]+\).*/ { if (inb && hit) n++; inb=1; hit=0; next }
-        inb==1 {
-            if ($0 ~ /\\\\/ && match($0, /\\\\+([^\\]+)\\([^[:space:]]+)/, m)) {
-                if (m[1]==H && m[2]==S) hit=1
-            }
+    # Count connection blocks in DebugData that reference our host.
+    # Each "N) ... ConnectionId:" block represents a separate TCP session.
+    local h="$1"
+    local hl=$(echo "$h" | tr '[:upper:]' '[:lower:]')
+    awk -v HL="$hl" '
+        BEGIN { n=0; in_block=0; target=0 }
+        /^[[:space:]]*[0-9]+[)].*ConnectionId:/ {
+            if (in_block && target) n++
+            in_block=1; target=0; next
         }
-        END { if (inb && hit) n++; print n }
+        in_block {
+            line=tolower($0)
+            if (index(line, HL) > 0) target=1
+        }
+        END { if (in_block && target) n++; print n }
     ' /proc/fs/cifs/DebugData 2>/dev/null
 }
 
@@ -38,19 +44,21 @@ MO_NS=$(echo "$BASE" | awk -F, '{out=""; for(i=1;i<=NF;i++){ if($i=="nosharesock
 M1=$(mktemp -d /tmp/cifs139.sh.XXXXXX) || _fail "mktemp1"
 M2=$(mktemp -d /tmp/cifs139.ns.XXXXXX) || _fail "mktemp2"
 
-before=$(count_sockets_for_share "$HOST" "$SHARE")
+before=$(count_sockets_for_share "$HOST")
+echo "cifs139: before=$before" >> $seqres.full
 
 _do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO_SH'" || _fail "mount shared"
-mid=$(count_sockets_for_share "$HOST" "$SHARE")
+mid=$(count_sockets_for_share "$HOST")
+echo "cifs139: mid=$mid" >> $seqres.full
 [ -n "$mid" ] || _notrun "DebugData parse error"
-[ "$mid" -gt "$before" ] || _notrun "cannot observe baseline socket count for share"
+[ "$mid" -ge 1 ] || _notrun "cannot observe any session for host in DebugData"
 _do "mount -t cifs '$TEST_DEV' '$M2' -o '$MO_NS'" || _notrun "nosharesock not supported"
 
-after=$(count_sockets_for_share "$HOST" "$SHARE")
-[ -n "$before" ] && [ -n "$after" ] || _notrun "DebugData parse error"
-[ "$after" -gt 0 ] || _notrun "cannot observe sockets for share in DebugData"
+after=$(count_sockets_for_share "$HOST")
+echo "cifs139: after=$after" >> $seqres.full
+[ -n "$after" ] || _notrun "DebugData parse error"
 
-[ "$after" -ge $((mid+1)) ] || _fail "nosharesock did not create separate socket (before=$before mid=$mid after=$after)"
+[ "$after" -gt "$mid" ] || _fail "nosharesock did not create separate socket (before=$before mid=$mid after=$after)"
 
 echo "nosharesock creates separate sockets OK"
 

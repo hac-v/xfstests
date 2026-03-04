@@ -1,0 +1,81 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: POSIX truncate / ftruncate correctness
+#
+# Behavior under test
+# - truncate(2) grows a file (extends with zero-fill).
+# - truncate(2) shrinks a file (content beyond new size lost).
+# - ftruncate(2) to zero length empties the file.
+# - Data written before truncate is preserved up to the truncation point.
+#
+# Output
+# - Single success line; diagnostics go to $seqres.full.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v truncate >/dev/null 2>&1 || _notrun "requires truncate"
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs208.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# --- Test 1: truncate grows file with zero fill ---
+echo "ABCDEF" > "$W/f1" || _fail "create f1 failed"
+orig_sz=$(stat -c %s "$W/f1")
+new_sz=$((orig_sz + 4096))
+truncate -s "$new_sz" "$W/f1" || _fail "truncate grow failed"
+sz=$(stat -c %s "$W/f1")
+[ "$sz" -eq "$new_sz" ] || _fail "size after grow: expected $new_sz got $sz"
+
+# Verify the extended region is zero-filled
+tail_zeros=$(dd if="$W/f1" bs=1 skip="$orig_sz" count=4096 2>/dev/null | tr -d '\000' | wc -c)
+[ "$tail_zeros" -eq 0 ] || _fail "extended region not zero-filled ($tail_zeros non-zero bytes)"
+
+echo "cifs208: truncate grow OK" >> "$seqres.full"
+
+# --- Test 2: truncate shrinks file, preserving prefix ---
+dd if=/dev/urandom of="$W/f2" bs=4096 count=4 2>>"$seqres.full" || _fail "create f2 failed"
+md5_orig=$(dd if="$W/f2" bs=4096 count=2 2>/dev/null | md5sum | awk '{print $1}')
+truncate -s 8192 "$W/f2" || _fail "truncate shrink failed"
+sz=$(stat -c %s "$W/f2")
+[ "$sz" -eq 8192 ] || _fail "size after shrink: expected 8192 got $sz"
+md5_after=$(md5sum < "$W/f2" | awk '{print $1}')
+[ "$md5_orig" = "$md5_after" ] || _fail "data corruption after shrink"
+
+echo "cifs208: truncate shrink OK" >> "$seqres.full"
+
+# --- Test 3: ftruncate to zero via python3 ---
+echo "some content" > "$W/f3" || _fail "create f3 failed"
+python3 -c "
+import os
+fd = os.open('$W/f3', os.O_RDWR)
+os.ftruncate(fd, 0)
+os.close(fd)
+" || _fail "ftruncate to zero failed"
+sz=$(stat -c %s "$W/f3")
+[ "$sz" -eq 0 ] || _fail "ftruncate to zero: size=$sz"
+
+echo "cifs208: ftruncate zero OK" >> "$seqres.full"
+
+# --- Test 4: ftruncate grow via python3 ---
+python3 -c "
+import os
+fd = os.open('$W/f3', os.O_RDWR)
+os.ftruncate(fd, 65536)
+os.close(fd)
+" || _fail "ftruncate grow failed"
+sz=$(stat -c %s "$W/f3")
+[ "$sz" -eq 65536 ] || _fail "ftruncate grow: expected 65536 got $sz"
+
+echo "posix truncate/ftruncate OK"
+
+status=0
+exit

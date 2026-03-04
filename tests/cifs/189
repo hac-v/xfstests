@@ -27,7 +27,7 @@ _begin_fstest auto quick
 [ "$(id -u)" = 0 ] || _notrun "root required"
 [ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
 
-base_opts=${MOUNT_OPTIONS#-o}
+base_opts=$(echo "${MOUNT_OPTIONS#-o}" | sed 's/^[[:space:]]*//')
 if [ -z "$base_opts" ]; then
     base_opts=$(awk -v mnt="$TEST_DIR" '$2==mnt {print $4}' /proc/mounts)
 fi

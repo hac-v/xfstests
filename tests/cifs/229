@@ -1,0 +1,89 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: NFS reparse mknod (block, char, fifo, socket via reparse=nfs)
+#
+# Behavior under test
+# - Mount with reparse=nfs and create FIFO, socket, char device, block device
+#   via mknod. Verify stat reports correct file type. Skip if reparse=nfs
+#   mount fails or individual mknod returns EOPNOTSUPP.
+# - This exercises mknod_nfs() for non-symlink special file types.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ "$(id -u)" = 0 ] || _notrun "root required for mknod"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+_register_cleanup "_test_unmount >/dev/null 2>&1; rm -rf \"$TEST_DIR/cifs229.$$\" >/dev/null 2>&1"
+
+_test_unmount > /dev/null 2>&1
+_do "_test_mount -o reparse=nfs" || _notrun "mount with reparse=nfs failed"
+
+W="$TEST_DIR/cifs229.$$"
+mkdir -p "$W" || _fail "mkdir failed"
+
+pass=0
+skip=0
+
+# FIFO
+if mknod "$W/fifo" p 2>>$seqres.full; then
+    ftype=$(stat -c %F "$W/fifo")
+    echo "fifo: $ftype" >> $seqres.full
+    [ "$ftype" = "fifo" ] || _fail "FIFO type mismatch: $ftype"
+    pass=$((pass + 1))
+else
+    echo "mknod fifo not supported" >> $seqres.full
+    skip=$((skip + 1))
+fi
+
+# Character device (1,3 = /dev/null)
+if mknod "$W/chrdev" c 1 3 2>>$seqres.full; then
+    ftype=$(stat -c %F "$W/chrdev")
+    echo "chrdev: $ftype" >> $seqres.full
+    echo "$ftype" | grep -qi "character" || _fail "char device type mismatch: $ftype"
+    pass=$((pass + 1))
+else
+    echo "mknod chrdev not supported" >> $seqres.full
+    skip=$((skip + 1))
+fi
+
+# Block device (7,0 = /dev/loop0)
+if mknod "$W/blkdev" b 7 0 2>>$seqres.full; then
+    ftype=$(stat -c %F "$W/blkdev")
+    echo "blkdev: $ftype" >> $seqres.full
+    echo "$ftype" | grep -qi "block" || _fail "block device type mismatch: $ftype"
+    pass=$((pass + 1))
+else
+    echo "mknod blkdev not supported" >> $seqres.full
+    skip=$((skip + 1))
+fi
+
+# Socket (via python AF_UNIX bind)
+if python3 -c "
+import socket, os
+path = '$W/sock'
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(path)
+s.close()
+" 2>>$seqres.full; then
+    ftype=$(stat -c %F "$W/sock")
+    echo "socket: $ftype" >> $seqres.full
+    echo "$ftype" | grep -qi "socket" || _fail "socket type mismatch: $ftype"
+    pass=$((pass + 1))
+else
+    echo "socket creation not supported" >> $seqres.full
+    skip=$((skip + 1))
+fi
+
+echo "pass=$pass skip=$skip" >> $seqres.full
+
+[ $pass -eq 0 ] && _notrun "no NFS reparse special file types supported"
+
+echo "NFS reparse mknod OK"
+
+status=0
+exit

@@ -1,0 +1,186 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: O_WRONLY + fscache regression test
+#
+# Regression test for kernel commit:
+#   e9e62243a3e2 ("cifs: Fix caching to try to do open O_WRONLY as rdwr on server")
+#
+# Bug: When FS-Cache is enabled (-o fsc) and a file is opened O_WRONLY,
+# the client can't cache partial writes because it can't read the rest
+# of the cache granule. The fix: try GENERIC_READ|GENERIC_WRITE first;
+# if ACCESS_DENIED, fall back to GENERIC_WRITE only and invalidate cache.
+#
+# Test:
+# 1. Mount with -o fsc
+# 2. Open file O_WRONLY, write partial data
+# 3. Close and re-read — data must be correct
+# 4. Open file O_WRONLY at mid-offset, write — surrounding data intact
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs282.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# Note: fscache may or may not be enabled on this mount.
+# The O_WRONLY partial write bug affects all cache modes, but is most
+# severe with fsc. We test the O_WRONLY pattern regardless.
+
+# --- Test 1: O_WRONLY write + read back ---
+F1="$W/wronly_basic"
+python3 -c "
+import os, sys
+
+f = '$F1'
+# Create file with known content
+fd = os.open(f, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+os.write(fd, b'INITIAL_DATA_HERE_1234567890' * 100)
+os.fsync(fd)
+os.close(fd)
+
+# Re-open O_WRONLY and write partial data at offset 0
+fd = os.open(f, os.O_WRONLY)
+os.write(fd, b'REPLACED!')
+os.fsync(fd)
+os.close(fd)
+
+# Read back — first 9 bytes should be 'REPLACED!', rest should be original
+fd = os.open(f, os.O_RDONLY)
+data = os.read(fd, 4096)
+os.close(fd)
+
+assert data[:9] == b'REPLACED!', f'wronly partial: {data[:20]!r}'
+assert b'INITIAL_DATA' in data[9:50], f'surrounding data lost: {data[9:50]!r}'
+print('O_WRONLY basic write OK', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "O_WRONLY basic write failed"
+
+echo "cifs282: O_WRONLY basic OK" >> "$seqres.full"
+
+# --- Test 2: O_WRONLY mid-file write (the hard case) ---
+F2="$W/wronly_mid"
+python3 -c "
+import os, sys
+
+f = '$F2'
+size = 65536
+# Fill with 'X'
+fd = os.open(f, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+os.write(fd, b'X' * size)
+os.fsync(fd)
+os.close(fd)
+
+# O_WRONLY write at mid-file offset
+fd = os.open(f, os.O_WRONLY)
+os.lseek(fd, 32768, os.SEEK_SET)
+os.write(fd, b'Y' * 200)
+os.fsync(fd)
+os.close(fd)
+
+# Read back — verify exact pattern
+fd = os.open(f, os.O_RDONLY)
+data = os.read(fd, size + 4096)
+os.close(fd)
+
+assert len(data) == size, f'size: {len(data)}'
+
+# Check each region
+for i in range(32768):
+    if data[i] != ord('X'):
+        print(f'CORRUPTION at {i}: expected X got 0x{data[i]:02x}', file=sys.stderr)
+        sys.exit(1)
+
+for i in range(32768, 32968):
+    if data[i] != ord('Y'):
+        print(f'CORRUPTION at {i}: expected Y got 0x{data[i]:02x}', file=sys.stderr)
+        sys.exit(1)
+
+for i in range(32968, size):
+    if data[i] != ord('X'):
+        print(f'CORRUPTION at {i}: expected X got 0x{data[i]:02x}', file=sys.stderr)
+        sys.exit(1)
+
+print('O_WRONLY mid-file write OK', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "O_WRONLY mid-file write corruption"
+
+echo "cifs282: O_WRONLY mid-file OK" >> "$seqres.full"
+
+# --- Test 3: O_WRONLY with cache drop between write and read ---
+F3="$W/wronly_cache"
+python3 -c "
+import os, sys, hashlib
+
+f = '$F3'
+data = b'CACHE_TEST_DATA_' * 4096  # 64 KiB
+h_orig = hashlib.md5(data).hexdigest()
+
+fd = os.open(f, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+os.write(fd, data)
+os.fsync(fd)
+os.close(fd)
+" 2>>"$seqres.full" || _fail "wronly cache write failed"
+
+# Drop all caches to force server re-read
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+python3 -c "
+import os, sys, hashlib
+
+f = '$F3'
+expected = b'CACHE_TEST_DATA_' * 4096
+h_expected = hashlib.md5(expected).hexdigest()
+
+fd = os.open(f, os.O_RDONLY)
+data = os.read(fd, len(expected) + 4096)
+os.close(fd)
+
+h_got = hashlib.md5(data).hexdigest()
+assert h_got == h_expected, f'cache coherency: {h_expected} vs {h_got}'
+print('O_WRONLY + cache drop OK', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "O_WRONLY cache coherency failed"
+
+echo "cifs282: O_WRONLY cache OK" >> "$seqres.full"
+
+# --- Test 4: multiple O_WRONLY partial writes (accumulate) ---
+F4="$W/wronly_multi"
+python3 -c "
+import os, sys
+
+f = '$F4'
+fd = os.open(f, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+os.write(fd, b'0' * 4096)
+os.close(fd)
+
+# 10 O_WRONLY writes at different offsets
+for i in range(10):
+    fd = os.open(f, os.O_WRONLY)
+    os.lseek(fd, i * 400, os.SEEK_SET)
+    os.write(fd, bytes([0x41 + i]) * 100)  # A, B, C, ...
+    os.close(fd)
+
+# Verify all writes persisted
+fd = os.open(f, os.O_RDONLY)
+data = os.read(fd, 4096)
+os.close(fd)
+
+for i in range(10):
+    off = i * 400
+    expected = bytes([0x41 + i]) * 100
+    actual = data[off:off+100]
+    assert actual == expected, f'multi-write {i}: at {off} expected {chr(0x41+i)} got {actual[:5]!r}'
+
+print('multiple O_WRONLY partial writes OK', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "multiple O_WRONLY partial writes failed"
+
+echo "O_WRONLY fscache regression OK"
+
+status=0
+exit

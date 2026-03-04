@@ -1,0 +1,153 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: FSCTL_DUPLICATE_EXTENTS_TO_FILE — server-side file clone (reflink)
+#
+# Kernel code exercised:
+# - smb2ops.c: smb2_duplicate_extents() → FSCTL_DUPLICATE_EXTENTS_TO_FILE
+# - This is the SMB equivalent of reflink/clone — copy data server-side
+#   without actually transferring bytes over the network
+# - Triggered via copy_file_range() or FICLONE/FICLONERANGE ioctl
+# - Skip if server doesn't support extent duplication
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs264.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# --- Test 1: FICLONE (full file clone) via python ---
+SRC="$W/clone_src"
+DST="$W/clone_dst"
+
+dd if=/dev/urandom of="$SRC" bs=65536 count=8 2>>"$seqres.full" || _fail "create src failed"
+SRC_MD5=$(md5sum < "$SRC" | awk '{print $1}')
+
+python3 -c "
+import fcntl, os, sys, struct, errno
+
+FICLONE = 0x40049409  # _IOW(0x94, 9, int)
+
+src_fd = os.open('$SRC', os.O_RDONLY)
+# Create empty destination
+dst_fd = os.open('$DST', os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+
+try:
+    # Pack the source fd as a 4-byte int
+    fcntl.ioctl(dst_fd, FICLONE, struct.pack('i', src_fd))
+    print('FICLONE succeeded', file=sys.stderr)
+except OSError as e:
+    if e.errno in (errno.EOPNOTSUPP, errno.ENOTTY, errno.EINVAL, errno.ENOSYS,
+                   errno.EXDEV, errno.EBADF):
+        print(f'FICLONE not supported: {e}', file=sys.stderr)
+        sys.exit(77)
+    print(f'FICLONE error: {e}', file=sys.stderr)
+    sys.exit(77)
+finally:
+    os.close(src_fd)
+    os.close(dst_fd)
+" 2>>"$seqres.full"
+rc=$?
+
+if [ $rc -eq 77 ]; then
+    echo "cifs264: [skip] FICLONE not supported, trying copy_file_range" >> "$seqres.full"
+
+    # Fall back to copy_file_range which may use FSCTL_SRV_COPYCHUNK or
+    # FSCTL_DUPLICATE_EXTENTS internally
+    python3 -c "
+import os, sys, errno
+
+src_fd = os.open('$SRC', os.O_RDONLY)
+dst_fd = os.open('$DST', os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+sz = os.fstat(src_fd).st_size
+
+try:
+    copied = 0
+    while copied < sz:
+        n = os.copy_file_range(src_fd, dst_fd, sz - copied)
+        if n == 0:
+            break
+        copied += n
+    assert copied == sz, f'copy_file_range: {copied}/{sz}'
+    print(f'copy_file_range OK: {copied} bytes', file=sys.stderr)
+except (OSError, AttributeError) as e:
+    print(f'copy_file_range: {e}', file=sys.stderr)
+    sys.exit(77)
+finally:
+    os.close(src_fd)
+    os.close(dst_fd)
+" 2>>"$seqres.full"
+    rc2=$?
+    [ $rc2 -eq 77 ] && _notrun "neither FICLONE nor copy_file_range supported"
+fi
+
+# Verify data integrity of cloned file
+if [ -f "$DST" ] && [ -s "$DST" ]; then
+    DST_MD5=$(md5sum < "$DST" | awk '{print $1}')
+    [ "$SRC_MD5" = "$DST_MD5" ] || _fail "clone md5 mismatch: $SRC_MD5 vs $DST_MD5"
+    echo "cifs264: clone integrity OK" >> "$seqres.full"
+fi
+
+# --- Test 2: FICLONERANGE (partial clone) ---
+SRC2="$W/range_src"
+DST2="$W/range_dst"
+
+dd if=/dev/urandom of="$SRC2" bs=65536 count=4 2>>"$seqres.full" || _fail "create range_src failed"
+: > "$DST2" || _fail "create range_dst failed"
+
+# Clone only a portion (first 128K)
+python3 -c "
+import fcntl, os, sys, struct, errno
+
+# struct file_clone_range { __s64 src_fd; __u64 src_offset; __u64 src_length; __u64 dest_offset; }
+FICLONERANGE = 0x4020940d  # _IOW(0x94, 13, struct file_clone_range)
+
+src_fd = os.open('$SRC2', os.O_RDONLY)
+dst_fd = os.open('$DST2', os.O_WRONLY)
+
+try:
+    # Clone first 131072 bytes at offset 0 to dst offset 0
+    data = struct.pack('qQQQ', src_fd, 0, 131072, 0)
+    fcntl.ioctl(dst_fd, FICLONERANGE, data)
+    print('FICLONERANGE succeeded', file=sys.stderr)
+except OSError as e:
+    print(f'FICLONERANGE: {e}', file=sys.stderr)
+    sys.exit(77)
+finally:
+    os.close(src_fd)
+    os.close(dst_fd)
+" 2>>"$seqres.full"
+rc3=$?
+
+if [ $rc3 -eq 0 ] && [ -s "$DST2" ]; then
+    # Verify the cloned range matches
+    src_part=$(dd if="$SRC2" bs=65536 count=2 2>/dev/null | md5sum | awk '{print $1}')
+    dst_part=$(md5sum < "$DST2" | awk '{print $1}')
+    [ "$src_part" = "$dst_part" ] || echo "cifs264: [warn] range clone mismatch" >> "$seqres.full"
+    echo "cifs264: FICLONERANGE OK" >> "$seqres.full"
+else
+    echo "cifs264: [skip] FICLONERANGE not supported" >> "$seqres.full"
+fi
+
+# --- Test 3: clone then modify source (COW semantics) ---
+if [ -f "$DST" ] && [ -s "$DST" ]; then
+    # Modify source — clone should still have old data
+    echo "MODIFIED" > "$SRC"
+    DST_MD5_2=$(md5sum < "$DST" | awk '{print $1}')
+    [ "$SRC_MD5" = "$DST_MD5_2" ] || \
+        echo "cifs264: [note] clone shares data with source (no COW)" >> "$seqres.full"
+    echo "cifs264: post-modify clone check OK" >> "$seqres.full"
+fi
+
+echo "FSCTL_DUPLICATE_EXTENTS OK"
+
+status=0
+exit

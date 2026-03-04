@@ -1,0 +1,127 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: drop_dir_cache — force invalidation of cached directory entries
+#
+# Kernel code exercised:
+# - cached_dir.c: drop_cached_dir_by_name() triggered by writing 1 to sysfs
+# - cached_dir.c: close_cached_dir() for each evicted entry
+# - Stats: QueryDirectories should increase after dropping cache
+#
+# When drop_dir_cache is written to:
+# - All cached directory handles are closed immediately
+# - Next readdir must go to server (QueryDirectories increments)
+# - Useful for testing cache invalidation and coherency
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+[ -w /sys/module/cifs/parameters/drop_dir_cache ] || \
+    _notrun "drop_dir_cache not writable"
+[ -r /proc/fs/cifs/Stats ] || _notrun "requires Stats"
+
+W="$TEST_DIR/cifs289.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# Helper: get QueryDirectories count
+_get_qd() {
+    awk '/QueryDirectories:/ {split($2, a, " "); sum += a[1]} END {print sum+0}' \
+        /proc/fs/cifs/Stats 2>/dev/null
+}
+_reset_stats() {
+    echo 0 > /proc/fs/cifs/Stats 2>/dev/null || true
+    sleep 0.3
+}
+
+# Create some files to have a non-empty directory
+for i in $(seq 1 20); do
+    echo "file_$i" > "$W/f_$i.txt"
+done
+
+# --- Test 1: populate dir cache with readdir ---
+_reset_stats
+
+ls -la "$W" > /dev/null 2>&1  # first readdir → populates cache
+QD1=$(_get_qd)
+echo "cifs289: after first ls: QueryDirs=$QD1" >> "$seqres.full"
+
+ls -la "$W" > /dev/null 2>&1  # second readdir → may use cache
+QD2=$(_get_qd)
+echo "cifs289: after second ls: QueryDirs=$QD2" >> "$seqres.full"
+
+# --- Test 2: drop_dir_cache forces invalidation ---
+# Check open_dirs before drop
+if [ -r /proc/fs/cifs/open_dirs ]; then
+    dirs_before=$(grep -c "cifs289" /proc/fs/cifs/open_dirs 2>/dev/null) || dirs_before=0
+    echo "cifs289: open_dirs entries before drop: $dirs_before" >> "$seqres.full"
+    cat /proc/fs/cifs/open_dirs >> "$seqres.full" 2>&1
+fi
+
+echo 1 > /sys/module/cifs/parameters/drop_dir_cache 2>>"$seqres.full"
+echo "cifs289: wrote 1 to drop_dir_cache" >> "$seqres.full"
+
+# Check open_dirs after drop — should have no cached entries for our dir
+if [ -r /proc/fs/cifs/open_dirs ]; then
+    dirs_after=$(grep -c "cifs289" /proc/fs/cifs/open_dirs 2>/dev/null) || dirs_after=0
+    echo "cifs289: open_dirs entries after drop: $dirs_after" >> "$seqres.full"
+    if [ "$dirs_after" -gt 0 ]; then
+        echo "cifs289: [warn] cached dirs still present after drop" >> "$seqres.full"
+        cat /proc/fs/cifs/open_dirs >> "$seqres.full" 2>&1
+    else
+        echo "cifs289: open_dirs correctly empty after drop" >> "$seqres.full"
+    fi
+fi
+
+ls -la "$W" > /dev/null 2>&1  # must go to server (cache was dropped)
+QD3=$(_get_qd)
+echo "cifs289: after drop + ls: QueryDirs=$QD3" >> "$seqres.full"
+
+# QueryDirs should have increased after dropping cache
+[ "$QD3" -gt "$QD2" ] || \
+    echo "cifs289: [note] QueryDirs didn't increase after drop ($QD2 → $QD3)" >> "$seqres.full"
+
+# --- Test 3: verify data integrity after cache drop ---
+count=$(ls -1 "$W" | wc -l)
+[ "$count" -eq 20 ] || _fail "readdir after drop: expected 20 got $count"
+
+got=$(cat "$W/f_1.txt")
+[ "$got" = "file_1" ] || _fail "data after drop: '$got'"
+
+echo "cifs289: data integrity after drop OK" >> "$seqres.full"
+
+# --- Test 4: multiple rapid drops ---
+for i in $(seq 1 5); do
+    echo 1 > /sys/module/cifs/parameters/drop_dir_cache 2>/dev/null
+    ls "$W" > /dev/null 2>&1
+done
+
+# Verify still functional
+count2=$(ls -1 "$W" | wc -l)
+[ "$count2" -eq 20 ] || _fail "readdir after rapid drops: expected 20 got $count2"
+
+echo "cifs289: rapid drops OK" >> "$seqres.full"
+
+# --- Test 5: drop cache, create new file, readdir sees it ---
+echo 1 > /sys/module/cifs/parameters/drop_dir_cache 2>/dev/null
+echo "new_after_drop" > "$W/new_file.txt" || _fail "create after drop failed"
+
+listing=$(ls -1 "$W")
+echo "$listing" | grep -q "new_file.txt" || _fail "new file not visible after drop"
+
+echo "cifs289: new file visible after drop OK" >> "$seqres.full"
+
+# --- Summary ---
+echo "" >> "$seqres.full"
+echo "=== drop_dir_cache Summary ===" >> "$seqres.full"
+echo "QueryDirs: before=$QD1, cached=$QD2, after_drop=$QD3" >> "$seqres.full"
+
+echo "drop_dir_cache OK"
+
+status=0
+exit

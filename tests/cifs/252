@@ -1,0 +1,169 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: reparse.c — deep mknod coverage via NFS and WSL reparse points
+#
+# Kernel code exercised:
+# - mknod_nfs(): NFS reparse for FIFO, char dev, block dev, socket
+# - nfs_set_reparse_buf(): build NFS reparse data buffer
+# - parse_reparse_nfs(): parse NFS reparse on stat/readdir
+# - create_native_socket(): native socket creation via reparse
+# - mknod_wsl(): WSL reparse for FIFO, char dev, block dev, socket
+# - wsl_set_reparse_buf(), wsl_set_xattrs(): WSL reparse + EA creation
+# - mknod_reparse(): dispatcher that chooses NFS vs WSL path
+# - stat correctly returns S_ISFIFO/S_ISCHR/S_ISBLK/S_ISSOCK
+#
+# Requires reparse=nfs or reparse=wsl mount option.
+# Skip if mknod operations are not supported.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs252.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+mknod_supported=false
+
+# --- Test 1: mkfifo (FIFO via reparse) ---
+FIFO="$W/test_fifo"
+if mkfifo "$FIFO" 2>>"$seqres.full"; then
+    mknod_supported=true
+
+    # Verify stat shows S_ISFIFO
+    ftype=$(stat -c %F "$FIFO" 2>>"$seqres.full")
+    echo "cifs252: FIFO type='$ftype'" >> "$seqres.full"
+
+    python3 -c "
+import os, stat, sys
+st = os.lstat('$FIFO')
+assert stat.S_ISFIFO(st.st_mode), f'not FIFO: mode={oct(st.st_mode)}'
+print('S_ISFIFO OK', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "FIFO stat check failed"
+
+    # Functional: write+read through FIFO
+    (echo "fifo_payload" > "$FIFO") &
+    WR_PID=$!
+    got=$(timeout 5 cat "$FIFO" 2>>"$seqres.full") || true
+    wait $WR_PID 2>/dev/null || true
+    if [ "$got" = "fifo_payload" ]; then
+        echo "cifs252: FIFO functional OK" >> "$seqres.full"
+    else
+        echo "cifs252: [warn] FIFO read='$got'" >> "$seqres.full"
+    fi
+
+    rm -f "$FIFO" 2>/dev/null
+    echo "cifs252: mkfifo OK" >> "$seqres.full"
+else
+    echo "cifs252: [skip] mkfifo not supported" >> "$seqres.full"
+fi
+
+# --- Test 2: mknod character device ---
+CDEV="$W/test_cdev"
+if mknod "$CDEV" c 1 3 2>>"$seqres.full"; then  # /dev/null equivalent
+    mknod_supported=true
+
+    python3 -c "
+import os, stat, sys
+st = os.lstat('$CDEV')
+assert stat.S_ISCHR(st.st_mode), f'not char dev: mode={oct(st.st_mode)}'
+major = os.major(st.st_rdev)
+minor = os.minor(st.st_rdev)
+print(f'S_ISCHR OK major={major} minor={minor}', file=sys.stderr)
+assert major == 1 and minor == 3, f'dev nums wrong: {major}:{minor}'
+" 2>>"$seqres.full" || _fail "char dev stat check failed"
+
+    rm -f "$CDEV" 2>/dev/null
+    echo "cifs252: mknod char dev OK" >> "$seqres.full"
+else
+    echo "cifs252: [skip] mknod char dev not supported" >> "$seqres.full"
+fi
+
+# --- Test 3: mknod block device ---
+BDEV="$W/test_bdev"
+if mknod "$BDEV" b 7 0 2>>"$seqres.full"; then  # loop0 equivalent
+    mknod_supported=true
+
+    python3 -c "
+import os, stat, sys
+st = os.lstat('$BDEV')
+assert stat.S_ISBLK(st.st_mode), f'not block dev: mode={oct(st.st_mode)}'
+major = os.major(st.st_rdev)
+minor = os.minor(st.st_rdev)
+print(f'S_ISBLK OK major={major} minor={minor}', file=sys.stderr)
+assert major == 7 and minor == 0, f'dev nums wrong: {major}:{minor}'
+" 2>>"$seqres.full" || _fail "block dev stat check failed"
+
+    rm -f "$BDEV" 2>/dev/null
+    echo "cifs252: mknod block dev OK" >> "$seqres.full"
+else
+    echo "cifs252: [skip] mknod block dev not supported" >> "$seqres.full"
+fi
+
+# --- Test 4: Unix domain socket via bind ---
+SOCK="$W/test_sock"
+python3 -c "
+import socket, os, stat, sys
+
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.bind('$SOCK')
+    s.close()
+
+    st = os.lstat('$SOCK')
+    assert stat.S_ISSOCK(st.st_mode), f'not socket: mode={oct(st.st_mode)}'
+    print('S_ISSOCK OK', file=sys.stderr)
+    os.unlink('$SOCK')
+except OSError as e:
+    print(f'socket: {e}', file=sys.stderr)
+    sys.exit(0)  # not a failure, just unsupported
+" 2>>"$seqres.full" || true
+
+echo "cifs252: socket test done" >> "$seqres.full"
+
+# --- Test 5: mknod persistence across remount (NFS reparse data stored) ---
+FIFO2="$W/persist_fifo"
+if mkfifo "$FIFO2" 2>>"$seqres.full"; then
+    # Drop caches to force re-read from server
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+    ftype2=$(stat -c %F "$FIFO2" 2>>"$seqres.full")
+    echo "cifs252: FIFO after cache drop: type='$ftype2'" >> "$seqres.full"
+
+    python3 -c "
+import os, stat
+st = os.lstat('$FIFO2')
+assert stat.S_ISFIFO(st.st_mode), f'FIFO not preserved: {oct(st.st_mode)}'
+" 2>>"$seqres.full" || echo "cifs252: [warn] FIFO not preserved after cache drop" >> "$seqres.full"
+
+    rm -f "$FIFO2" 2>/dev/null
+    echo "cifs252: mknod persistence OK" >> "$seqres.full"
+fi
+
+# --- Test 6: mknod with different permissions ---
+if $mknod_supported; then
+    for mode in 0644 0600 0755 0666; do
+        FTEST="$W/fifo_$mode"
+        if mkfifo -m "$mode" "$FTEST" 2>>"$seqres.full"; then
+            actual=$(stat -c %a "$FTEST" 2>/dev/null)
+            echo "cifs252: mkfifo -m $mode -> stat $actual" >> "$seqres.full"
+            rm -f "$FTEST" 2>/dev/null
+        fi
+    done
+    echo "cifs252: mknod permissions OK" >> "$seqres.full"
+fi
+
+$mknod_supported || _notrun "no mknod operations supported on this CIFS mount"
+
+echo "reparse mknod deep OK"
+
+status=0
+exit

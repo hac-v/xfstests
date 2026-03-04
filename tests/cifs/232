@@ -1,0 +1,149 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: nohandlecache functional validation
+#
+# Behavior under test
+# - Mount normally and verify cached dir handles appear in /proc/fs/cifs/open_dirs
+#   after readdir. Then mount with -o nohandlecache and verify open_dirs stays
+#   empty after the same readdir pattern.
+# - Fallback: if open_dirs is unavailable, use Stats Creates counter to compare
+#   handle reuse between cached and uncached modes.
+# - Skip if neither open_dirs nor Stats are available, or if the server doesn't
+#   grant directory leases (open_dirs empty even without nohandlecache).
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+_host_from_unc() { echo "$1" | sed -E 's#^//([^/]+)/.*#\1#'; }
+_unc_windows() {
+    local h=$(_host_from_unc "$1")
+    local s=$(echo "$1" | sed -E 's#^//[^/]+/([^/]+).*#\1#')
+    printf "\\\\%s\\%s" "$h" "$s"
+}
+UNCW=$(_unc_windows "$TEST_DEV")
+
+OPEN_DIRS="/proc/fs/cifs/open_dirs"
+have_open_dirs=false
+[ -r "$OPEN_DIRS" ] && have_open_dirs=true
+
+_stats_creates() {
+    cat /proc/fs/cifs/Stats 2>/dev/null | awk -v UNC="$UNCW" '
+        BEGIN { inb=0; cr=0 }
+        /^[[:space:]]*[0-9]+\) / { inb = (index($0, UNC) > 0) ? 1 : 0; next }
+        inb==1 && NF==0 { inb=0 }
+        inb==1 && $1=="Creates:" { cr=$2 }
+        END { print cr+0 }
+    '
+}
+
+# Count non-header lines in open_dirs matching our mount path
+_open_dirs_count() {
+    local dir="$1"
+    local cnt
+    cnt=$(cat "$OPEN_DIRS" 2>/dev/null | grep -v '^#' | grep -c "$dir" 2>/dev/null) || cnt=0
+    echo $((cnt + 0))
+}
+
+_register_cleanup "_test_unmount >/dev/null 2>&1; rm -rf \"$TEST_DIR/cifs232.$$\" >/dev/null 2>&1"
+
+# ============================================================
+# Phase 1: Mount normally (with dir handle caching)
+# ============================================================
+_test_unmount > /dev/null 2>&1
+_do "_test_mount" || _fail "normal mount failed"
+
+W="$TEST_DIR/cifs232.$$"
+mkdir -p "$W" || _fail "mkdir failed"
+for i in $(seq 1 5); do echo "f$i" > "$W/f$i"; done
+sync
+
+# Trigger readdir multiple times to populate cache
+for i in $(seq 1 10); do
+    ls "$W" >/dev/null 2>&1
+done
+sleep 1
+
+cached_dirs=0
+if $have_open_dirs; then
+    cached_dirs=$(_open_dirs_count "cifs232")
+    echo "phase1 (cached): open_dirs entries=$cached_dirs" >> $seqres.full
+fi
+
+cr_cached=0
+cr0=$(_stats_creates)
+if [ "$cr0" -gt 0 ]; then
+    for i in $(seq 1 5); do ls "$W" >/dev/null 2>&1; done
+    cr1=$(_stats_creates)
+    cr_cached=$((cr1 - cr0))
+    echo "phase1 (cached): stats creates delta=$cr_cached" >> $seqres.full
+fi
+
+_test_unmount > /dev/null 2>&1
+
+# ============================================================
+# Phase 2: Mount with nohandlecache
+# ============================================================
+_do "_test_mount -o nohandlecache" || _notrun "mount with nohandlecache failed"
+
+# Trigger readdir multiple times
+for i in $(seq 1 10); do
+    ls "$W" >/dev/null 2>&1
+done
+sleep 1
+
+nohandle_dirs=0
+if $have_open_dirs; then
+    nohandle_dirs=$(_open_dirs_count "cifs232")
+    echo "phase2 (nohandlecache): open_dirs entries=$nohandle_dirs" >> $seqres.full
+fi
+
+cr_nohandle=0
+cr2=$(_stats_creates)
+if [ "$cr2" -gt 0 ]; then
+    for i in $(seq 1 5); do ls "$W" >/dev/null 2>&1; done
+    cr3=$(_stats_creates)
+    cr_nohandle=$((cr3 - cr2))
+    echo "phase2 (nohandlecache): stats creates delta=$cr_nohandle" >> $seqres.full
+fi
+
+# ============================================================
+# Evaluate results
+# ============================================================
+validated=false
+
+# Method 1: open_dirs check
+if $have_open_dirs; then
+    if [ "$cached_dirs" -gt 0 ] && [ "$nohandle_dirs" -eq 0 ]; then
+        echo "nohandlecache: open_dirs confirms no cached dir handles (cached=$cached_dirs nohandle=$nohandle_dirs)" >> $seqres.full
+        validated=true
+    elif [ "$cached_dirs" -gt 0 ] && [ "$nohandle_dirs" -gt 0 ]; then
+        _fail "nohandlecache: expected 0 cached dirs but found $nohandle_dirs (cached mode had $cached_dirs)"
+    else
+        echo "open_dirs empty even in cached mode (server may not grant dir leases)" >> $seqres.full
+    fi
+fi
+
+# Method 2: Stats Creates fallback
+if ! $validated && [ "$cr0" -gt 0 ]; then
+    if [ "$cr_nohandle" -gt "$cr_cached" ]; then
+        echo "nohandlecache: Stats confirms more Creates without caching (nohandle=$cr_nohandle cached=$cr_cached)" >> $seqres.full
+        validated=true
+    elif [ "$cr_nohandle" -eq "$cr_cached" ]; then
+        echo "nohandlecache: same Creates in both modes (server may not cache dirs)" >> $seqres.full
+    fi
+fi
+
+if ! $validated; then
+    _notrun "could not validate nohandlecache (open_dirs empty + Stats unavailable; server may not support dir caching)"
+fi
+
+echo "nohandlecache functional OK"
+
+status=0
+exit

@@ -1,0 +1,192 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: AES-256-GCM encryption negotiation and I/O validation
+#
+# Behavior under test
+# - Enable the enable_gcm_256 module parameter, mount with -o seal, and
+#   verify the negotiated cipher is AES-256-GCM (0x0004) via DebugData.
+# - Perform basic write/read to confirm encrypted I/O works.
+# - Also test require_gcm_256: if set, mount must fail when server does
+#   not support AES-256-GCM (or succeed if it does).
+# - Restore module params on cleanup.
+#
+# Skip conditions
+# - Module param files not writable
+# - DebugData lacks cipher info
+# - Server doesn't support AES-256-GCM (test will _notrun, not _fail)
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+_host_from_unc() { echo "$1" | sed -E 's#^//([^/]+)/.*#\1#'; }
+_unc_windows() {
+    local h=$(_host_from_unc "$1")
+    local s=$(echo "$1" | sed -E 's#^//[^/]+/([^/]+).*#\1#')
+    printf "\\\\%s\\%s" "$h" "$s"
+}
+
+HOST=$(_host_from_unc "$TEST_DEV")
+UNCW=$(_unc_windows "$TEST_DEV")
+[ -n "$HOST" ] || _notrun "could not derive host"
+
+# Module param paths
+GCM_ENABLE="/sys/module/cifs/parameters/enable_gcm_256"
+GCM_REQUIRE="/sys/module/cifs/parameters/require_gcm_256"
+
+[ -w "$GCM_ENABLE" ] || _notrun "enable_gcm_256 module param not writable"
+[ -w "$GCM_REQUIRE" ] || _notrun "require_gcm_256 module param not writable"
+
+# Save original values for cleanup
+ORIG_ENABLE=$(cat "$GCM_ENABLE")
+ORIG_REQUIRE=$(cat "$GCM_REQUIRE")
+
+_register_cleanup "
+    _test_unmount >/dev/null 2>&1
+    echo $ORIG_ENABLE > $GCM_ENABLE 2>/dev/null
+    echo $ORIG_REQUIRE > $GCM_REQUIRE 2>/dev/null
+    rm -rf \"$TEST_DIR/cifs230.$$\" >/dev/null 2>&1
+"
+
+# Helper: extract cipher type from DebugData for our host
+_dd_cipher_for_host()
+{
+    local host="$1" snap
+    snap=$(cat /proc/fs/cifs/DebugData 2>/dev/null)
+    echo "$snap" >> $seqres.full
+    echo "$snap" | awk -v HOST="$host" '
+        BEGIN { tl=tolower(HOST); in_block=0; target=0 }
+        /^[[:space:]]*[0-9]+[)].*ConnectionId:/ {
+            if (in_block && target) exit
+            in_block=1; target=0; next
+        }
+        in_block {
+            line=tolower($0)
+            if (index(line, tl)>0) target=1
+            if (target && line ~ /cipher/) {
+                # Look for hex cipher value like 0x0004 or text like AES-256-GCM
+                if (match(line, /0x[0-9a-f]+/)) {
+                    print substr(line, RSTART, RLENGTH)
+                    exit
+                }
+                if (line ~ /aes.?256.?gcm/) { print "aes256gcm"; exit }
+                if (line ~ /aes.?128.?gcm/) { print "aes128gcm"; exit }
+                if (line ~ /aes.?128.?ccm/) { print "aes128ccm"; exit }
+                if (line ~ /aes.?256.?ccm/) { print "aes256ccm"; exit }
+            }
+        }
+    '
+}
+
+_test_unmount > /dev/null 2>&1
+
+# ============================================================
+# Phase 1: enable_gcm_256 + seal -> expect AES-256-GCM if server supports it
+# ============================================================
+echo "Y" > "$GCM_ENABLE"
+echo "N" > "$GCM_REQUIRE"
+echo "phase1: enable_gcm_256=Y require_gcm_256=N" >> $seqres.full
+
+_do "_test_mount -o seal" || _notrun "mount with seal failed (server may not support encryption)"
+
+# Light I/O
+W="$TEST_DIR/cifs230.$$"
+mkdir -p "$W" 2>>$seqres.full || true
+echo "gcm256_test_data" > "$W/testfile" 2>>$seqres.full || _fail "write under seal failed"
+content=$(cat "$W/testfile" 2>>$seqres.full) || _fail "read under seal failed"
+[ "$content" = "gcm256_test_data" ] || _fail "data mismatch: got '$content'"
+
+# Check negotiated cipher
+tries=10
+cipher=""
+while [ $tries -gt 0 ]; do
+    cipher=$(_dd_cipher_for_host "$HOST")
+    [ -n "$cipher" ] && break
+    tries=$((tries-1)); sleep 0.3
+done
+echo "phase1 cipher=$cipher" >> $seqres.full
+
+if [ -z "$cipher" ]; then
+    _notrun "DebugData lacks cipher info for $UNCW"
+fi
+
+# 0x0004 = SMB2_ENCRYPTION_AES256_GCM, 0x0002 = AES128_GCM
+gcm256_negotiated=false
+case "$cipher" in
+    0x0004|0x00004|*aes256gcm*) gcm256_negotiated=true ;;
+esac
+
+_test_unmount > /dev/null 2>&1
+
+# ============================================================
+# Phase 2: require_gcm_256 -> mount must negotiate AES-256-GCM or fail
+# ============================================================
+echo "Y" > "$GCM_REQUIRE"
+echo "phase2: require_gcm_256=Y" >> $seqres.full
+
+if _do "_test_mount -o seal" 2>>$seqres.full; then
+    # Mount succeeded -> cipher must be AES-256-GCM
+    cipher2=$(_dd_cipher_for_host "$HOST")
+    echo "phase2 cipher=$cipher2" >> $seqres.full
+
+    case "$cipher2" in
+        0x0004|0x00004|*aes256gcm*)
+            echo "require_gcm_256: correctly negotiated AES-256-GCM" >> $seqres.full
+            ;;
+        *)
+            _fail "require_gcm_256 set but negotiated cipher is $cipher2 (expected AES-256-GCM)"
+            ;;
+    esac
+
+    # Verify I/O works
+    echo "phase2_data" > "$W/testfile2" 2>>$seqres.full || _fail "write with require_gcm_256 failed"
+    _test_unmount > /dev/null 2>&1
+else
+    # Mount failed -> server doesn't support AES-256-GCM; that's expected behavior
+    echo "require_gcm_256: mount correctly refused (server lacks AES-256-GCM)" >> $seqres.full
+fi
+
+# ============================================================
+# Phase 3: disable gcm_256 -> should fall back to AES-128-GCM or CCM
+# ============================================================
+echo "N" > "$GCM_ENABLE"
+echo "N" > "$GCM_REQUIRE"
+echo "phase3: enable_gcm_256=N require_gcm_256=N" >> $seqres.full
+
+if _do "_test_mount -o seal" 2>>$seqres.full; then
+    cipher3=$(_dd_cipher_for_host "$HOST")
+    echo "phase3 cipher=$cipher3" >> $seqres.full
+
+    # Should NOT be AES-256-GCM since we disabled it
+    case "$cipher3" in
+        0x0004|0x00004|*aes256gcm*)
+            echo "WARNING: AES-256-GCM negotiated even with enable_gcm_256=N" >> $seqres.full
+            ;;
+        *)
+            echo "phase3: correctly fell back to $cipher3" >> $seqres.full
+            ;;
+    esac
+    _test_unmount > /dev/null 2>&1
+else
+    echo "phase3: mount with seal failed (server may not support any encryption)" >> $seqres.full
+fi
+
+# Restore
+echo "$ORIG_ENABLE" > "$GCM_ENABLE"
+echo "$ORIG_REQUIRE" > "$GCM_REQUIRE"
+
+if $gcm256_negotiated; then
+    echo "AES-256-GCM negotiated" >> $seqres.full
+else
+    echo "AES-256-GCM not negotiated (server offered $cipher)" >> $seqres.full
+fi
+
+echo "AES-256-GCM encryption negotiation and I/O OK"
+
+status=0
+exit

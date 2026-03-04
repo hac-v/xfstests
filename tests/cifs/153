@@ -20,6 +20,14 @@ DBG=/proc/fs/cifs/DebugData
 
 parse_credits() {
     local line max a
+    # Try new format: "Number of credits: N,N,N"
+    line=$(grep -m1 'Number of credits:' $DBG 2>/dev/null)
+    if [ -n "$line" ]; then
+        max=$(echo "$line" | sed 's/.*Number of credits:[[:space:]]*//' | cut -d, -f1)
+        a=0  # new format doesn't show active separately
+        [ -n "$max" ] && echo "$max $a" && return 0
+    fi
+    # Try old format: "Credits: Max: N Active: N"
     line=$(grep -m1 'Credits:' $DBG 2>/dev/null) || return 1
     max=$(echo "$line" | sed -n 's/.*Max:[[:space:]]*\([0-9]\+\).*/\1/p')
     a=$(echo "$line" | sed -n 's/.*Active:[[:space:]]*\([0-9]\+\).*/\1/p')

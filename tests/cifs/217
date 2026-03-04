@@ -1,0 +1,101 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: POSIX stat / fstat field consistency
+#
+# Behavior under test
+# - st_size reflects actual file size after write, truncate.
+# - st_nlink reflects link count after link/unlink.
+# - st_ino is stable across stat calls on the same file.
+# - st_blocks is non-negative and roughly proportional to st_size.
+# - Directory st_nlink reflects subdirectory count (if supported).
+#
+# Output
+# - Single success line; diagnostics go to $seqres.full.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs217.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# --- Test 1: st_size after write ---
+dd if=/dev/urandom of="$W/f1" bs=4096 count=10 2>>"$seqres.full" || _fail "create f1 failed"
+sz=$(stat -c %s "$W/f1")
+[ "$sz" -eq 40960 ] || _fail "st_size after write: expected 40960 got $sz"
+
+echo "cifs217: st_size write OK" >> "$seqres.full"
+
+# --- Test 2: st_size after truncate ---
+truncate -s 1234 "$W/f1" || _fail "truncate failed"
+sz=$(stat -c %s "$W/f1")
+[ "$sz" -eq 1234 ] || _fail "st_size after truncate: expected 1234 got $sz"
+
+echo "cifs217: st_size truncate OK" >> "$seqres.full"
+
+# --- Test 3: st_ino stability ---
+ino1=$(stat -c %i "$W/f1")
+ino2=$(stat -c %i "$W/f1")
+ino3=$(stat -c %i "$W/f1")
+[ "$ino1" = "$ino2" ] && [ "$ino2" = "$ino3" ] || \
+    _fail "inode not stable: $ino1 $ino2 $ino3"
+
+echo "cifs217: st_ino stable OK" >> "$seqres.full"
+
+# --- Test 4: st_nlink with hardlinks ---
+echo "linktest" > "$W/link_orig" || _fail "create link_orig failed"
+nlink=$(stat -c %h "$W/link_orig")
+[ "$nlink" -eq 1 ] || _fail "initial nlink: expected 1 got $nlink"
+
+ln "$W/link_orig" "$W/link_copy" 2>>"$seqres.full"
+if [ $? -eq 0 ]; then
+    nlink=$(stat -c %h "$W/link_orig")
+    [ "$nlink" -eq 2 ] || _fail "nlink after link: expected 2 got $nlink"
+
+    rm "$W/link_copy" || _fail "unlink link_copy failed"
+    nlink=$(stat -c %h "$W/link_orig")
+    [ "$nlink" -eq 1 ] || _fail "nlink after unlink: expected 1 got $nlink"
+
+    echo "cifs217: st_nlink hardlink OK" >> "$seqres.full"
+else
+    echo "cifs217: [skip] hardlink not supported, skipping nlink test" >> "$seqres.full"
+fi
+
+# --- Test 5: st_blocks is sane ---
+dd if=/dev/zero of="$W/f_blocks" bs=4096 count=16 2>>"$seqres.full" || _fail "create f_blocks failed"
+blocks=$(stat -c %b "$W/f_blocks")
+sz=$(stat -c %s "$W/f_blocks")
+# blocks should be > 0 for a non-empty file
+[ "$blocks" -gt 0 ] || _fail "st_blocks is 0 for a 64K file"
+
+echo "cifs217: st_blocks OK (size=$sz blocks=$blocks)" >> "$seqres.full"
+
+# --- Test 6: fstat matches stat ---
+python3 -c "
+import os, sys
+
+f = '$W/f_blocks'
+# stat via path
+st1 = os.stat(f)
+# fstat via fd
+fd = os.open(f, os.O_RDONLY)
+st2 = os.fstat(fd)
+os.close(fd)
+
+assert st1.st_size == st2.st_size, f'size mismatch: stat={st1.st_size} fstat={st2.st_size}'
+assert st1.st_ino == st2.st_ino, f'ino mismatch: stat={st1.st_ino} fstat={st2.st_ino}'
+assert st1.st_nlink == st2.st_nlink, f'nlink mismatch: stat={st1.st_nlink} fstat={st2.st_nlink}'
+" 2>>"$seqres.full" || _fail "fstat vs stat mismatch"
+
+echo "posix stat consistency OK"
+
+status=0
+exit

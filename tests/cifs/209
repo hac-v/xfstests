@@ -1,0 +1,85 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: POSIX mmap read/write semantics
+#
+# Behavior under test
+# - MAP_SHARED write via mmap is visible via read(2).
+# - read(2) data is visible via MAP_PRIVATE mmap.
+# - msync(MS_SYNC) flushes written mmap data to server.
+# - Data written via mmap survives close + reopen.
+#
+# Output
+# - Single success line; diagnostics go to $seqres.full.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs209.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# --- Test 1: MAP_SHARED write visible via read(2) ---
+dd if=/dev/zero of="$W/f1" bs=4096 count=1 2>>"$seqres.full" || _fail "create f1 failed"
+
+python3 -c "
+import mmap, os, sys
+fd = os.open('$W/f1', os.O_RDWR)
+m = mmap.mmap(fd, 4096, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+m[0:11] = b'HELLO MMAP!'
+m.flush()
+m.close()
+os.close(fd)
+" 2>>"$seqres.full" || _fail "mmap MAP_SHARED write failed"
+
+head_bytes=$(dd if="$W/f1" bs=1 count=11 2>/dev/null)
+[ "$head_bytes" = "HELLO MMAP!" ] || _fail "mmap write not visible via read: got '$head_bytes'"
+
+echo "cifs209: MAP_SHARED write OK" >> "$seqres.full"
+
+# --- Test 2: read(2) data visible via mmap read ---
+echo -n "READ_VIA_MMAP" > "$W/f2" || _fail "create f2 failed"
+
+got=$(python3 -c "
+import mmap, os
+fd = os.open('$W/f2', os.O_RDONLY)
+sz = os.fstat(fd).st_size
+m = mmap.mmap(fd, sz, mmap.MAP_PRIVATE, mmap.PROT_READ)
+print(m[:sz].decode(), end='')
+m.close()
+os.close(fd)
+" 2>>"$seqres.full") || _fail "mmap read failed"
+[ "$got" = "READ_VIA_MMAP" ] || _fail "mmap read mismatch: got '$got'"
+
+echo "cifs209: mmap read OK" >> "$seqres.full"
+
+# --- Test 3: msync + close + reopen persistence ---
+dd if=/dev/zero of="$W/f3" bs=4096 count=4 2>>"$seqres.full" || _fail "create f3 failed"
+
+python3 -c "
+import mmap, os
+fd = os.open('$W/f3', os.O_RDWR)
+m = mmap.mmap(fd, 4096, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+m[0:9] = b'PERSISTED'
+m.flush()   # msync
+m.close()
+os.close(fd)
+" 2>>"$seqres.full" || _fail "mmap persist write failed"
+
+# Drop caches to force re-read from server
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+got=$(dd if="$W/f3" bs=1 count=9 2>/dev/null)
+[ "$got" = "PERSISTED" ] || _fail "mmap data not persisted after reopen: got '$got'"
+
+echo "posix mmap read/write OK"
+
+status=0
+exit

@@ -1,0 +1,171 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: concurrent unlink + stat/open race — stale dentry regression
+#
+# Regression test for kernel commit:
+#   0af1561b2d60 ("smb: client: fix race with concurrent opens in unlink(2)")
+#
+# Bug: After unlink(2) sends the removal request but before it finishes
+# closing deferred handles and marking open handles as deleted, a concurrent
+# stat(2) or open(2) could see a stale dentry and report the deleted file
+# as still existing.
+#
+# Test:
+# 1. Create file, start concurrent stat() in a loop
+# 2. Unlink the file from another thread
+# 3. After unlink completes, stat must eventually return ENOENT
+# 4. Also: concurrent open+unlink — open should fail or succeed, not crash
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs284.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# --- Test 1: unlink + concurrent stat race ---
+python3 -c "
+import os, sys, threading, time, errno
+
+d = '$W'
+errors = []
+
+for iteration in range(50):
+    f = os.path.join(d, f'unlink_stat_{iteration}')
+
+    # Create file
+    with open(f, 'w') as fh:
+        fh.write(f'data_{iteration}')
+
+    stat_after_unlink = []
+    unlink_done = threading.Event()
+
+    def statter():
+        '''Rapidly stat the file before/during/after unlink'''
+        for _ in range(100):
+            try:
+                os.stat(f)
+            except FileNotFoundError:
+                stat_after_unlink.append(True)
+                return
+            except OSError:
+                pass
+        # If we get here, we never saw ENOENT — check if unlink happened
+        if unlink_done.is_set():
+            # Give a moment for cache to catch up
+            time.sleep(0.1)
+            try:
+                os.stat(f)
+                stat_after_unlink.append(False)  # BAD: file still visible
+            except FileNotFoundError:
+                stat_after_unlink.append(True)
+
+    t = threading.Thread(target=statter)
+    t.start()
+
+    # Small delay then unlink
+    time.sleep(0.001)
+    try:
+        os.unlink(f)
+    except FileNotFoundError:
+        pass
+    unlink_done.set()
+
+    t.join(timeout=5)
+
+    # After unlink + join, stat must return ENOENT
+    if os.path.exists(f):
+        errors.append(f'iteration {iteration}: file still exists after unlink!')
+
+if errors:
+    for e in errors[:5]:
+        print(f'STALE DENTRY: {e}', file=sys.stderr)
+    sys.exit(1)
+
+print(f'unlink+stat race: 50 iterations OK', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "unlink+stat race detected stale dentry"
+
+echo "cifs284: unlink+stat race OK" >> "$seqres.full"
+
+# --- Test 2: concurrent open + unlink (must not crash) ---
+python3 -c "
+import os, sys, threading, time
+
+d = '$W'
+crashes = []
+
+for iteration in range(50):
+    f = os.path.join(d, f'unlink_open_{iteration}')
+    with open(f, 'w') as fh:
+        fh.write(f'content_{iteration}')
+
+    def opener():
+        try:
+            fd = os.open(f, os.O_RDONLY)
+            os.read(fd, 100)
+            os.close(fd)
+        except (FileNotFoundError, OSError):
+            pass  # expected
+
+    def unlinker():
+        try:
+            os.unlink(f)
+        except (FileNotFoundError, OSError):
+            pass
+
+    t1 = threading.Thread(target=opener)
+    t2 = threading.Thread(target=unlinker)
+    t1.start()
+    t2.start()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+
+    # Clean up if still exists
+    try:
+        os.unlink(f)
+    except FileNotFoundError:
+        pass
+
+print(f'concurrent open+unlink: 50 iterations, no crash', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "concurrent open+unlink crashed"
+
+echo "cifs284: open+unlink race OK" >> "$seqres.full"
+
+# --- Test 3: unlink while fd is open, then stat via path ---
+python3 -c "
+import os, sys
+
+f = '$W/unlink_open_fd'
+fd = os.open(f, os.O_CREAT | os.O_RDWR, 0o644)
+os.write(fd, b'OPEN_FD_DATA')
+os.fsync(fd)
+
+# Unlink while fd is open
+os.unlink(f)
+
+# Path should be gone
+assert not os.path.exists(f), 'file still exists via path after unlink'
+
+# But fd should still work (delete-on-close semantics)
+os.lseek(fd, 0, os.SEEK_SET)
+data = os.read(fd, 100)
+os.close(fd)
+
+# After close, file is truly gone
+assert not os.path.exists(f), 'file reappeared after close'
+
+print(f'unlink-open-fd: data={data!r}', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "unlink while fd open failed"
+
+echo "concurrent unlink race regression OK"
+
+status=0
+exit

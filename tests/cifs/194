@@ -88,7 +88,7 @@ log_over="$logdir/pass_over.log"
 run_with_passes "$PASS_OVER" "" "$log_over"
 rc=$?
 cat "$log_over" >>$seqres.full 2>/dev/null || true
-[ $rc -ne 0 ] || _fail "mount.cifs accepted oversized password"
+[ $rc -ne 0 ] || _fail "mount.cifs accepted oversized password (exceeds MOUNT_PASSWD_SIZE=512 after comma escaping)"
 
 grep -q "Converted password too long" "$log_over" || _fail "missing overflow error for oversized password"
 
@@ -104,7 +104,7 @@ log_pass2_over="$logdir/pass2-over.log"
 run_with_passes "$BASEPASS" "$PASS2_OVER" "$log_pass2_over"
 rc=$?
 cat "$log_pass2_over" >>$seqres.full 2>/dev/null || true
-[ $rc -ne 0 ] || _fail "mount.cifs accepted oversized password2"
+[ $rc -ne 0 ] || _fail "mount.cifs accepted oversized password2 (exceeds MOUNT_PASSWD_SIZE=512 after comma escaping)"
 
 grep -q "Converted password too long" "$log_pass2_over" || _fail "missing overflow error for oversized password2"
 

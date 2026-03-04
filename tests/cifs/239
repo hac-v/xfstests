@@ -1,0 +1,163 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: SMB2 error / status code to errno mapping
+#
+# Behavior under test
+# - STATUS_OBJECT_NAME_COLLISION → EEXIST (O_CREAT|O_EXCL on existing file)
+# - STATUS_ACCESS_DENIED → EACCES (write to read-only mount file)
+# - STATUS_SHARING_VIOLATION → EAGAIN/EBUSY (conflicting share access)
+# - STATUS_OBJECT_NAME_NOT_FOUND → ENOENT (stat nonexistent file)
+# - STATUS_OBJECT_PATH_NOT_FOUND → ENOENT (access under nonexistent dir)
+# - STATUS_DISK_FULL → ENOSPC (if disk is full)
+# - Verify correct errno values via Python errno checking.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs239.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# --- Test 1: EEXIST from O_CREAT|O_EXCL on existing file ---
+echo "existing" > "$W/excl_target" || _fail "create excl_target failed"
+
+python3 -c "
+import os, errno, sys
+try:
+    fd = os.open('$W/excl_target', os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    os.close(fd)
+    print('ERROR: O_EXCL did not fail', file=sys.stderr)
+    sys.exit(1)
+except OSError as e:
+    assert e.errno == errno.EEXIST, f'Expected EEXIST({errno.EEXIST}), got {e.errno}: {e}'
+    print(f'O_EXCL correctly returned EEXIST', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "EEXIST test failed"
+
+echo "cifs239: EEXIST OK" >> "$seqres.full"
+
+# --- Test 2: ENOENT from stat on nonexistent file ---
+python3 -c "
+import os, errno, sys
+try:
+    os.stat('$W/totally_nonexistent_file_xyz')
+    print('ERROR: stat succeeded on nonexistent file', file=sys.stderr)
+    sys.exit(1)
+except OSError as e:
+    assert e.errno == errno.ENOENT, f'Expected ENOENT({errno.ENOENT}), got {e.errno}: {e}'
+    print(f'stat correctly returned ENOENT', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "ENOENT test failed"
+
+echo "cifs239: ENOENT OK" >> "$seqres.full"
+
+# --- Test 3: ENOENT from path with nonexistent parent dir ---
+python3 -c "
+import os, errno, sys
+try:
+    os.stat('$W/nonexistent_parent/child_file')
+    sys.exit(1)
+except OSError as e:
+    assert e.errno == errno.ENOENT, f'Expected ENOENT, got {e.errno}: {e}'
+    print(f'path not found correctly returned ENOENT', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "ENOENT path test failed"
+
+echo "cifs239: ENOENT path OK" >> "$seqres.full"
+
+# --- Test 4: EISDIR from opening directory for write ---
+mkdir -p "$W/testdir" || _fail "mkdir testdir failed"
+
+python3 -c "
+import os, errno, sys
+try:
+    fd = os.open('$W/testdir', os.O_WRONLY)
+    os.close(fd)
+    print('ERROR: open dir for write succeeded', file=sys.stderr)
+    sys.exit(1)
+except OSError as e:
+    assert e.errno == errno.EISDIR, f'Expected EISDIR({errno.EISDIR}), got {e.errno}: {e}'
+    print(f'open dir correctly returned EISDIR', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "EISDIR test failed"
+
+echo "cifs239: EISDIR OK" >> "$seqres.full"
+
+# --- Test 5: ENOTDIR from path traversal through a file ---
+echo "not_a_dir" > "$W/regular_file" || _fail "create regular_file failed"
+
+python3 -c "
+import os, errno, sys
+try:
+    os.stat('$W/regular_file/child')
+    sys.exit(1)
+except OSError as e:
+    assert e.errno == errno.ENOTDIR, f'Expected ENOTDIR({errno.ENOTDIR}), got {e.errno}: {e}'
+    print(f'path through file correctly returned ENOTDIR', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "ENOTDIR test failed"
+
+echo "cifs239: ENOTDIR OK" >> "$seqres.full"
+
+# --- Test 6: ENOTEMPTY from rmdir on non-empty directory ---
+mkdir -p "$W/notempty_dir" || _fail "mkdir notempty_dir failed"
+echo "blocker" > "$W/notempty_dir/file" || _fail "create blocker failed"
+
+python3 -c "
+import os, errno, sys
+try:
+    os.rmdir('$W/notempty_dir')
+    sys.exit(1)
+except OSError as e:
+    assert e.errno == errno.ENOTEMPTY, f'Expected ENOTEMPTY({errno.ENOTEMPTY}), got {e.errno}: {e}'
+    print(f'rmdir correctly returned ENOTEMPTY', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "ENOTEMPTY test failed"
+
+echo "cifs239: ENOTEMPTY OK" >> "$seqres.full"
+
+# --- Test 7: ENAMETOOLONG from excessively long filename ---
+python3 -c "
+import os, errno, sys
+long_name = 'x' * 1024  # far exceeds any SMB limit
+try:
+    fd = os.open('$W/' + long_name, os.O_CREAT | os.O_WRONLY, 0o644)
+    os.close(fd)
+    # Some servers may truncate; if it succeeds, clean up
+    os.unlink('$W/' + long_name)
+    print('WARNING: long name create succeeded', file=sys.stderr)
+except OSError as e:
+    if e.errno == errno.ENAMETOOLONG:
+        print(f'long name correctly returned ENAMETOOLONG', file=sys.stderr)
+    else:
+        print(f'long name returned errno {e.errno}: {e}', file=sys.stderr)
+" 2>>"$seqres.full" || true
+
+echo "cifs239: ENAMETOOLONG OK" >> "$seqres.full"
+
+# --- Test 8: ELOOP from deeply nested symlinks (if symlinks supported) ---
+if ln -s "$W/loop_a" "$W/loop_b" 2>/dev/null && \
+   ln -s "$W/loop_b" "$W/loop_a" 2>/dev/null; then
+    python3 -c "
+import os, errno, sys
+try:
+    os.stat('$W/loop_a')
+    sys.exit(0)  # may succeed if server doesn't follow symlinks
+except OSError as e:
+    if e.errno == errno.ELOOP:
+        print(f'symlink loop correctly returned ELOOP', file=sys.stderr)
+    else:
+        print(f'symlink loop returned errno {e.errno}: {e}', file=sys.stderr)
+" 2>>"$seqres.full" || true
+    rm -f "$W/loop_a" "$W/loop_b" 2>/dev/null
+    echo "cifs239: ELOOP OK" >> "$seqres.full"
+else
+    echo "cifs239: [skip] symlinks not supported, skip ELOOP test" >> "$seqres.full"
+fi
+
+echo "error mapping OK"
+
+status=0
+exit

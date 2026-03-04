@@ -1,0 +1,136 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: SMB3 compression data integrity
+#
+# Behavior under test
+# - Mount with compress=lz77 (or compress=lz77huff, compress=lznt1) to enable
+#   SMB3 compression (smb_compress() in compress.c).
+# - Write data, read back — verify integrity (compressed transport, same data).
+# - Write compressible data (zeros, repeated patterns) — exercises the
+#   compressibility heuristic (calc_byte_distribution).
+# - Write incompressible data (random) — kernel may skip compression.
+# - Large file compressed I/O integrity.
+# - Skip if server or kernel doesn't support SMB compression.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+
+M1=""
+_cleanup_248() {
+    [ -n "$M1" ] && _do "umount -l '$M1'" >/dev/null 2>&1 || true
+    [ -n "$M1" ] && rmdir "$M1" >/dev/null 2>&1 || true
+}
+_register_cleanup _cleanup_248
+
+_test_unmount >/dev/null 2>&1
+
+_strip_compress() {
+    echo "$1" | awk -F, '{
+        out=""
+        for(i=1;i<=NF;i++){
+            if($i ~ /^compress/) continue
+            out = out (out ? "," : "") $i
+        }
+        print out
+    }'
+}
+
+BASE=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+STRIPPED=$(_strip_compress "$BASE")
+
+# Try compression algorithms in order of preference
+COMPRESS_ALG=""
+for alg in "compress=lz77" "compress=lz77huff" "compress=lznt1" "compress"; do
+    MO="$STRIPPED"
+    [ -n "$MO" ] && MO="$MO,$alg" || MO="$alg"
+
+    M1=$(mktemp -d /tmp/cifs248.XXXXXX) || _fail "mktemp failed"
+    if _do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO'" 2>>"$seqres.full"; then
+        COMPRESS_ALG="$alg"
+        echo "cifs248: mounted with $alg" >> "$seqres.full"
+        break
+    fi
+    rmdir "$M1" 2>/dev/null
+    M1=""
+done
+
+[ -n "$COMPRESS_ALG" ] || _notrun "SMB3 compression not supported (server or kernel)"
+
+SUB="cifs248.$$.d"
+mkdir -p "$M1/$SUB" || _fail "mkdir workspace failed"
+
+# --- Test 1: compressible data (zeros) integrity ---
+F="$M1/$SUB/compressible"
+dd if=/dev/zero of="$F" bs=65536 count=8 2>>"$seqres.full" || _fail "write zeros failed"
+sync
+
+sz=$(stat -c %s "$F")
+[ "$sz" -eq 524288 ] || _fail "compressible file size: expected 524288 got $sz"
+
+# Read back and verify all zeros
+nonzero=$(dd if="$F" bs=65536 count=8 2>/dev/null | tr -d '\000' | wc -c)
+[ "$nonzero" -eq 0 ] || _fail "compressible read: $nonzero non-zero bytes"
+
+echo "cifs248: compressible data OK" >> "$seqres.full"
+
+# --- Test 2: repeated pattern data integrity ---
+F2="$M1/$SUB/pattern"
+python3 -c "
+data = (b'COMPRESS_ME!' * 10000)[:524288]
+with open('$M1/$SUB/pattern', 'wb') as f:
+    f.write(data)
+" 2>>"$seqres.full" || _fail "write pattern failed"
+
+md5_w=$(python3 -c "
+data = (b'COMPRESS_ME!' * 10000)[:524288]
+import hashlib
+print(hashlib.md5(data).hexdigest())
+")
+md5_r=$(md5sum < "$F2" | awk '{print $1}')
+[ "$md5_w" = "$md5_r" ] || _fail "pattern data md5 mismatch: $md5_w vs $md5_r"
+
+echo "cifs248: pattern data OK" >> "$seqres.full"
+
+# --- Test 3: incompressible data (random) integrity ---
+F3="$M1/$SUB/random"
+dd if=/dev/urandom of="$F3" bs=65536 count=8 2>>"$seqres.full" || _fail "write random failed"
+sync
+
+MD5_ORIG=$(md5sum < "$F3" | awk '{print $1}')
+
+# Drop caches and re-read
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+MD5_REREAD=$(md5sum < "$F3" | awk '{print $1}')
+[ "$MD5_ORIG" = "$MD5_REREAD" ] || _fail "random data md5 mismatch: $MD5_ORIG vs $MD5_REREAD"
+
+echo "cifs248: random data OK" >> "$seqres.full"
+
+# --- Test 4: large compressed I/O (4 MiB) ---
+F4="$M1/$SUB/large_compress"
+dd if=/dev/urandom of="$F4" bs=1048576 count=4 2>>"$seqres.full" || _fail "write large failed"
+sync
+MD5_L=$(md5sum < "$F4" | awk '{print $1}')
+
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+MD5_LR=$(md5sum < "$F4" | awk '{print $1}')
+[ "$MD5_L" = "$MD5_LR" ] || _fail "large compressed data mismatch"
+
+echo "cifs248: large compressed OK" >> "$seqres.full"
+
+# --- Test 5: verify compression stats (if available) ---
+if [ -r /proc/fs/cifs/Stats ]; then
+    echo "cifs248: Stats:" >> "$seqres.full"
+    grep -i "compress\|compr" /proc/fs/cifs/Stats >> "$seqres.full" 2>&1 || true
+fi
+
+echo "compression data integrity OK"
+
+status=0
+exit

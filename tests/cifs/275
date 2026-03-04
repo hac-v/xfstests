@@ -1,0 +1,233 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: directory lease performance — rsync workload with/without dir leases
+#
+# Kernel code exercised:
+# - cached_dir.c: open_cached_dir(), find_or_create_cached_dir(),
+#   is_valid_cached_dir(), close_cached_dir(), cached_dir_lease_break()
+# - smb2ops.c: dir lease acquisition in compound open+query
+# - Stats: QueryDirectories counter reduction with dir leases
+#
+# Strategy:
+# 1. Create a reproducible directory tree (100 dirs, 1000 files)
+# 2. Mount with directory leases (default) — rsync the tree, measure time
+# 3. Mount with nolease — rsync the same tree, measure time
+# 4. Compare QueryDirectories count and wall-clock time
+# 5. Dir leases should significantly reduce QueryDirectories and may
+#    improve elapsed time
+#
+# This is a performance/regression test. It doesn't hard-fail on speed
+# but reports the numbers and validates that dir leases reduce server calls.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto stress
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+[ -r /proc/fs/cifs/Stats ] || _notrun "requires /proc/fs/cifs/Stats"
+
+command -v rsync >/dev/null 2>&1 || _notrun "requires rsync"
+
+MA=""; MB=""
+_cleanup_275() {
+    [ -n "$MB" ] && umount -l "$MB" 2>/dev/null || true
+    [ -n "$MA" ] && umount -l "$MA" 2>/dev/null || true
+    [ -n "$MB" ] && rmdir "$MB" 2>/dev/null || true
+    [ -n "$MA" ] && rmdir "$MA" 2>/dev/null || true
+    rm -rf /tmp/cifs275_src.$$ 2>/dev/null || true
+}
+_register_cleanup _cleanup_275
+
+_test_unmount >/dev/null 2>&1
+
+_strip_lease_opts() {
+    echo "$1" | awk -F, '{
+        out=""
+        for(i=1;i<=NF;i++){
+            if($i ~ /^(nolease|lease|nosharesock|actimeo=)$/) continue
+            if($i ~ /^(nolease|nosharesock|actimeo=)/) continue
+            out = out (out ? "," : "") $i
+        }
+        print out
+    }'
+}
+
+BASE=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+CLEAN=$(_strip_lease_opts "$BASE")
+
+# --- Create reproducible source tree on local disk ---
+SRC="/tmp/cifs275_src.$$"
+echo "cifs275: creating source tree..." >> "$seqres.full"
+mkdir -p "$SRC"
+for d in $(seq 1 50); do
+    mkdir -p "$SRC/dir_$d"
+    for f in $(seq 1 20); do
+        echo "file_${d}_${f}_data" > "$SRC/dir_$d/file_$f.txt"
+    done
+done
+# Total: 50 dirs, 1000 files
+SRC_FILES=$(find "$SRC" -type f | wc -l)
+echo "cifs275: source tree: $SRC_FILES files" >> "$seqres.full"
+
+# Helper: get total QueryDirectories count from Stats
+_get_query_dirs() {
+    awk '/QueryDirectories:/ {split($2, a, " "); sum += a[1]} END {print sum+0}' \
+        /proc/fs/cifs/Stats 2>/dev/null
+}
+
+# Helper: reset Stats
+_reset_stats() {
+    echo 0 > /proc/fs/cifs/Stats 2>/dev/null || true
+    sleep 0.5
+}
+
+# ============================================================
+# Phase 1: Mount WITH directory leases (default) + rsync
+# ============================================================
+MO_LEASE="$CLEAN"
+[ -n "$MO_LEASE" ] && MO_LEASE="$MO_LEASE,nosharesock,actimeo=0" || MO_LEASE="nosharesock,actimeo=0"
+
+MA=$(mktemp -d /tmp/cifs275.lease.XXXXXX) || _fail "mktemp MA failed"
+_do "mount -t cifs '$TEST_DEV' '$MA' -o '$MO_LEASE'" 2>>"$seqres.full" || \
+    _fail "mount with leases failed"
+
+DEST_A="$MA/cifs275_lease.$$"
+mkdir -p "$DEST_A" || _fail "mkdir dest_a failed"
+
+_reset_stats
+sleep 1
+
+# Rsync with dir leases
+QD_BEFORE_A=$(_get_query_dirs "$MA")
+T_START_A=$(date +%s%N)
+
+rsync -a --delete "$SRC/" "$DEST_A/" >>"$seqres.full" 2>&1 || _fail "rsync (lease) failed"
+sync
+
+T_END_A=$(date +%s%N)
+QD_AFTER_A=$(_get_query_dirs "$MA")
+
+ELAPSED_A=$(( (T_END_A - T_START_A) / 1000000 ))  # milliseconds
+QD_LEASE=$((QD_AFTER_A - QD_BEFORE_A))
+
+echo "cifs275: WITH leases: rsync ${ELAPSED_A}ms, QueryDirs=$QD_LEASE" >> "$seqres.full"
+
+# Second rsync (should be fast — cached metadata)
+_reset_stats
+sleep 1
+QD_BEFORE_A2=$(_get_query_dirs "$MA")
+T_START_A2=$(date +%s%N)
+
+rsync -a --delete "$SRC/" "$DEST_A/" >>"$seqres.full" 2>&1
+sync
+
+T_END_A2=$(date +%s%N)
+QD_AFTER_A2=$(_get_query_dirs "$MA")
+
+ELAPSED_A2=$(( (T_END_A2 - T_START_A2) / 1000000 ))
+QD_LEASE2=$((QD_AFTER_A2 - QD_BEFORE_A2))
+
+echo "cifs275: WITH leases (2nd rsync): ${ELAPSED_A2}ms, QueryDirs=$QD_LEASE2" >> "$seqres.full"
+
+# Clean up lease mount
+rm -rf "$DEST_A" 2>/dev/null
+_do "umount '$MA'" 2>>"$seqres.full" || true
+
+# ============================================================
+# Phase 2: Mount WITHOUT directory leases (nolease) + rsync
+# ============================================================
+MO_NOLEASE="$CLEAN"
+[ -n "$MO_NOLEASE" ] && MO_NOLEASE="$MO_NOLEASE,nolease,nosharesock,actimeo=0" || MO_NOLEASE="nolease,nosharesock,actimeo=0"
+
+MB=$(mktemp -d /tmp/cifs275.nolease.XXXXXX) || _fail "mktemp MB failed"
+_do "mount -t cifs '$TEST_DEV' '$MB' -o '$MO_NOLEASE'" 2>>"$seqres.full" || {
+    rmdir "$MB" 2>/dev/null; MB=""
+    _notrun "nolease mount not supported"
+}
+
+DEST_B="$MB/cifs275_nolease.$$"
+mkdir -p "$DEST_B" || _fail "mkdir dest_b failed"
+
+_reset_stats
+sleep 1
+
+# Rsync without dir leases
+QD_BEFORE_B=$(_get_query_dirs "$MB")
+T_START_B=$(date +%s%N)
+
+rsync -a --delete "$SRC/" "$DEST_B/" >>"$seqres.full" 2>&1 || _fail "rsync (nolease) failed"
+sync
+
+T_END_B=$(date +%s%N)
+QD_AFTER_B=$(_get_query_dirs "$MB")
+
+ELAPSED_B=$(( (T_END_B - T_START_B) / 1000000 ))
+QD_NOLEASE=$((QD_AFTER_B - QD_BEFORE_B))
+
+echo "cifs275: WITHOUT leases: rsync ${ELAPSED_B}ms, QueryDirs=$QD_NOLEASE" >> "$seqres.full"
+
+# Second rsync (no caching — should still be slow)
+_reset_stats
+sleep 1
+QD_BEFORE_B2=$(_get_query_dirs "$MB")
+T_START_B2=$(date +%s%N)
+
+rsync -a --delete "$SRC/" "$DEST_B/" >>"$seqres.full" 2>&1
+sync
+
+T_END_B2=$(date +%s%N)
+QD_AFTER_B2=$(_get_query_dirs "$MB")
+
+ELAPSED_B2=$(( (T_END_B2 - T_START_B2) / 1000000 ))
+QD_NOLEASE2=$((QD_AFTER_B2 - QD_BEFORE_B2))
+
+echo "cifs275: WITHOUT leases (2nd rsync): ${ELAPSED_B2}ms, QueryDirs=$QD_NOLEASE2" >> "$seqres.full"
+
+# Clean up nolease mount
+rm -rf "$DEST_B" 2>/dev/null
+_do "umount '$MB'" 2>>"$seqres.full" || true
+rmdir "$MB" 2>/dev/null; MB=""
+rmdir "$MA" 2>/dev/null; MA=""
+
+# ============================================================
+# Analysis
+# ============================================================
+echo "" >> "$seqres.full"
+echo "=== Directory Lease Performance Summary ===" >> "$seqres.full"
+echo "Source: $SRC_FILES files in 50 directories" >> "$seqres.full"
+echo "" >> "$seqres.full"
+echo "First rsync (cold):" >> "$seqres.full"
+echo "  WITH leases:    ${ELAPSED_A}ms, QueryDirs=$QD_LEASE" >> "$seqres.full"
+echo "  WITHOUT leases: ${ELAPSED_B}ms, QueryDirs=$QD_NOLEASE" >> "$seqres.full"
+echo "" >> "$seqres.full"
+echo "Second rsync (warm):" >> "$seqres.full"
+echo "  WITH leases:    ${ELAPSED_A2}ms, QueryDirs=$QD_LEASE2" >> "$seqres.full"
+echo "  WITHOUT leases: ${ELAPSED_B2}ms, QueryDirs=$QD_NOLEASE2" >> "$seqres.full"
+
+# Validate: dir leases should reduce QueryDirectories on 2nd rsync
+if [ "$QD_LEASE2" -gt 0 ] && [ "$QD_NOLEASE2" -gt 0 ]; then
+    if [ "$QD_LEASE2" -lt "$QD_NOLEASE2" ]; then
+        savings=$(( (QD_NOLEASE2 - QD_LEASE2) * 100 / QD_NOLEASE2 ))
+        echo "" >> "$seqres.full"
+        echo "Dir lease QueryDirs reduction: ${savings}% ($QD_NOLEASE2 → $QD_LEASE2)" >> "$seqres.full"
+        echo "cifs275: dir leases reduced server calls by ${savings}%" >> "$seqres.full"
+    else
+        echo "" >> "$seqres.full"
+        echo "cifs275: [note] dir leases did not reduce QueryDirs ($QD_LEASE2 vs $QD_NOLEASE2)" >> "$seqres.full"
+    fi
+fi
+
+if [ "$ELAPSED_A2" -gt 0 ] && [ "$ELAPSED_B2" -gt 0 ]; then
+    if [ "$ELAPSED_A2" -lt "$ELAPSED_B2" ]; then
+        speedup=$(( (ELAPSED_B2 - ELAPSED_A2) * 100 / ELAPSED_B2 ))
+        echo "Dir lease time speedup: ${speedup}% (${ELAPSED_B2}ms → ${ELAPSED_A2}ms)" >> "$seqres.full"
+    fi
+fi
+
+echo "dir lease rsync perf OK"
+
+status=0
+exit

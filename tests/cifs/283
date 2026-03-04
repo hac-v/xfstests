@@ -1,0 +1,184 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: rename of open file — data loss regression test
+#
+# Regression test for kernel commits:
+#   c5ea3065586d ("smb: client: fix data loss due to broken rename(2)")
+#   d84291fc7453 ("smb: client: fix race with concurrent opens in rename(2)")
+#
+# Bug: Rename of open files in SMB2+ was broken, resulting in data loss —
+# the client failed rename(2) with -ENOENT and then removed the target file.
+# Also, a race between rename and concurrent opens could cause stale
+# dentries because deferred close + delete-on-close marking increased
+# the race window.
+#
+# Test:
+# 1. Open file, write data, rename while fd is still open → data preserved
+# 2. Concurrent open+rename on same file → no crash, no data loss
+# 3. Rename target exists + source is open → atomic replace, data intact
+# 4. Write through fd after rename → data appears at new name
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs283.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# --- Test 1: rename while file is open for writing ---
+python3 -c "
+import os, sys
+
+src = '$W/open_rename_src'
+dst = '$W/open_rename_dst'
+
+# Open and write
+fd = os.open(src, os.O_CREAT | os.O_RDWR, 0o644)
+os.write(fd, b'PRECIOUS_DATA_12345')
+os.fsync(fd)
+
+# Rename while fd is open — this is the bug: used to return ENOENT + delete target
+os.rename(src, dst)
+
+# Old name must not exist
+assert not os.path.exists(src), 'source still exists after rename'
+# New name must exist
+assert os.path.exists(dst), 'destination missing after rename'
+
+# Write more through the still-open fd
+os.write(fd, b'_AFTER_RENAME')
+os.fsync(fd)
+os.close(fd)
+
+# Read from new name — all data must be present
+with open(dst, 'rb') as f:
+    data = f.read()
+assert b'PRECIOUS_DATA_12345' in data, f'data lost after rename: {data!r}'
+assert b'_AFTER_RENAME' in data, f'post-rename write lost: {data!r}'
+
+print(f'rename-while-open OK: {data!r}', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "rename of open file caused data loss"
+
+echo "cifs283: rename-while-open OK" >> "$seqres.full"
+
+# --- Test 2: concurrent open + rename race ---
+python3 -c "
+import os, sys, threading, time
+
+d = '$W'
+errors = []
+
+def racer(iteration):
+    src = os.path.join(d, f'race_src_{iteration}')
+    dst = os.path.join(d, f'race_dst_{iteration}')
+    try:
+        # Create and write
+        fd = os.open(src, os.O_CREAT | os.O_RDWR, 0o644)
+        os.write(fd, f'race_data_{iteration}'.encode())
+        os.fsync(fd)
+
+        # Concurrent: another thread tries to open src while we rename
+        def opener():
+            try:
+                fd2 = os.open(src, os.O_RDONLY)
+                os.read(fd2, 100)
+                os.close(fd2)
+            except FileNotFoundError:
+                pass  # expected if rename wins the race
+            except OSError:
+                pass
+
+        t = threading.Thread(target=opener)
+        t.start()
+
+        # Rename
+        try:
+            os.rename(src, dst)
+        except OSError as e:
+            errors.append(f'rename {iteration}: {e}')
+
+        t.join(timeout=5)
+        os.close(fd)
+
+        # Verify: one of src or dst must exist with correct data
+        for path in [dst, src]:
+            if os.path.exists(path):
+                with open(path, 'rb') as f:
+                    data = f.read()
+                if f'race_data_{iteration}'.encode() not in data:
+                    errors.append(f'data loss in {path}')
+                break
+        else:
+            errors.append(f'BOTH src and dst missing for iteration {iteration}!')
+
+    except OSError as e:
+        errors.append(f'iteration {iteration}: {e}')
+
+# Run 50 iterations of the race
+threads = []
+for i in range(50):
+    t = threading.Thread(target=racer, args=(i,))
+    threads.append(t)
+    t.start()
+    if len(threads) >= 8:
+        for tt in threads:
+            tt.join(timeout=10)
+        threads = []
+
+for t in threads:
+    t.join(timeout=10)
+
+if errors:
+    for e in errors[:5]:
+        print(f'ERROR: {e}', file=sys.stderr)
+    sys.exit(1)
+
+print(f'concurrent open+rename: 50 iterations OK', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "concurrent open+rename race caused errors"
+
+echo "cifs283: concurrent rename race OK" >> "$seqres.full"
+
+# --- Test 3: rename over existing target while source is open ---
+python3 -c "
+import os, sys
+
+d = '$W'
+src = os.path.join(d, 'replace_src')
+dst = os.path.join(d, 'replace_dst')
+
+# Create target with old data
+with open(dst, 'w') as f:
+    f.write('OLD_TARGET_DATA')
+
+# Create source, keep open
+fd = os.open(src, os.O_CREAT | os.O_RDWR, 0o644)
+os.write(fd, b'NEW_SOURCE_DATA')
+os.fsync(fd)
+
+# Rename source over target (atomic replace)
+os.rename(src, dst)
+
+os.close(fd)
+
+# dst must have new data, not old
+with open(dst, 'rb') as f:
+    data = f.read()
+assert b'NEW_SOURCE_DATA' in data, f'atomic replace failed: {data!r}'
+assert b'OLD_TARGET_DATA' not in data, f'old data leaked: {data!r}'
+assert not os.path.exists(src), 'source still exists'
+
+print('rename-replace-while-open OK', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "rename-over-existing with open fd failed"
+
+echo "rename open file regression OK"
+
+status=0
+exit

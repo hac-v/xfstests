@@ -1,0 +1,206 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: cross-mount cache coherency
+#
+# Kernel code exercised:
+# - inode.c: cifs_revalidate_mapping(), cifs_invalidate_mapping()
+# - file.c: oplock/lease break triggers cache flush on remote write
+# - smb2misc.c: lease break notification handling between sessions
+#
+# Two mounts of the same share (nosharesock for separate sessions):
+# - Mount A (cache=strict): normal caching
+# - Mount B (cache=none): direct-to-server, no caching
+# - Write on A, read on B → B must see new data
+# - Write on B, read on A → A must see new data (after lease break)
+# - Metadata changes (size, mtime) must be visible cross-mount
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+
+# Set up two mounts with different cache modes
+BASE=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+
+_strip_cache_opts() {
+    echo "$1" | awk -F, '{
+        out=""
+        for(i=1;i<=NF;i++){
+            if($i ~ /^(cache=|nosharesock$|actimeo=)/) continue
+            out = out (out ? "," : "") $i
+        }
+        print out
+    }'
+}
+
+CLEAN=$(_strip_cache_opts "$BASE")
+
+MA=""; MB=""
+_cleanup_266() {
+    [ -n "$MB" ] && umount -l "$MB" 2>/dev/null || true
+    [ -n "$MA" ] && umount -l "$MA" 2>/dev/null || true
+    [ -n "$MB" ] && rmdir "$MB" 2>/dev/null || true
+    [ -n "$MA" ] && rmdir "$MA" 2>/dev/null || true
+}
+_register_cleanup _cleanup_266
+
+_test_unmount >/dev/null 2>&1
+
+# Mount A: cache=strict (normal caching)
+MO_A="$CLEAN"
+[ -n "$MO_A" ] && MO_A="$MO_A,cache=strict,nosharesock,actimeo=0" || MO_A="cache=strict,nosharesock,actimeo=0"
+
+MA=$(mktemp -d /tmp/cifs266.a.XXXXXX) || _fail "mktemp MA"
+_do "mount -t cifs '$TEST_DEV' '$MA' -o '$MO_A'" 2>>"$seqres.full" || _fail "mount A (strict) failed"
+
+# Mount B: cache=none (no caching, direct to server)
+MO_B="$CLEAN"
+[ -n "$MO_B" ] && MO_B="$MO_B,cache=none,nosharesock,actimeo=0" || MO_B="cache=none,nosharesock,actimeo=0"
+
+MB=$(mktemp -d /tmp/cifs266.b.XXXXXX) || _fail "mktemp MB"
+_do "mount -t cifs '$TEST_DEV' '$MB' -o '$MO_B'" 2>>"$seqres.full" || {
+    # cache=none may not be supported, try cache=loose
+    MO_B2="$CLEAN"
+    [ -n "$MO_B2" ] && MO_B2="$MO_B2,cache=loose,nosharesock,actimeo=0" || MO_B2="cache=loose,nosharesock,actimeo=0"
+    _do "mount -t cifs '$TEST_DEV' '$MB' -o '$MO_B2'" 2>>"$seqres.full" || {
+        rmdir "$MB" 2>/dev/null; MB=""
+        _fail "mount B failed"
+    }
+}
+
+SUB="cifs266.$$.d"
+mkdir -p "$MA/$SUB" || _fail "mkdir workspace failed"
+
+echo "cifs266: mount A=$MA (strict) mount B=$MB (none)" >> "$seqres.full"
+
+# --- Test 1: write on A, read on B (cached → uncached) ---
+FA="$MA/$SUB/coherent1"
+FB="$MB/$SUB/coherent1"
+
+echo "written_by_A" > "$FA" || _fail "write on A failed"
+sync
+
+got=$(cat "$FB" 2>>"$seqres.full")
+[ "$got" = "written_by_A" ] || _fail "A→B coherency: expected 'written_by_A' got '$got'"
+
+echo "cifs266: A→B write coherency OK" >> "$seqres.full"
+
+# --- Test 2: write on B, read on A (uncached → cached) ---
+FA2="$MA/$SUB/coherent2"
+FB2="$MB/$SUB/coherent2"
+
+echo "seed" > "$FA2" || _fail "seed file failed"
+sync
+cat "$FA2" >/dev/null  # populate A's cache
+
+echo "written_by_B" > "$FB2" || _fail "write on B failed"
+sync
+
+# A should see B's write (via lease break or revalidation)
+sleep 0.5  # brief pause for lease break to propagate
+got2=$(cat "$FA2" 2>>"$seqres.full")
+[ "$got2" = "written_by_B" ] || {
+    # Retry with cache drop
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    sleep 0.5
+    got2=$(cat "$FA2" 2>>"$seqres.full")
+    [ "$got2" = "written_by_B" ] || _fail "B→A coherency: expected 'written_by_B' got '$got2'"
+}
+
+echo "cifs266: B→A write coherency OK" >> "$seqres.full"
+
+# --- Test 3: size coherency (truncate on A, check stat on B) ---
+FA3="$MA/$SUB/size_test"
+FB3="$MB/$SUB/size_test"
+
+dd if=/dev/urandom of="$FA3" bs=4096 count=10 2>>"$seqres.full" || _fail "create size_test failed"
+sync
+
+sz_b_before=$(stat -c %s "$FB3" 2>>"$seqres.full")
+echo "cifs266: size before truncate: B sees $sz_b_before" >> "$seqres.full"
+
+truncate -s 1024 "$FA3" || _fail "truncate on A failed"
+sync
+sleep 0.5
+
+sz_b_after=$(stat -c %s "$FB3" 2>>"$seqres.full")
+echo "cifs266: size after truncate: B sees $sz_b_after (expect 1024)" >> "$seqres.full"
+[ "$sz_b_after" -eq 1024 ] || {
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    sleep 0.5
+    sz_b_after=$(stat -c %s "$FB3")
+    [ "$sz_b_after" -eq 1024 ] || _fail "size coherency: expected 1024 got $sz_b_after"
+}
+
+echo "cifs266: size coherency OK" >> "$seqres.full"
+
+# --- Test 4: mtime coherency ---
+FA4="$MA/$SUB/mtime_test"
+FB4="$MB/$SUB/mtime_test"
+
+echo "mtime_seed" > "$FA4" || _fail "create mtime_test failed"
+sync
+sleep 1
+
+mt_before=$(stat -c %Y "$FB4" 2>>"$seqres.full")
+
+echo "mtime_update" >> "$FA4" || _fail "append mtime_test failed"
+sync
+sleep 0.5
+
+mt_after=$(stat -c %Y "$FB4" 2>>"$seqres.full")
+echo "cifs266: mtime before=$mt_before after=$mt_after" >> "$seqres.full"
+[ "$mt_after" -ge "$mt_before" ] || \
+    echo "cifs266: [note] mtime did not advance on B (cache delay)" >> "$seqres.full"
+
+echo "cifs266: mtime coherency OK" >> "$seqres.full"
+
+# --- Test 5: rapid alternating writes ---
+FA5="$MA/$SUB/alternate"
+FB5="$MB/$SUB/alternate"
+
+: > "$FA5" || _fail "create alternate failed"
+
+for i in $(seq 1 10); do
+    echo "A_$i" >> "$FA5"
+    sync
+    echo "B_$i" >> "$FB5"
+    sync
+done
+
+# Both sides' writes should be present
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+lines=$(wc -l < "$FA5")
+echo "cifs266: alternating writes: $lines lines (expect ~20)" >> "$seqres.full"
+
+# At least some data should survive
+[ "$lines" -ge 10 ] || _fail "alternating writes: only $lines lines"
+
+# --- Test 6: create on A, readdir on B ---
+DIR_A="$MA/$SUB/newdir"
+DIR_B="$MB/$SUB/newdir"
+
+mkdir "$DIR_A" || _fail "mkdir on A failed"
+for i in $(seq 1 5); do
+    echo "f$i" > "$DIR_A/file_$i"
+done
+sync
+sleep 0.5
+
+count_b=$(ls -1 "$DIR_B" 2>>"$seqres.full" | wc -l)
+echo "cifs266: create on A, readdir on B: $count_b files (expect 5)" >> "$seqres.full"
+[ "$count_b" -eq 5 ] || {
+    sleep 1
+    count_b=$(ls -1 "$DIR_B" | wc -l)
+    [ "$count_b" -eq 5 ] || _fail "cross-mount readdir: expected 5 got $count_b"
+}
+
+echo "cross-mount cache coherency OK"
+
+status=0
+exit

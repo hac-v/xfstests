@@ -1,0 +1,133 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: Kerberos (sec=krb5) negative path and option parsing
+#
+# Behavior under test
+# - sec=krb5 mount without a valid Kerberos ticket should fail cleanly
+#   (EACCES, ENXIO, or similar) — not hang, crash, or cause a kernel oops.
+# - Invalid sec= values (e.g. sec=garbage) should be rejected at mount time.
+# - upcall_target= mount option should be accepted by the parser even if
+#   authentication ultimately fails.
+# - Validates the SPNEGO upcall error path in sess.c / cifs_spnego.
+#
+# Prerequisites
+# - CIFS module loaded (FSTYP=cifs).
+# - No valid Kerberos ticket (we destroy any cached tickets for safety).
+# - Does NOT require a KDC or Kerberos infrastructure.
+#
+# Skip conditions
+# - Not CIFS
+# - Not root
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+_register_cleanup "rm -rf /tmp/cifs290_mnt.$$ 2>/dev/null; true"
+
+MNT="/tmp/cifs290_mnt.$$"
+mkdir -p "$MNT"
+
+# Save and clear any existing Kerberos tickets so sec=krb5 will definitely fail
+ORIG_KRB5CCNAME="${KRB5CCNAME:-}"
+export KRB5CCNAME="/tmp/cifs290_empty_cc.$$"
+rm -f "$KRB5CCNAME" 2>/dev/null
+
+# Extract server UNC and base credentials from existing config
+# We only need the UNC; password is irrelevant for krb5 mount attempts
+UNC="$TEST_DEV"
+
+# ============================================================
+# Test 1: sec=krb5 mount fails cleanly without a ticket
+# ============================================================
+echo "test1: sec=krb5 without ticket" >> $seqres.full
+
+dmesg_before=$(dmesg | wc -l)
+
+# Attempt mount — should fail but not hang (timeout 30s safety net)
+timeout 30 mount -t cifs "$UNC" "$MNT" -o sec=krb5,user=nonexistent 2>>"$seqres.full"
+rc=$?
+echo "test1: mount rc=$rc" >> $seqres.full
+
+# rc should be non-zero (mount failed)
+if [ $rc -eq 0 ]; then
+    umount "$MNT" 2>/dev/null
+    # Unexpected success — maybe server allows anonymous krb5?
+    echo "test1: mount unexpectedly succeeded (server may accept any krb5)" >> $seqres.full
+fi
+
+# Check no kernel oops/panic/BUG in dmesg since our attempt
+dmesg_after=$(dmesg | wc -l)
+new_lines=$((dmesg_after - dmesg_before))
+if [ $new_lines -gt 0 ]; then
+    dmesg | tail -n "$new_lines" > /tmp/cifs290_dmesg.$$ 2>/dev/null
+    if grep -qiE 'BUG:|kernel panic|Oops:|RIP:|general protection fault' /tmp/cifs290_dmesg.$$; then
+        cat /tmp/cifs290_dmesg.$$ >> $seqres.full
+        _fail "kernel oops/BUG detected after sec=krb5 mount failure"
+    fi
+    rm -f /tmp/cifs290_dmesg.$$
+fi
+echo "test1: no kernel crash — PASS" >> $seqres.full
+
+# ============================================================
+# Test 2: sec=garbage is rejected
+# ============================================================
+echo "test2: sec=garbage" >> $seqres.full
+
+timeout 10 mount -t cifs "$UNC" "$MNT" -o sec=garbage,user=nonexistent 2>>"$seqres.full"
+rc=$?
+echo "test2: mount rc=$rc" >> $seqres.full
+
+if [ $rc -eq 0 ]; then
+    umount "$MNT" 2>/dev/null
+    _fail "mount with sec=garbage unexpectedly succeeded"
+fi
+echo "test2: invalid sec= rejected — PASS" >> $seqres.full
+
+# ============================================================
+# Test 3: upcall_target= option is parsed (even if mount fails)
+# ============================================================
+echo "test3: upcall_target=app" >> $seqres.full
+
+# This should fail auth but NOT fail with "unknown mount option"
+err_out=$(timeout 10 mount -t cifs "$UNC" "$MNT" \
+    -o sec=krb5,upcall_target=app,user=nonexistent 2>&1)
+rc=$?
+echo "test3: mount rc=$rc err='$err_out'" >> $seqres.full
+
+# If mount complained about unknown option, that's a regression
+if echo "$err_out" | grep -qi "unknown.*option.*upcall_target\|invalid.*option.*upcall_target"; then
+    _fail "upcall_target= not recognized as valid mount option"
+fi
+[ $rc -eq 0 ] && umount "$MNT" 2>/dev/null
+echo "test3: upcall_target parsed OK — PASS" >> $seqres.full
+
+# ============================================================
+# Test 4: sec=krb5i and sec=krb5p also fail cleanly
+# ============================================================
+for sectype in krb5i krb5p; do
+    echo "test4: sec=$sectype" >> $seqres.full
+    timeout 10 mount -t cifs "$UNC" "$MNT" -o sec=$sectype,user=nonexistent 2>>"$seqres.full"
+    rc=$?
+    echo "test4: sec=$sectype rc=$rc" >> $seqres.full
+    [ $rc -eq 0 ] && umount "$MNT" 2>/dev/null
+done
+
+# Restore original KRB5CCNAME
+if [ -n "$ORIG_KRB5CCNAME" ]; then
+    export KRB5CCNAME="$ORIG_KRB5CCNAME"
+else
+    unset KRB5CCNAME
+fi
+rm -f /tmp/cifs290_empty_cc.$$ 2>/dev/null
+
+echo "Kerberos negative path and option parsing OK"
+
+status=0
+exit

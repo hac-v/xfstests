@@ -1,0 +1,111 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: smbinfo comprehensive — exercise all CIFS_QUERY_INFO subcommands
+#
+# Kernel code exercised:
+# - ioctl.c: CIFS_QUERY_INFO passthrough handler
+# - smb2ops.c: smb2_query_info_compound() for each InfoType/FileInfoClass
+# - smb2pdu.c: SMB2_query_info() PDU construction
+#
+# Uses the smbinfo Python tool from cifs-utils to exercise every
+# QUERY_INFO subcommand: fileallinfo, filebasicinfo, filestandardinfo,
+# fileinternalinfo, fileeainfo, fileaccessinfo, filealigninfo,
+# filemodeinfo, filepositioninfo, filefsfullsizeinfo, filestreaminfo,
+# fsctl-getobjid, getcompression, secdesc
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+# Find smbinfo
+SMBINFO=""
+for p in /home/bharathsm/cifs-utils/smbinfo /usr/bin/smbinfo /usr/sbin/smbinfo; do
+    [ -x "$p" ] && SMBINFO="$p" && break
+done
+[ -n "$SMBINFO" ] || _notrun "smbinfo not found"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs270.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+F="$W/query_test"
+echo "smbinfo_test_data" > "$F" || _fail "create file failed"
+
+D="$W/query_dir"
+mkdir "$D" || _fail "mkdir query_dir failed"
+
+passed=0
+failed=0
+skipped=0
+
+_run_smbinfo() {
+    local cmd="$1"
+    local target="$2"
+    local label="$3"
+
+    echo "cifs270: testing smbinfo $cmd on $label..." >> "$seqres.full"
+    out=$("$SMBINFO" "$cmd" "$target" 2>>"$seqres.full")
+    rc=$?
+    if [ $rc -eq 0 ] && [ -n "$out" ]; then
+        echo "$out" >> "$seqres.full"
+        echo "cifs270: $cmd OK" >> "$seqres.full"
+        passed=$((passed + 1))
+        return 0
+    else
+        echo "cifs270: $cmd failed (rc=$rc)" >> "$seqres.full"
+        failed=$((failed + 1))
+        return 1
+    fi
+}
+
+# --- Test all smbinfo subcommands on a file ---
+for cmd in fileallinfo filebasicinfo filestandardinfo fileinternalinfo \
+           fileeainfo fileaccessinfo filealigninfo filemodeinfo \
+           filepositioninfo filefsfullsizeinfo filestreaminfo \
+           fsctl-getobjid getcompression secdesc; do
+    _run_smbinfo "$cmd" "$F" "file" || true
+done
+
+# --- Test on a directory too ---
+for cmd in fileallinfo filebasicinfo filestandardinfo secdesc; do
+    _run_smbinfo "$cmd" "$D" "dir" || true
+done
+
+echo "cifs270: passed=$passed failed=$failed" >> "$seqres.full"
+
+# --- Validate specific field values from fileallinfo ---
+allinfo=$("$SMBINFO" fileallinfo "$F" 2>>"$seqres.full") || true
+if [ -n "$allinfo" ]; then
+    echo "cifs270: fileallinfo output:" >> "$seqres.full"
+    echo "$allinfo" >> "$seqres.full"
+
+    # Verify file size is reported
+    echo "$allinfo" | grep -qi "size\|length\|allocation" && \
+        echo "cifs270: fileallinfo has size info" >> "$seqres.full"
+fi
+
+# --- Validate filestreaminfo (may show NTFS alternate data streams) ---
+streaminfo=$("$SMBINFO" filestreaminfo "$F" 2>>"$seqres.full") || true
+if [ -n "$streaminfo" ]; then
+    echo "cifs270: filestreaminfo:" >> "$seqres.full"
+    echo "$streaminfo" >> "$seqres.full"
+    # Default stream should be ::$DATA or similar
+    echo "$streaminfo" | grep -qi "DATA\|stream" && \
+        echo "cifs270: default stream present" >> "$seqres.full"
+fi
+
+# At least half the commands should work
+total=$((passed + failed))
+[ "$passed" -ge 5 ] || _fail "only $passed of $total smbinfo commands succeeded"
+
+echo "smbinfo comprehensive OK"
+
+status=0
+exit

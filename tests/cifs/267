@@ -1,0 +1,217 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: Unicode / i18n filename stress
+#
+# Kernel code exercised:
+# - cifs_unicode.c (645 lines): cifs_from_utf16(), cifs_utf16_bytes(),
+#   cifs_strtoUTF16(), UniStrnlen(), UniToupper()
+# - dir.c: cifs_lookup(), cifs_create(), cifs_mkdir() with unicode names
+# - readdir.c: parsing unicode filenames from QUERY_DIRECTORY responses
+#
+# Tests CJK characters, emoji (4-byte UTF-8), Cyrillic, Arabic, mixed scripts,
+# zero-width characters, NFC/NFD forms, and names near the SMB path limit.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs267.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# --- Test 1: CJK characters (Chinese, Japanese, Korean) ---
+python3 -c "
+import os, sys
+
+d = '$W'
+names = {
+    'chinese': '中文测试文件',
+    'japanese': 'テスト日本語ファイル',
+    'korean': '한국어테스트파일',
+    'mixed_cjk': '中文_テスト_한국어',
+}
+
+for label, name in names.items():
+    path = os.path.join(d, name)
+    try:
+        with open(path, 'w') as f:
+            f.write(f'content_{label}')
+        # Read back
+        with open(path, 'r') as f:
+            data = f.read()
+        assert data == f'content_{label}', f'{label}: read {data!r}'
+        # Verify via listdir
+        assert name in os.listdir(d), f'{label}: not in listdir'
+        print(f'{label} OK', file=sys.stderr)
+    except OSError as e:
+        print(f'{label} SKIP: {e}', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "CJK test failed"
+
+echo "cifs267: CJK OK" >> "$seqres.full"
+
+# --- Test 2: Emoji (4-byte UTF-8 / surrogate pairs in UTF-16) ---
+python3 -c "
+import os, sys
+
+d = '$W'
+emoji_names = [
+    '🎉party',
+    'fire🔥file',
+    '🇺🇸flag',
+    '❤️heart',
+    '🏠home_dir',
+    '🎵🎶music',
+]
+
+ok = 0
+for name in emoji_names:
+    path = os.path.join(d, name)
+    try:
+        with open(path, 'w') as f:
+            f.write('emoji_data')
+        with open(path, 'r') as f:
+            assert f.read() == 'emoji_data'
+        ok += 1
+    except OSError as e:
+        print(f'emoji {name!r}: {e}', file=sys.stderr)
+
+print(f'emoji: {ok}/{len(emoji_names)} passed', file=sys.stderr)
+assert ok >= 1, 'no emoji filenames worked'
+" 2>>"$seqres.full" || _fail "emoji test failed"
+
+echo "cifs267: emoji OK" >> "$seqres.full"
+
+# --- Test 3: Cyrillic, Arabic, Hebrew, Thai ---
+python3 -c "
+import os, sys
+
+d = '$W'
+scripts = {
+    'cyrillic': 'Тестовый_файл',
+    'arabic': 'ملف_اختبار',
+    'hebrew': 'קובץ_בדיקה',
+    'thai': 'ไฟล์ทดสอบ',
+    'greek': 'αρχείο_δοκιμής',
+    'devanagari': 'परीक्षा_फ़ाइल',
+}
+
+ok = 0
+for label, name in scripts.items():
+    path = os.path.join(d, name)
+    try:
+        with open(path, 'w') as f:
+            f.write(label)
+        with open(path, 'r') as f:
+            assert f.read() == label
+        ok += 1
+    except OSError as e:
+        print(f'{label}: {e}', file=sys.stderr)
+
+print(f'scripts: {ok}/{len(scripts)} passed', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "multi-script test failed"
+
+echo "cifs267: multi-script OK" >> "$seqres.full"
+
+# --- Test 4: mixed ASCII + Unicode in same name ---
+python3 -c "
+import os, sys
+
+d = '$W'
+mixed = [
+    'report_2024_年度報告.txt',
+    'données_été_2024.csv',
+    'ñoño_file.dat',
+    'café_résumé.pdf',
+    'naïve_über_file',
+]
+
+ok = 0
+for name in mixed:
+    try:
+        path = os.path.join(d, name)
+        with open(path, 'w') as f:
+            f.write('mixed')
+        with open(path, 'r') as f:
+            assert f.read() == 'mixed'
+        ok += 1
+    except OSError as e:
+        print(f'mixed {name!r}: {e}', file=sys.stderr)
+
+print(f'mixed: {ok}/{len(mixed)} passed', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "mixed name test failed"
+
+echo "cifs267: mixed ASCII+unicode OK" >> "$seqres.full"
+
+# --- Test 5: edge cases — zero-width, combining chars ---
+python3 -c "
+import os, sys
+
+d = '$W'
+edge = {
+    'combining_accent': 'e\u0301file',  # e + combining acute = é
+    'zero_width_joiner': 'a\u200Db',    # a + ZWJ + b
+    'bom_in_name': '\uFEFFbom_file',    # BOM character
+    'rtl_override': '\u202Ertl_file',   # RTL override
+}
+
+ok = 0
+for label, name in edge.items():
+    try:
+        path = os.path.join(d, name)
+        with open(path, 'w') as f:
+            f.write(label)
+        # Read back
+        with open(path, 'r') as f:
+            data = f.read()
+        assert data == label, f'{label}: {data!r}'
+        ok += 1
+    except OSError as e:
+        print(f'{label}: {e}', file=sys.stderr)
+
+print(f'edge cases: {ok}/{len(edge)} passed', file=sys.stderr)
+" 2>>"$seqres.full" || true  # edge cases may fail, that's informational
+
+echo "cifs267: edge cases done" >> "$seqres.full"
+
+# --- Test 6: long unicode name (near SMB MAX_PATH) ---
+python3 -c "
+import os, sys
+
+d = '$W'
+# SMB max filename component is ~255 chars; try 200 unicode chars
+long_name = '文' * 100  # 100 CJK chars = 300 UTF-8 bytes, 200 UTF-16 bytes
+try:
+    path = os.path.join(d, long_name)
+    with open(path, 'w') as f:
+        f.write('long_unicode')
+    with open(path, 'r') as f:
+        assert f.read() == 'long_unicode'
+    print(f'long unicode ({len(long_name)} chars) OK', file=sys.stderr)
+except OSError as e:
+    print(f'long unicode: {e}', file=sys.stderr)
+" 2>>"$seqres.full" || true
+
+echo "cifs267: long unicode done" >> "$seqres.full"
+
+# --- Test 7: readdir returns all unicode files correctly ---
+python3 -c "
+import os, sys
+
+d = '$W'
+entries = os.listdir(d)
+print(f'total entries: {len(entries)}', file=sys.stderr)
+# We created ~25+ files across all tests; verify reasonable count
+assert len(entries) >= 15, f'readdir too few: {len(entries)}'
+" 2>>"$seqres.full" || _fail "unicode readdir count failed"
+
+echo "unicode/i18n filename stress OK"
+
+status=0
+exit

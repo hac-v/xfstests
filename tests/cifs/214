@@ -1,0 +1,120 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: POSIX lseek semantics
+#
+# Behavior under test
+# - lseek(SEEK_SET): absolute positioning.
+# - lseek(SEEK_CUR): relative positioning.
+# - lseek(SEEK_END): position relative to file end.
+# - lseek past EOF extends the readable range (reads zeros).
+# - Optionally tests SEEK_HOLE/SEEK_DATA if supported.
+#
+# Output
+# - Single success line; diagnostics go to $seqres.full.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs214.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# --- Test 1: SEEK_SET, SEEK_CUR, SEEK_END ---
+python3 -c "
+import os
+
+f = '$W/f1'
+fd = os.open(f, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644)
+os.write(fd, b'0123456789')  # 10 bytes
+
+# SEEK_SET to absolute offset
+pos = os.lseek(fd, 5, os.SEEK_SET)
+assert pos == 5, f'SEEK_SET: expected 5, got {pos}'
+data = os.read(fd, 5)
+assert data == b'56789', f'SEEK_SET read: expected 56789, got {data!r}'
+
+# SEEK_CUR: relative
+os.lseek(fd, 0, os.SEEK_SET)  # back to start
+os.read(fd, 3)                 # read 3, now at 3
+pos = os.lseek(fd, 2, os.SEEK_CUR)
+assert pos == 5, f'SEEK_CUR: expected 5, got {pos}'
+data = os.read(fd, 1)
+assert data == b'5', f'SEEK_CUR read: expected 5, got {data!r}'
+
+# SEEK_END: from end
+pos = os.lseek(fd, -3, os.SEEK_END)
+assert pos == 7, f'SEEK_END: expected 7, got {pos}'
+data = os.read(fd, 3)
+assert data == b'789', f'SEEK_END read: expected 789, got {data!r}'
+
+# SEEK_END to exactly the end
+pos = os.lseek(fd, 0, os.SEEK_END)
+assert pos == 10, f'SEEK_END(0): expected 10, got {pos}'
+
+os.close(fd)
+" 2>>"$seqres.full" || _fail "lseek basic test failed"
+
+echo "cifs214: lseek basic OK" >> "$seqres.full"
+
+# --- Test 2: lseek past EOF, write creates gap ---
+python3 -c "
+import os
+
+f = '$W/f2'
+fd = os.open(f, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644)
+os.write(fd, b'HEAD')      # 4 bytes at offset 0
+os.lseek(fd, 8192, os.SEEK_SET)
+os.write(fd, b'TAIL')      # 4 bytes at offset 8192
+
+# File size should be 8196
+sz = os.fstat(fd).st_size
+assert sz == 8196, f'expected size 8196, got {sz}'
+
+# Gap should be zeros
+os.lseek(fd, 4, os.SEEK_SET)
+gap = os.read(fd, 8188)
+nonzero = sum(1 for b in gap if b != 0)
+assert nonzero == 0, f'gap has {nonzero} non-zero bytes'
+
+os.close(fd)
+" 2>>"$seqres.full" || _fail "lseek past EOF test failed"
+
+echo "cifs214: lseek past EOF OK" >> "$seqres.full"
+
+# --- Test 3: SEEK_HOLE / SEEK_DATA (optional) ---
+python3 -c "
+import os, sys, errno
+
+f = '$W/f3'
+fd = os.open(f, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644)
+os.ftruncate(fd, 1048576)  # 1 MiB sparse file
+os.pwrite(fd, b'X' * 4096, 524288)  # write 4K at 512K
+
+SEEK_DATA = getattr(os, 'SEEK_DATA', 3)
+SEEK_HOLE = getattr(os, 'SEEK_HOLE', 4)
+
+try:
+    data_off = os.lseek(fd, 0, SEEK_DATA)
+    hole_off = os.lseek(fd, data_off, SEEK_HOLE)
+    print(f'SEEK_DATA={data_off} SEEK_HOLE={hole_off}', file=sys.stderr)
+except OSError as e:
+    if e.errno in (errno.ENXIO, errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTSUP):
+        print('SEEK_HOLE/SEEK_DATA not supported (OK)', file=sys.stderr)
+    else:
+        raise
+
+os.close(fd)
+" 2>>"$seqres.full" || true  # optional, don't fail
+
+echo "posix lseek OK"
+
+status=0
+exit

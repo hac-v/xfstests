@@ -1,0 +1,148 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: SMB2 quota query via CIFS_QUERY_INFO passthrough
+#
+# Kernel code exercised:
+# - ioctl.c: CIFS_QUERY_INFO handler with InfoType=4 (quota)
+# - smb2pdu.c: SMB2_query_info() with SMB2_O_INFO_QUOTA
+# - smb2ops.c: passthrough to server's quota subsystem
+#
+# Uses smb2-quota tool from cifs-utils or direct ioctl to query
+# user/group quota information from the server.
+# Skip if quotas are not supported or configured.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs272.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+F="$W/quota_test"
+echo "quota_data" > "$F" || _fail "create file failed"
+
+# --- Test 1: smb2-quota tool (if available) ---
+SMB2_QUOTA=""
+for p in /home/bharathsm/cifs-utils/smb2-quota /usr/bin/smb2-quota /usr/sbin/smb2-quota; do
+    [ -x "$p" ] && SMB2_QUOTA="$p" && break
+done
+
+quota_supported=false
+if [ -n "$SMB2_QUOTA" ]; then
+    echo "cifs272: testing smb2-quota tool..." >> "$seqres.full"
+    out=$("$SMB2_QUOTA" -l "$F" 2>>"$seqres.full") || true
+    echo "$out" >> "$seqres.full"
+
+    if [ -n "$out" ] && ! echo "$out" | grep -q "failed"; then
+        quota_supported=true
+        echo "cifs272: smb2-quota OK" >> "$seqres.full"
+    else
+        echo "cifs272: smb2-quota: no quota data or failed" >> "$seqres.full"
+    fi
+fi
+
+# --- Test 2: direct CIFS_QUERY_INFO ioctl for quota ---
+python3 -c "
+import fcntl, struct, os, sys
+
+CIFS_QUERY_INFO = 0xc018cf07
+
+fd = os.open('$F', os.O_RDONLY)
+try:
+    # InfoType=4 (SMB2_O_INFO_QUOTA), FileInfoClass=0
+    buf = bytearray(16384)
+    struct.pack_into('<IIIIII', buf, 0,
+        4,      # SMB2_O_INFO_QUOTA
+        0,      # FileInfoClass (unused for quota)
+        0,      # additional_info
+        0,      # flags
+        16,     # input_buffer_length (SID list input)
+        16000)  # output_buffer_length
+
+    # Quota input buffer: ReturnSingle=0, RestartScan=1
+    struct.pack_into('<bb', buf, 24, 0, 1)
+
+    try:
+        fcntl.ioctl(fd, CIFS_QUERY_INFO, buf)
+        out_len = struct.unpack_from('<I', buf, 16)[0]
+        print(f'quota ioctl OK: output_len={out_len}', file=sys.stderr)
+
+        if out_len > 0:
+            # Parse first QuotaEntry: next_offset(4), SID_length(4), ...
+            next_off = struct.unpack_from('<I', buf, 24)[0]
+            sid_len = struct.unpack_from('<I', buf, 28)[0]
+            used = struct.unpack_from('<Q', buf, 40)[0]
+            threshold = struct.unpack_from('<Q', buf, 48)[0]
+            limit = struct.unpack_from('<Q', buf, 56)[0]
+            print(f'  used={used} threshold={threshold} limit={limit} sid_len={sid_len}', file=sys.stderr)
+        sys.exit(0)
+    except OSError as e:
+        import errno
+        if e.errno in (errno.EOPNOTSUPP, errno.EINVAL, errno.ENOTTY, errno.ENOSYS):
+            print(f'quota ioctl not supported: {e}', file=sys.stderr)
+            sys.exit(77)
+        print(f'quota ioctl: {e}', file=sys.stderr)
+        sys.exit(77)
+finally:
+    os.close(fd)
+" 2>>"$seqres.full"
+rc=$?
+
+if [ $rc -eq 77 ]; then
+    if $quota_supported; then
+        echo "cifs272: ioctl failed but smb2-quota tool worked" >> "$seqres.full"
+    else
+        echo "cifs272: [skip] quotas not supported" >> "$seqres.full"
+    fi
+else
+    echo "cifs272: quota ioctl OK" >> "$seqres.full"
+fi
+
+# --- Test 3: CIFS_DUMP_KEY and CIFS_DUMP_FULL_KEY ioctls ---
+python3 -c "
+import fcntl, struct, os, sys
+
+CIFS_DUMP_KEY      = 0xc03acf08
+CIFS_DUMP_FULL_KEY = 0xc011cf0a
+
+fd = os.open('$F', os.O_RDONLY)
+try:
+    # CIFS_DUMP_KEY
+    buf = bytearray(256)
+    try:
+        fcntl.ioctl(fd, CIFS_DUMP_KEY, buf)
+        session_id = struct.unpack_from('<Q', buf, 0)[0]
+        print(f'DUMP_KEY: session_id=0x{session_id:016x}', file=sys.stderr)
+        # Key material follows session_id
+        key_hex = buf[8:24].hex()
+        print(f'  key[0:16]={key_hex}', file=sys.stderr)
+    except OSError as e:
+        print(f'DUMP_KEY: {e}', file=sys.stderr)
+
+    # CIFS_DUMP_FULL_KEY
+    buf2 = bytearray(256)
+    try:
+        fcntl.ioctl(fd, CIFS_DUMP_FULL_KEY, buf2)
+        session_id2 = struct.unpack_from('<Q', buf2, 0)[0]
+        print(f'DUMP_FULL_KEY: session_id=0x{session_id2:016x}', file=sys.stderr)
+    except OSError as e:
+        print(f'DUMP_FULL_KEY: {e}', file=sys.stderr)
+
+finally:
+    os.close(fd)
+" 2>>"$seqres.full" || true
+
+echo "cifs272: key dump ioctls done" >> "$seqres.full"
+
+echo "SMB2 quota and key dump OK"
+
+status=0
+exit

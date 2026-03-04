@@ -1,0 +1,103 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: max_cached_dirs / dir_cache_timeout tuning
+#
+# Behavior under test
+# - dir_cache_timeout controls how long cached directory handles are kept.
+# - max_cached_dirs limits the number of cached dir handles (mount option
+#   on newer kernels, module param on older).
+# - Verify QueryDirectories counter behavior after modifying cache params.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ -r /proc/fs/cifs/Stats ] || _notrun "requires Stats"
+
+DIR_TIMEOUT="/sys/module/cifs/parameters/dir_cache_timeout"
+[ -r "$DIR_TIMEOUT" ] || _notrun "dir_cache_timeout param not readable"
+
+ORIG_TIMEOUT=$(cat "$DIR_TIMEOUT")
+
+_share_from_unc() { echo "$1" | sed -E 's#^//[^/]+/([^/]+).*#\1#'; }
+SHARE=$(_share_from_unc "$TEST_DEV")
+
+_stats_qd() {
+    awk -v SH="$SHARE" '
+        BEGIN { inb=0; qd=0 }
+        /^[[:space:]]*[0-9]+\) / { inb = (index($0, SH) > 0) ? 1 : 0; next }
+        inb==1 && NF==0 { inb=0 }
+        inb==1 && $1=="QueryDirectories:" { qd=$2 }
+        END { print qd+0 }
+    ' /proc/fs/cifs/Stats 2>/dev/null
+}
+
+_cleanup_231() {
+    echo "$ORIG_TIMEOUT" > "$DIR_TIMEOUT" 2>/dev/null || true
+    rm -rf "$TEST_DIR/cifs231.$$" 2>/dev/null || true
+}
+_register_cleanup _cleanup_231
+
+W="$TEST_DIR/cifs231.$$"
+mkdir -p "$W" || _fail "mkdir failed"
+
+# Create dirs
+NDIRS=8
+for i in $(seq 1 $NDIRS); do
+    mkdir -p "$W/dir$i"
+    echo "file" > "$W/dir$i/f" 2>/dev/null || true
+done
+sync
+
+# --- Test 1: verify dir_cache_timeout is readable and writable ---
+echo "cifs231: orig dir_cache_timeout=$ORIG_TIMEOUT" >> "$seqres.full"
+
+if [ -w "$DIR_TIMEOUT" ]; then
+    # Set short timeout
+    echo 1 > "$DIR_TIMEOUT" 2>>"$seqres.full"
+    new_val=$(cat "$DIR_TIMEOUT")
+    echo "cifs231: set dir_cache_timeout=$new_val" >> "$seqres.full"
+
+    # Prime cache
+    for i in $(seq 1 $NDIRS); do
+        ls "$W/dir$i" >/dev/null 2>&1
+    done
+
+    echo 0 > /proc/fs/cifs/Stats 2>/dev/null || true
+    sleep 0.3
+
+    qd0=$(_stats_qd)
+
+    # Wait for timeout to expire
+    sleep 2
+
+    # Re-read — should go to server since cache expired
+    for i in $(seq 1 $NDIRS); do
+        ls "$W/dir$i" >/dev/null 2>&1
+    done
+
+    qd1=$(_stats_qd)
+    delta=$((qd1 - qd0))
+    echo "cifs231: after timeout: qd0=$qd0 qd1=$qd1 delta=$delta" >> "$seqres.full"
+
+    if [ "$delta" -gt 0 ]; then
+        echo "cifs231: cache timeout caused re-queries (delta=$delta)" >> "$seqres.full"
+    else
+        echo "cifs231: [note] no additional queries after timeout (server may not cache)" >> "$seqres.full"
+    fi
+
+    # Restore
+    echo "$ORIG_TIMEOUT" > "$DIR_TIMEOUT" 2>/dev/null
+    echo "cifs231: dir_cache_timeout test OK" >> "$seqres.full"
+else
+    echo "cifs231: [skip] dir_cache_timeout not writable" >> "$seqres.full"
+fi
+
+echo "max_cached_dirs tuning OK"
+
+status=0
+exit

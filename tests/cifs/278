@@ -1,0 +1,228 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: copy_file_range vs cp — server-side copy performance
+#
+# Kernel code exercised:
+# - smb2ops.c: smb2_copychunk_range() → FSCTL_SRV_REQUEST_RESUME_KEY +
+#   FSCTL_SRV_COPYCHUNK_WRITE (server-side copy, zero network data transfer)
+# - file.c: cifs_copy_file_range() dispatch
+# - For cp: normal read() + write() path — all data crosses the network twice
+#
+# Strategy:
+# - Create a 64 MiB source file
+# - copy_file_range: copies via server-side COPYCHUNK (no data over network)
+# - cp: modern coreutils (8.30+) also uses copy_file_range internally,
+#   so it should also trigger COPYCHUNK. Older cp uses read()+write().
+# - dd: always uses read()+write() — true data-over-network baseline
+# - Measure: elapsed time, Reads/Writes/IOCTLs from Stats
+# - Expected: copy_file_range and modern cp both show IOCTLs (COPYCHUNK)
+#   with 0 Reads/Writes; dd shows Reads+Writes (data crosses network)
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto stress perf
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ -r /proc/fs/cifs/Stats ] || _notrun "requires /proc/fs/cifs/Stats"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+# Verify copy_file_range is available
+python3 -c "import os; assert hasattr(os, 'copy_file_range')" 2>/dev/null || \
+    _notrun "python3 os.copy_file_range not available (need Python 3.8+)"
+
+W="$TEST_DIR/cifs278.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+FILE_SIZE=$((64 * 1048576))  # 64 MiB
+
+# Helper: get Stats counters
+_get_reads() {
+    awk '/Reads:/ && !/ReadDir/ {split($2, a, " "); sum += a[1]} END {print sum+0}' \
+        /proc/fs/cifs/Stats 2>/dev/null
+}
+_get_writes() {
+    awk '/Writes:/ {split($2, a, " "); sum += a[1]} END {print sum+0}' \
+        /proc/fs/cifs/Stats 2>/dev/null
+}
+_get_ioctls() {
+    awk '/IOCTLs:/ {split($2, a, " "); sum += a[1]} END {print sum+0}' \
+        /proc/fs/cifs/Stats 2>/dev/null
+}
+_reset_stats() {
+    echo 0 > /proc/fs/cifs/Stats 2>/dev/null || true
+    sleep 0.5
+}
+
+# --- Create source file ---
+echo "cifs278: creating 64 MiB source file..." >> "$seqres.full"
+dd if=/dev/urandom of="$W/source.dat" bs=1048576 count=64 2>>"$seqres.full" || \
+    _fail "create source failed"
+sync
+SRC_MD5=$(md5sum < "$W/source.dat" | awk '{print $1}')
+echo "cifs278: source md5=$SRC_MD5" >> "$seqres.full"
+
+# ============================================================
+# Test 1: copy_file_range (server-side COPYCHUNK)
+# ============================================================
+echo "cifs278: Phase 1 — copy_file_range" >> "$seqres.full"
+_reset_stats
+
+READS_BEFORE=$(_get_reads)
+WRITES_BEFORE=$(_get_writes)
+IOCTLS_BEFORE=$(_get_ioctls)
+T_START=$(date +%s%N)
+
+python3 -c "
+import os, sys
+
+src = '$W/source.dat'
+dst = '$W/dst_cfr.dat'
+
+src_fd = os.open(src, os.O_RDONLY)
+dst_fd = os.open(dst, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+
+total = os.fstat(src_fd).st_size
+copied = 0
+while copied < total:
+    n = os.copy_file_range(src_fd, dst_fd, total - copied)
+    if n == 0:
+        break
+    copied += n
+
+os.close(src_fd)
+os.close(dst_fd)
+
+assert copied == total, f'copy_file_range: {copied}/{total}'
+print(f'copy_file_range: {copied} bytes', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "copy_file_range failed"
+
+sync
+T_END=$(date +%s%N)
+
+READS_AFTER=$(_get_reads)
+WRITES_AFTER=$(_get_writes)
+IOCTLS_AFTER=$(_get_ioctls)
+
+ELAPSED_CFR=$(( (T_END - T_START) / 1000000 ))
+READS_CFR=$((READS_AFTER - READS_BEFORE))
+WRITES_CFR=$((WRITES_AFTER - WRITES_BEFORE))
+IOCTLS_CFR=$((IOCTLS_AFTER - IOCTLS_BEFORE))
+
+# Verify integrity
+DST_MD5_CFR=$(md5sum < "$W/dst_cfr.dat" | awk '{print $1}')
+[ "$DST_MD5_CFR" = "$SRC_MD5" ] || _fail "copy_file_range md5 mismatch: $DST_MD5_CFR vs $SRC_MD5"
+
+echo "cifs278: copy_file_range: ${ELAPSED_CFR}ms, Reads=$READS_CFR, Writes=$WRITES_CFR, IOCTLs=$IOCTLS_CFR" >> "$seqres.full"
+
+rm -f "$W/dst_cfr.dat"
+
+# ============================================================
+# Test 2: cp (userspace read + write, data crosses network)
+# ============================================================
+echo "cifs278: Phase 2 — cp" >> "$seqres.full"
+_reset_stats
+
+READS_BEFORE2=$(_get_reads)
+WRITES_BEFORE2=$(_get_writes)
+IOCTLS_BEFORE2=$(_get_ioctls)
+T_START2=$(date +%s%N)
+
+cp "$W/source.dat" "$W/dst_cp.dat" 2>>"$seqres.full" || _fail "cp failed"
+sync
+
+T_END2=$(date +%s%N)
+
+READS_AFTER2=$(_get_reads)
+WRITES_AFTER2=$(_get_writes)
+IOCTLS_AFTER2=$(_get_ioctls)
+
+ELAPSED_CP=$(( (T_END2 - T_START2) / 1000000 ))
+READS_CP=$((READS_AFTER2 - READS_BEFORE2))
+WRITES_CP=$((WRITES_AFTER2 - WRITES_BEFORE2))
+IOCTLS_CP=$((IOCTLS_AFTER2 - IOCTLS_BEFORE2))
+
+# Verify integrity
+DST_MD5_CP=$(md5sum < "$W/dst_cp.dat" | awk '{print $1}')
+[ "$DST_MD5_CP" = "$SRC_MD5" ] || _fail "cp md5 mismatch: $DST_MD5_CP vs $SRC_MD5"
+
+echo "cifs278: cp: ${ELAPSED_CP}ms, Reads=$READS_CP, Writes=$WRITES_CP, IOCTLs=$IOCTLS_CP" >> "$seqres.full"
+
+rm -f "$W/dst_cp.dat"
+
+# ============================================================
+# Test 3: dd (another data-over-network baseline)
+# ============================================================
+echo "cifs278: Phase 3 — dd" >> "$seqres.full"
+_reset_stats
+
+READS_BEFORE3=$(_get_reads)
+WRITES_BEFORE3=$(_get_writes)
+T_START3=$(date +%s%N)
+
+dd if="$W/source.dat" of="$W/dst_dd.dat" bs=1048576 2>>"$seqres.full" || _fail "dd failed"
+sync
+
+T_END3=$(date +%s%N)
+
+READS_AFTER3=$(_get_reads)
+WRITES_AFTER3=$(_get_writes)
+
+ELAPSED_DD=$(( (T_END3 - T_START3) / 1000000 ))
+READS_DD=$((READS_AFTER3 - READS_BEFORE3))
+WRITES_DD=$((WRITES_AFTER3 - WRITES_BEFORE3))
+
+DST_MD5_DD=$(md5sum < "$W/dst_dd.dat" | awk '{print $1}')
+[ "$DST_MD5_DD" = "$SRC_MD5" ] || _fail "dd md5 mismatch"
+
+echo "cifs278: dd: ${ELAPSED_DD}ms, Reads=$READS_DD, Writes=$WRITES_DD" >> "$seqres.full"
+
+# ============================================================
+# Analysis
+# ============================================================
+echo "" >> "$seqres.full"
+echo "=== Server-Side Copy Performance Summary ===" >> "$seqres.full"
+echo "File size: 64 MiB" >> "$seqres.full"
+echo "" >> "$seqres.full"
+echo "copy_file_range: ${ELAPSED_CFR}ms  Reads=$READS_CFR Writes=$WRITES_CFR IOCTLs=$IOCTLS_CFR" >> "$seqres.full"
+echo "cp:              ${ELAPSED_CP}ms  Reads=$READS_CP Writes=$WRITES_CP IOCTLs=$IOCTLS_CP" >> "$seqres.full"
+echo "dd:              ${ELAPSED_DD}ms  Reads=$READS_DD Writes=$WRITES_DD" >> "$seqres.full"
+
+# copy_file_range should use IOCTLs (COPYCHUNK) instead of Reads+Writes
+if [ "$IOCTLS_CFR" -gt 0 ]; then
+    echo "" >> "$seqres.full"
+    echo "copy_file_range used $IOCTLS_CFR IOCTLs (COPYCHUNK) — server-side copy confirmed" >> "$seqres.full"
+fi
+
+if [ "$READS_CFR" -lt "$READS_CP" ] 2>/dev/null; then
+    read_savings=$(( (READS_CP - READS_CFR) * 100 / (READS_CP > 0 ? READS_CP : 1) ))
+    echo "copy_file_range saved ${read_savings}% network Reads ($READS_CP → $READS_CFR)" >> "$seqres.full"
+fi
+
+if [ "$ELAPSED_CFR" -gt 0 ] && [ "$ELAPSED_CP" -gt 0 ]; then
+    if [ "$ELAPSED_CFR" -lt "$ELAPSED_CP" ]; then
+        speedup=$(( (ELAPSED_CP - ELAPSED_CFR) * 100 / ELAPSED_CP ))
+        echo "copy_file_range ${speedup}% faster than cp (${ELAPSED_CP}ms → ${ELAPSED_CFR}ms)" >> "$seqres.full"
+    else
+        echo "cifs278: [note] copy_file_range not faster (local server, no network benefit)" >> "$seqres.full"
+    fi
+fi
+
+# Throughput
+if [ "$ELAPSED_CFR" -gt 0 ]; then
+    TPUT_CFR=$(( 64 * 1000 / ELAPSED_CFR ))
+    echo "copy_file_range throughput: ~${TPUT_CFR} MB/s" >> "$seqres.full"
+fi
+if [ "$ELAPSED_CP" -gt 0 ]; then
+    TPUT_CP=$(( 64 * 1000 / ELAPSED_CP ))
+    echo "cp throughput:              ~${TPUT_CP} MB/s" >> "$seqres.full"
+fi
+
+echo "copy_file_range vs cp perf OK"
+
+status=0
+exit

@@ -1,0 +1,142 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: Windows ACL ↔ POSIX mode mapping via cifsacl
+#
+# Behavior under test
+# - Mount with cifsacl: Windows DACLs are mapped to POSIX mode bits.
+# - parse_dacl() / access_flags_to_mode(): read permissions map correctly.
+# - mode_to_access_flags() / set_chmod_dacl(): chmod updates the DACL.
+# - Deny ACEs: a deny entry restricts access correctly.
+# - smbcacls (if available) can set/read Windows ACLs directly.
+# - Skip if cifsacl mount is not supported.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+
+M1=""
+_cleanup_246() {
+    [ -n "$M1" ] && _do "umount -l '$M1'" >/dev/null 2>&1 || true
+    [ -n "$M1" ] && rmdir "$M1" >/dev/null 2>&1 || true
+}
+_register_cleanup _cleanup_246
+
+_test_unmount >/dev/null 2>&1
+
+_strip_acl_opts() {
+    echo "$1" | awk -F, '{
+        out=""
+        for(i=1;i<=NF;i++){
+            if($i ~ /^(cifsacl|nocifsacl|noperm|perm|modefromsid)$/) continue
+            out = out (out ? "," : "") $i
+        }
+        print out
+    }'
+}
+
+BASE=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+STRIPPED=$(_strip_acl_opts "$BASE")
+MO="$STRIPPED"
+[ -n "$MO" ] && MO="$MO,cifsacl" || MO="cifsacl"
+
+M1=$(mktemp -d /tmp/cifs246.XXXXXX) || _fail "mktemp failed"
+if ! _do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO'" 2>>"$seqres.full"; then
+    rmdir "$M1" 2>/dev/null
+    M1=""
+    _notrun "cifsacl mount not supported"
+fi
+
+SUB="cifs246.$$.d"
+mkdir -p "$M1/$SUB" || _fail "mkdir workspace failed"
+
+# --- Test 1: DACL → mode mapping: newly created file has sane mode ---
+F="$M1/$SUB/acl_test_file"
+echo "acl_mapping" > "$F" || _fail "create test file failed"
+
+mode=$(stat -c %a "$F")
+echo "cifs246: initial mode=$mode" >> "$seqres.full"
+# Mode should be non-zero and sane (some value reflecting the DACL)
+[ -n "$mode" ] || _fail "stat returned empty mode"
+[ "$mode" != "0" ] && [ "$mode" != "000" ] || \
+    _fail "mode is 0 — DACL not mapped to any permissions"
+
+echo "cifs246: DACL→mode mapping OK (mode=$mode)" >> "$seqres.full"
+
+# --- Test 2: chmod → DACL update → mode persists ---
+chmod 0755 "$F" 2>>"$seqres.full"
+if [ $? -eq 0 ]; then
+    m2=$(stat -c %a "$F")
+    echo "cifs246: after chmod 755, mode=$m2" >> "$seqres.full"
+
+    # Remount to verify persistence
+    sync
+    _do "umount '$M1'" 2>>"$seqres.full" || _fail "unmount failed"
+    _do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO'" 2>>"$seqres.full" || _fail "remount failed"
+
+    m3=$(stat -c %a "$M1/$SUB/acl_test_file")
+    echo "cifs246: after remount, mode=$m3 (expect 755)" >> "$seqres.full"
+
+    # The mode should be close to 755 (server may round some bits)
+    u_bits=$(( (0$m3 / 64) % 8 ))
+    [ "$u_bits" -ge 5 ] || _fail "chmod 755 not persisted via DACL: got mode $m3"
+
+    echo "cifs246: chmod→DACL persistence OK" >> "$seqres.full"
+else
+    echo "cifs246: [skip] chmod not supported with cifsacl" >> "$seqres.full"
+fi
+
+# --- Test 3: restrictive chmod → DACL denies access appropriately ---
+F2="$M1/$SUB/restricted_file"
+echo "restricted" > "$F2" || _fail "create restricted file failed"
+
+chmod 0000 "$F2" 2>>"$seqres.full"
+if [ $? -eq 0 ]; then
+    m4=$(stat -c %a "$F2")
+    echo "cifs246: after chmod 000, mode=$m4" >> "$seqres.full"
+
+    # Restore so cleanup can delete it
+    chmod 0644 "$F2" 2>>"$seqres.full" || true
+    echo "cifs246: restrictive chmod OK" >> "$seqres.full"
+else
+    echo "cifs246: [skip] chmod 000 not supported" >> "$seqres.full"
+fi
+
+# --- Test 4: directory ACL mapping ---
+D="$M1/$SUB/acl_dir"
+mkdir "$D" 2>>"$seqres.full" || _fail "mkdir acl_dir failed"
+
+dir_mode=$(stat -c %a "$D")
+echo "cifs246: dir initial mode=$dir_mode" >> "$seqres.full"
+[ -n "$dir_mode" ] || _fail "dir stat returned empty mode"
+
+chmod 0700 "$D" 2>>"$seqres.full"
+if [ $? -eq 0 ]; then
+    dm2=$(stat -c %a "$D")
+    echo "cifs246: dir after chmod 700, mode=$dm2" >> "$seqres.full"
+    echo "cifs246: dir chmod→DACL OK" >> "$seqres.full"
+else
+    echo "cifs246: [skip] dir chmod not supported" >> "$seqres.full"
+fi
+
+# --- Test 5: smbcacls direct ACL manipulation (if available) ---
+if command -v smbcacls >/dev/null 2>&1; then
+    echo "cifs246: testing smbcacls..." >> "$seqres.full"
+    # Extract share path for smbcacls
+    share_path=$(echo "$TEST_DEV" | sed 's|^//||')
+    smbcacls "//$share_path" "$SUB/acl_test_file" \
+        -A "$(cat /root/.cifs-cred-xfstest 2>/dev/null || echo '')" \
+        >> "$seqres.full" 2>&1 || \
+        echo "cifs246: [warn] smbcacls query failed" >> "$seqres.full"
+else
+    echo "cifs246: [skip] smbcacls not installed" >> "$seqres.full"
+fi
+
+echo "Windows ACL mapping OK"
+
+status=0
+exit

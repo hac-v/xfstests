@@ -1,0 +1,217 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: data integrity across different rsize/wsize mount configurations
+#
+# Regression test for kernel commits:
+#   4860abb91f3d ("smb: Fix regression in writes when non-standard maximum
+#                  write size negotiated")
+#   e374d90f8a76 ("CIFS: Fix rsize usage for sync read")
+#   66231a47965c ("CIFS: Fix wsize usage in writepages")
+#   6ec0b01b2691 ("CIFS: Fix wsize usage in iovec write")
+#
+# Kernel code exercised:
+#   - file.c: cifs_strict_writev/readv with different wsize/rsize PDU sizes
+#   - smb2pdu.c: SMB2_read/write with varying max buffer sizes
+#   - fs_context.c: rsize/wsize validation and alignment
+#
+# Strategy:
+# - Mount with various rsize/wsize combinations
+# - For each: write known data, read back, verify md5
+# - Test sequential, random, O_DIRECT, mmap, and multi-page I/O patterns
+# - Any wsize/rsize that causes data corruption will fail the md5 check
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto stress
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+_test_unmount >/dev/null 2>&1
+
+_strip_size_opts() {
+    echo "$1" | awk -F, '{
+        out=""
+        for(i=1;i<=NF;i++){
+            if($i ~ /^(rsize=|wsize=|bsize=|nosharesock$)/) continue
+            out = out (out ? "," : "") $i
+        }
+        print out
+    }'
+}
+
+BASE=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+CLEAN=$(_strip_size_opts "$BASE")
+
+M1=""
+_cleanup_286() {
+    [ -n "$M1" ] && umount -l "$M1" 2>/dev/null || true
+    [ -n "$M1" ] && rmdir "$M1" 2>/dev/null || true
+}
+_register_cleanup _cleanup_286
+
+# Test data: 5 MiB of random data (reference copy on local disk)
+REF="/tmp/cifs286_ref.$$"
+dd if=/dev/urandom of="$REF" bs=1048576 count=5 2>/dev/null || _fail "create ref failed"
+REF_MD5=$(md5sum < "$REF" | awk '{print $1}')
+REF_SIZE=$(stat -c %s "$REF")
+echo "cifs286: reference md5=$REF_MD5 size=$REF_SIZE" >> "$seqres.full"
+
+# rsize/wsize combinations to test
+# Include non-power-of-2 values that historically caused corruption
+SIZES="
+65536,65536
+131072,131072
+262144,262144
+524288,524288
+1048576,1048576
+2097152,2097152
+4194304,4194304
+65536,1048576
+1048576,65536
+"
+
+total=0
+passed=0
+failed=0
+
+for pair in $SIZES; do
+    RSIZE=$(echo "$pair" | cut -d, -f1)
+    WSIZE=$(echo "$pair" | cut -d, -f2)
+
+    echo "cifs286: testing rsize=$RSIZE wsize=$WSIZE" >> "$seqres.full"
+
+    MO="$CLEAN,nosharesock,rsize=$RSIZE,wsize=$WSIZE"
+    M1=$(mktemp -d /tmp/cifs286.XXXXXX) || _fail "mktemp"
+
+    if ! _do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO'" 2>>"$seqres.full"; then
+        echo "cifs286: [skip] rsize=$RSIZE wsize=$WSIZE mount failed" >> "$seqres.full"
+        rmdir "$M1" 2>/dev/null; M1=""
+        continue
+    fi
+
+    total=$((total + 1))
+    SUB="cifs286_${RSIZE}_${WSIZE}.$$"
+    mkdir -p "$M1/$SUB" 2>>"$seqres.full" || { _do "umount '$M1'"; rmdir "$M1"; M1=""; continue; }
+
+    err=0
+
+    # --- Sub-test A: sequential write + read ---
+    cp "$REF" "$M1/$SUB/seq_test" 2>>"$seqres.full"
+    sync
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    MD5_A=$(md5sum < "$M1/$SUB/seq_test" | awk '{print $1}')
+    if [ "$MD5_A" != "$REF_MD5" ]; then
+        echo "cifs286: CORRUPT rsize=$RSIZE wsize=$WSIZE seq: $MD5_A vs $REF_MD5" >> "$seqres.full"
+        err=1
+    fi
+
+    # --- Sub-test B: dd with matching block size ---
+    dd if="$REF" of="$M1/$SUB/dd_test" bs=$WSIZE 2>>"$seqres.full"
+    sync
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    MD5_B=$(dd if="$M1/$SUB/dd_test" bs=$RSIZE 2>/dev/null | md5sum | awk '{print $1}')
+    if [ "$MD5_B" != "$REF_MD5" ]; then
+        echo "cifs286: CORRUPT rsize=$RSIZE wsize=$WSIZE dd: $MD5_B vs $REF_MD5" >> "$seqres.full"
+        err=1
+    fi
+
+    # --- Sub-test C: small block write, large block read (and vice versa) ---
+    dd if="$REF" of="$M1/$SUB/small_write" bs=4096 2>>"$seqres.full"
+    sync
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    MD5_C=$(dd if="$M1/$SUB/small_write" bs=$((RSIZE * 2)) 2>/dev/null | md5sum | awk '{print $1}')
+    if [ "$MD5_C" != "$REF_MD5" ]; then
+        echo "cifs286: CORRUPT rsize=$RSIZE wsize=$WSIZE small→large: $MD5_C vs $REF_MD5" >> "$seqres.full"
+        err=1
+    fi
+
+    # --- Sub-test D: python pwrite at various offsets ---
+    python3 -c "
+import os, sys, hashlib
+
+ref_data = open('$REF', 'rb').read()
+f = '$M1/$SUB/pwrite_test'
+
+# Write in chunks at non-aligned offsets
+fd = os.open(f, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+chunk = 65536
+offset = 0
+while offset < len(ref_data):
+    end = min(offset + chunk, len(ref_data))
+    os.pwrite(fd, ref_data[offset:end], offset)
+    offset = end
+os.fsync(fd)
+os.close(fd)
+" 2>>"$seqres.full" || { echo "cifs286: pwrite failed rsize=$RSIZE wsize=$WSIZE" >> "$seqres.full"; err=1; }
+
+    if [ $err -eq 0 ]; then
+        sync
+        echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+        MD5_D=$(md5sum < "$M1/$SUB/pwrite_test" | awk '{print $1}')
+        if [ "$MD5_D" != "$REF_MD5" ]; then
+            echo "cifs286: CORRUPT rsize=$RSIZE wsize=$WSIZE pwrite: $MD5_D vs $REF_MD5" >> "$seqres.full"
+            err=1
+        fi
+    fi
+
+    # --- Sub-test E: append writes (accumulate to full size) ---
+    python3 -c "
+import os, sys
+
+ref_data = open('$REF', 'rb').read()
+f = '$M1/$SUB/append_test'
+
+fd = os.open(f, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_APPEND, 0o644)
+chunk = 32768
+offset = 0
+while offset < len(ref_data):
+    end = min(offset + chunk, len(ref_data))
+    os.write(fd, ref_data[offset:end])
+    offset = end
+os.fsync(fd)
+os.close(fd)
+" 2>>"$seqres.full" || { echo "cifs286: append failed" >> "$seqres.full"; err=1; }
+
+    if [ $err -eq 0 ]; then
+        sync
+        echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+        MD5_E=$(md5sum < "$M1/$SUB/append_test" | awk '{print $1}')
+        if [ "$MD5_E" != "$REF_MD5" ]; then
+            echo "cifs286: CORRUPT rsize=$RSIZE wsize=$WSIZE append: $MD5_E vs $REF_MD5" >> "$seqres.full"
+            err=1
+        fi
+    fi
+
+    # Clean up this mount
+    rm -rf "$M1/$SUB" 2>/dev/null
+    _do "umount '$M1'" 2>>"$seqres.full" || true
+    rmdir "$M1" 2>/dev/null; M1=""
+
+    if [ $err -eq 0 ]; then
+        passed=$((passed + 1))
+        echo "cifs286: rsize=$RSIZE wsize=$WSIZE ALL OK" >> "$seqres.full"
+    else
+        failed=$((failed + 1))
+    fi
+done
+
+rm -f "$REF"
+
+echo "" >> "$seqres.full"
+echo "=== rsize/wsize Data Integrity Summary ===" >> "$seqres.full"
+echo "Configurations tested: $total" >> "$seqres.full"
+echo "Passed: $passed" >> "$seqres.full"
+echo "Failed: $failed" >> "$seqres.full"
+
+[ "$failed" -eq 0 ] || _fail "data corruption detected in $failed of $total rsize/wsize configs"
+[ "$passed" -ge 1 ] || _fail "no rsize/wsize configurations succeeded"
+
+echo "rsize/wsize data integrity OK"
+
+status=0
+exit

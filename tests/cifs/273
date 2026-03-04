@@ -1,0 +1,265 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: concurrent truncate + write data corruption corner case
+#
+# Kernel code at risk:
+# - inode.c:2907: "We need to be sure that all dirty pages are written
+#   and the server has the latest file size"
+# - inode.c: cifs_setattr() vs writeback race
+# - file.c: extending write + concurrent truncate = size confusion
+#
+# Scenario:
+# - Writer A extends file continuously (append)
+# - Writer B truncates file repeatedly to smaller size
+# - After both stop, file must be consistent (no garbage beyond EOF,
+#   no data from before truncation leaking into post-truncation content)
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs273.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# --- Test 1: truncate during active writes ---
+python3 -c "
+import os, threading, time, sys, hashlib
+
+f = '$W/trunc_write'
+fd = os.open(f, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644)
+os.close(fd)
+
+stop = threading.Event()
+errors = []
+
+def writer():
+    try:
+        fd = os.open(f, os.O_WRONLY | os.O_APPEND)
+        i = 0
+        while not stop.is_set():
+            os.write(fd, b'W' * 4096)
+            i += 1
+            if i > 500:
+                break
+        os.close(fd)
+    except OSError as e:
+        errors.append(f'writer: {e}')
+
+def truncator():
+    try:
+        i = 0
+        while not stop.is_set():
+            try:
+                os.truncate(f, 4096 * (i % 10))
+            except OSError:
+                pass
+            i += 1
+            time.sleep(0.01)
+            if i > 200:
+                break
+    except OSError as e:
+        errors.append(f'truncator: {e}')
+
+t1 = threading.Thread(target=writer)
+t2 = threading.Thread(target=truncator)
+t1.start()
+t2.start()
+t1.join(timeout=30)
+t2.join(timeout=30)
+stop.set()
+
+if errors:
+    print(f'errors: {errors}', file=sys.stderr)
+
+# Verify file is consistent: size matches actual readable data
+try:
+    st = os.stat(f)
+    fd = os.open(f, os.O_RDONLY)
+    data = os.read(fd, st.st_size + 4096)
+    os.close(fd)
+    # Key check: no read error, readable length matches stat size
+    assert len(data) == st.st_size, f'size mismatch: stat={st.st_size} read={len(data)}'
+    print(f'trunc+write OK: final size={st.st_size}', file=sys.stderr)
+except OSError as e:
+    print(f'verify: {e}', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "truncate+write race test failed"
+
+echo "cifs273: truncate+write OK" >> "$seqres.full"
+
+# --- Test 2: truncate-to-zero while reader has file open ---
+python3 -c "
+import os, sys, time
+
+f = '$W/trunc_zero_read'
+# Write known data
+fd = os.open(f, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+os.write(fd, b'KNOWN_DATA' * 1000)
+os.fsync(fd)
+os.close(fd)
+
+# Open for reading
+rfd = os.open(f, os.O_RDONLY)
+# Read some data to populate page cache
+first = os.read(rfd, 100)
+assert first.startswith(b'KNOWN_DATA'), f'initial read: {first[:20]!r}'
+
+# Truncate to zero while reader fd is open
+os.truncate(f, 0)
+
+# Read from the beginning of the truncated file
+os.lseek(rfd, 0, os.SEEK_SET)
+after = os.read(rfd, 100)
+os.close(rfd)
+
+# After truncate, read should return empty (0 bytes)
+assert len(after) == 0, f'read after truncate-to-zero: {len(after)} bytes (expected 0)'
+print('truncate-to-zero while reading OK', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "truncate-to-zero while reading failed"
+
+echo "cifs273: trunc-to-zero+read OK" >> "$seqres.full"
+
+# --- Test 3: extending write + concurrent stat (size consistency) ---
+python3 -c "
+import os, threading, sys
+
+f = '$W/extend_stat'
+fd = os.open(f, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+os.close(fd)
+
+size_errors = []
+stop = threading.Event()
+
+def extender():
+    fd = os.open(f, os.O_WRONLY | os.O_APPEND)
+    for i in range(200):
+        os.write(fd, b'E' * 4096)
+        if stop.is_set():
+            break
+    os.fsync(fd)
+    os.close(fd)
+
+def statter():
+    prev_size = 0
+    for i in range(500):
+        try:
+            st = os.stat(f)
+            # Size should never decrease during extend (no truncate happening)
+            if st.st_size < prev_size:
+                size_errors.append(f'size went backwards: {prev_size} -> {st.st_size}')
+            prev_size = st.st_size
+        except OSError:
+            pass
+        if stop.is_set():
+            break
+
+t1 = threading.Thread(target=extender)
+t2 = threading.Thread(target=statter)
+t1.start()
+t2.start()
+t1.join(timeout=30)
+stop.set()
+t2.join(timeout=5)
+
+if size_errors:
+    print(f'SIZE ERRORS: {size_errors[:5]}', file=sys.stderr)
+    sys.exit(1)
+
+# Verify final size = 200 * 4096 = 819200
+st = os.stat(f)
+assert st.st_size == 200 * 4096, f'final size: {st.st_size} (expected {200*4096})'
+print(f'extend+stat OK: final={st.st_size}', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "extend+stat consistency failed"
+
+echo "cifs273: extend+stat OK" >> "$seqres.full"
+
+# --- Test 4: O_WRONLY partial write at file hole (stale zero check) ---
+python3 -c "
+import os, sys
+
+f = '$W/partial_hole'
+# Create a file filled with 'X'
+fd = os.open(f, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+os.write(fd, b'X' * 65536)
+os.fsync(fd)
+os.close(fd)
+
+# O_WRONLY partial write at mid-file offset (200 bytes of 'Y')
+# This triggers the sync write path because:
+# - O_WRONLY: write_begin skips page read → page not uptodate
+# - Mid-file: no EOF zero-fill shortcut
+# - Partial page: page never marked uptodate
+fd = os.open(f, os.O_WRONLY)
+os.lseek(fd, 32768, os.SEEK_SET)
+os.write(fd, b'Y' * 200)
+os.fsync(fd)
+os.close(fd)
+
+# Read back — verify 'Y' region is correct AND surrounding data not corrupted
+fd = os.open(f, os.O_RDONLY)
+data = os.read(fd, 65536)
+os.close(fd)
+
+# Bytes 0-32767 should be 'X'
+for i in range(0, 32768):
+    if data[i] != ord('X'):
+        print(f'CORRUPTION at offset {i}: expected X got {data[i]:02x}', file=sys.stderr)
+        sys.exit(1)
+
+# Bytes 32768-32967 should be 'Y'
+for i in range(32768, 32968):
+    if data[i] != ord('Y'):
+        print(f'CORRUPTION at offset {i}: expected Y got {data[i]:02x}', file=sys.stderr)
+        sys.exit(1)
+
+# Bytes 32968-65535 should be 'X'
+for i in range(32968, 65536):
+    if data[i] != ord('X'):
+        print(f'CORRUPTION at offset {i}: expected X got {data[i]:02x}', file=sys.stderr)
+        sys.exit(1)
+
+print('O_WRONLY partial write integrity OK', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "O_WRONLY partial write corruption detected"
+
+echo "cifs273: O_WRONLY partial OK" >> "$seqres.full"
+
+# --- Test 5: write + fsync + rename atomicity ---
+# If rename happens between write and fsync, data should not be lost
+python3 -c "
+import os, sys
+
+d = '$W'
+f1 = os.path.join(d, 'atomic_src')
+f2 = os.path.join(d, 'atomic_dst')
+
+# Write data
+fd = os.open(f1, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+os.write(fd, b'ATOMIC_DATA_12345' * 1000)
+os.fsync(fd)
+os.close(fd)
+
+# Rename
+os.rename(f1, f2)
+
+# Read from new name
+with open(f2, 'rb') as fh:
+    data = fh.read()
+
+expected = b'ATOMIC_DATA_12345' * 1000
+assert data == expected, f'rename after write: len={len(data)} expected={len(expected)}'
+print('write+fsync+rename atomicity OK', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "write+rename atomicity failed"
+
+echo "cifs273: write+rename atomicity OK" >> "$seqres.full"
+
+echo "data/metadata corruption corner cases OK"
+
+status=0
+exit

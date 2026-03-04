@@ -1,0 +1,113 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: fallocate collapse-range and insert-range correctness
+#
+# Behavior under test
+# - FALLOC_FL_COLLAPSE_RANGE: removes a range from the middle of a file,
+#   shifting subsequent data down. File size decreases.
+# - FALLOC_FL_INSERT_RANGE: inserts a hole in the middle of a file,
+#   shifting subsequent data up. File size increases.
+# - Skip if the server/kernel does not support these operations.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+_register_cleanup "_test_unmount >/dev/null 2>&1; rm -rf \"$TEST_DIR/cifs233.$$\" >/dev/null 2>&1"
+
+_test_unmount > /dev/null 2>&1
+_do "_test_mount" || _fail "mount failed"
+
+W="$TEST_DIR/cifs233.$$"
+mkdir -p "$W" || _fail "mkdir failed"
+
+BS=4096
+collapse_ok=false
+insert_ok=false
+
+# ============================================================
+# Test 1: Collapse range
+# ============================================================
+FC="$W/collapse"
+
+# Write 4 blocks: AAAABBBBCCCCDDDD
+printf 'A%.0s' $(seq 1 $BS) > "$FC"
+printf 'B%.0s' $(seq 1 $BS) >> "$FC"
+printf 'C%.0s' $(seq 1 $BS) >> "$FC"
+printf 'D%.0s' $(seq 1 $BS) >> "$FC"
+sync
+
+sz0=$(stat -c %s "$FC")
+echo "collapse: initial size=$sz0" >> $seqres.full
+
+# Collapse block 1 (offset BS, length BS) -> removes BBBB
+if fallocate --collapse-range -o $BS -l $BS "$FC" 2>>$seqres.full; then
+    sync
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+    sz1=$(stat -c %s "$FC")
+    echo "collapse: after size=$sz1 expected=$((BS * 3))" >> $seqres.full
+
+    [ "$sz1" -eq $((BS * 3)) ] || _fail "collapse: expected size $((BS * 3)), got $sz1"
+
+    # Byte at offset BS should now be 'C' (0x43), not 'B' (0x42)
+    byte=$(dd if="$FC" bs=1 skip=$BS count=1 status=none | od -An -tx1 | tr -d ' ')
+    echo "collapse: byte_at_BS=$byte" >> $seqres.full
+    [ "$byte" = "43" ] || _fail "collapse: expected 'C' (0x43) at offset $BS, got $byte"
+
+    collapse_ok=true
+else
+    echo "fallocate collapse-range not supported" >> $seqres.full
+fi
+
+# ============================================================
+# Test 2: Insert range
+# ============================================================
+FI="$W/insert"
+
+# Write 3 blocks: AAAA BBBB CCCC
+printf 'A%.0s' $(seq 1 $BS) > "$FI"
+printf 'B%.0s' $(seq 1 $BS) >> "$FI"
+printf 'C%.0s' $(seq 1 $BS) >> "$FI"
+sync
+
+sz0=$(stat -c %s "$FI")
+echo "insert: initial size=$sz0" >> $seqres.full
+
+# Insert a hole at offset BS (between A and B) -> AAAA [hole] BBBB CCCC
+if fallocate --insert-range -o $BS -l $BS "$FI" 2>>$seqres.full; then
+    sync
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+    sz1=$(stat -c %s "$FI")
+    echo "insert: after size=$sz1 expected=$((BS * 4))" >> $seqres.full
+
+    [ "$sz1" -eq $((BS * 4)) ] || _fail "insert: expected size $((BS * 4)), got $sz1"
+
+    # The inserted hole (block 1) should read as zeros
+    hole_nz=$(dd if="$FI" bs=$BS skip=1 count=1 status=none | tr -d '\0' | wc -c)
+    echo "insert: hole_nonzero_bytes=$hole_nz" >> $seqres.full
+    [ "$hole_nz" -eq 0 ] || _fail "insert: hole region not zero ($hole_nz non-zero bytes)"
+
+    # Block 2 should now be 'B' (shifted from block 1)
+    byte=$(dd if="$FI" bs=1 skip=$((BS * 2)) count=1 status=none | od -An -tx1 | tr -d ' ')
+    echo "insert: byte_at_2BS=$byte" >> $seqres.full
+    [ "$byte" = "42" ] || _fail "insert: expected 'B' (0x42) at offset $((BS*2)), got $byte"
+
+    insert_ok=true
+else
+    echo "fallocate insert-range not supported" >> $seqres.full
+fi
+
+$collapse_ok || $insert_ok || _notrun "neither collapse-range nor insert-range supported"
+
+echo "collapse=$collapse_ok insert=$insert_ok" >> $seqres.full
+echo "fallocate collapse+insert range OK"
+
+status=0
+exit

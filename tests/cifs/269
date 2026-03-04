@@ -1,0 +1,197 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: SMB2_write() in-place encryption page cache corruption
+#
+# Reproducer for a bug where SMB2_write() passes page cache data inline
+# in rq_iov. When SMB3 encryption is active, crypt_message() encrypts
+# these buffers in-place, overwriting the page cache with ciphertext.
+# On replay after a replayable send failure, the ciphertext is re-sent
+# as plaintext — the server stores ciphertext as file content.
+#
+# The sync write path (cifs_write_end → cifs_write → SMB2_write) is
+# taken when O_WRONLY partial writes hit a non-uptodate page at a
+# mid-file offset:
+# - O_WRONLY: write_begin() skips reading the page → page not uptodate
+# - Mid-file offset: EOF zero-fill shortcut doesn't apply
+# - Partial page (200 bytes): page never marked uptodate
+# → cifs_write_end() takes sync path: kmap → cifs_write → SMB2_write
+#
+# Strategy: concurrent O_WRONLY mid-file writers + socket kill to
+# interrupt mid-encrypt. Then verify all file bytes match expected values.
+#
+# Kernel code exercised:
+# - file.c: cifs_write_end(), cifs_write()
+# - smb2pdu.c: SMB2_write() rq_iov construction
+# - smb2transport.c: crypt_message() in-place encryption
+# - transport.c: replay_again path after send failure
+# - connect.c: reconnect after socket death
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+command -v ss >/dev/null 2>&1 || _notrun "requires ss (iproute2)"
+
+# Need encryption enabled — mount with seal
+M1=""
+PIDS=""
+_cleanup_269() {
+    # Kill all writers (suppress bash "Killed" messages)
+    if [ -n "$PIDS" ]; then
+        for pid in $PIDS; do
+            kill -9 $pid 2>/dev/null && wait $pid 2>/dev/null
+        done
+    fi
+    [ -n "$M1" ] && umount -l "$M1" 2>/dev/null || true
+    [ -n "$M1" ] && rmdir "$M1" 2>/dev/null || true
+}
+_register_cleanup _cleanup_269
+
+_test_unmount >/dev/null 2>&1
+
+# Strip seal/noseal and add seal for encrypted mount
+_strip_seal() {
+    echo "$1" | awk -F, '{
+        out=""
+        for(i=1;i<=NF;i++){
+            if($i ~ /^(seal|noseal)$/) continue
+            out = out (out ? "," : "") $i
+        }
+        print out
+    }'
+}
+
+BASE=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+STRIPPED=$(_strip_seal "$BASE")
+MO="$STRIPPED"
+[ -n "$MO" ] && MO="$MO,seal" || MO="seal"
+
+M1=$(mktemp -d /tmp/cifs269.XXXXXX) || _fail "mktemp failed"
+if ! _do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO'" 2>>"$seqres.full"; then
+    rmdir "$M1" 2>/dev/null
+    M1=""
+    _notrun "seal mount not supported (encryption required for this test)"
+fi
+
+W="$M1/cifs269.$$"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# Resolve server IP for targeted socket kill
+host=$(echo "$TEST_DEV" | sed -E 's#^//([^/]+)/.*#\1#')
+server_ip=$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1; exit}')
+[ -n "$server_ip" ] || server_ip="$host"
+echo "cifs269: server=$host ip=$server_ip" >> "$seqres.full"
+
+NFILES=5
+NCYCLES=5
+
+# --- Create test files with known byte pattern ---
+# f1='A'*64K, f2='B'*64K, ..., f5='E'*64K
+echo "cifs269: creating $NFILES test files" >> "$seqres.full"
+for f in $(seq 1 $NFILES); do
+    BYTE=$((0x40 + f))  # 0x41='A', 0x42='B', ...
+    python3 -c "
+open('$W/f${f}.dat','wb').write(bytes([$BYTE])*65536)
+" || _fail "create f${f}.dat failed"
+done
+sync
+sleep 1
+
+# --- Start concurrent O_WRONLY mid-file writers ---
+# O_WRONLY + mid-file + partial page → sync write path → SMB2_write inline
+_writer() {
+    local fname="$1" byte="$2"
+    while true; do
+        python3 -c "
+import os, random
+try:
+    fd = os.open('$fname', os.O_WRONLY)
+    off = random.randint(100, 60000)
+    os.lseek(fd, off, os.SEEK_SET)
+    os.write(fd, bytes([$byte]) * 200)
+    os.close(fd)
+except:
+    pass
+" 2>/dev/null
+    done
+}
+
+echo "cifs269: starting $NFILES writers" >> "$seqres.full"
+PIDS=""
+for f in $(seq 1 $NFILES); do
+    BYTE=$((0x40 + f))
+    ( _writer "$W/f${f}.dat" $BYTE ) >/dev/null 2>&1 &
+    PIDS="$PIDS $!"
+done
+
+# --- Disruption cycles: drop caches + kill socket ---
+ERRORS=0
+for cycle in $(seq 1 $NCYCLES); do
+    # Let writers run normally
+    sleep 2
+
+    # Cold cache: evict pages so next writes hit non-uptodate pages
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+    # Let writes accumulate on cold cache (all go through sync path)
+    sleep 1
+
+    # Kill the SMB socket — if a write is between crypt_message() and
+    # TCP send, rq_iov[1] (page cache) is already encrypted in-place.
+    # The send fails, replay_again re-sends ciphertext as plaintext.
+    ss -K dst "$server_ip" dport = 445 > /dev/null 2>&1
+    echo "cifs269: [cycle $cycle] socket killed" >> "$seqres.full"
+
+    # Wait for reconnect
+    sleep 3
+
+    # Re-read from server (not local cache)
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    sleep 1
+
+    # Verify: every byte in each file should match expected value
+    cycle_errors=0
+    for f in $(seq 1 $NFILES); do
+        BYTE=$((0x40 + f))
+        python3 -c "
+import sys
+try:
+    data = open('$W/f${f}.dat','rb').read()
+except OSError as e:
+    sys.exit(0)  # file temporarily unavailable during reconnect
+for i, b in enumerate(data):
+    if b != $BYTE:
+        print(f'CORRUPTION f${f}.dat offset=0x{i:x} exp=0x{$BYTE:02x}({chr($BYTE)}) got=0x{b:02x}', file=sys.stderr)
+        sys.exit(1)
+sys.exit(0)
+" 2>>"$seqres.full"
+        if [ $? -ne 0 ]; then
+            cycle_errors=$((cycle_errors + 1))
+            ERRORS=$((ERRORS + 1))
+        fi
+    done
+    echo "cifs269: [cycle $cycle] verified ($cycle_errors errors)" >> "$seqres.full"
+done
+
+# Stop writers (suppress bash "Killed" job notification)
+for pid in $PIDS; do
+    kill -9 $pid 2>/dev/null && wait $pid 2>/dev/null
+done
+PIDS=""
+
+echo "cifs269: total errors=$ERRORS across $NCYCLES cycles" >> "$seqres.full"
+
+[ "$ERRORS" -eq 0 ] || \
+    _fail "in-place encryption corrupted page cache ($ERRORS corruptions detected)"
+
+echo "SMB2_write encrypt corruption OK"
+
+status=0
+exit

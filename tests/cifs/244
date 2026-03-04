@@ -1,0 +1,135 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: F_SETLEASE / kernel file leases
+#
+# Behavior under test
+# - fcntl(F_SETLEASE, F_RDLCK): acquire a read lease on a CIFS file.
+# - fcntl(F_SETLEASE, F_WRLCK): acquire a write lease.
+# - Lease break: opening the file from a second process triggers a lease
+#   break notification (SIGIO).
+# - fcntl(F_SETLEASE, F_UNLCK): release a lease.
+# - Exercises cifs_setlease() in cifsfs.c.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs244.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+echo "lease_test_data" > "$W/leasefile" || _fail "create leasefile failed"
+
+# --- Test 1: F_SETLEASE F_RDLCK and F_UNLCK ---
+python3 -c "
+import fcntl, os, sys, signal, errno
+
+F_RDLCK = fcntl.F_RDLCK
+F_WRLCK = fcntl.F_WRLCK
+F_UNLCK = fcntl.F_UNLCK
+
+fd = os.open('$W/leasefile', os.O_RDONLY)
+try:
+    # Try to set a read lease
+    try:
+        fcntl.fcntl(fd, fcntl.F_SETLEASE, F_RDLCK)
+        print('F_SETLEASE F_RDLCK succeeded', file=sys.stderr)
+    except OSError as e:
+        if e.errno in (errno.EINVAL, errno.EAGAIN, errno.EACCES):
+            print(f'F_SETLEASE not supported: {e}', file=sys.stderr)
+            sys.exit(77)  # skip
+        raise
+
+    # Verify lease is held
+    lease_type = fcntl.fcntl(fd, fcntl.F_GETLEASE)
+    print(f'F_GETLEASE: {lease_type} (F_RDLCK={F_RDLCK})', file=sys.stderr)
+
+    # Release lease
+    fcntl.fcntl(fd, fcntl.F_SETLEASE, F_UNLCK)
+    lease_after = fcntl.fcntl(fd, fcntl.F_GETLEASE)
+    print(f'After F_UNLCK: F_GETLEASE={lease_after}', file=sys.stderr)
+
+finally:
+    os.close(fd)
+" 2>>"$seqres.full"
+rc=$?
+if [ $rc -eq 77 ]; then
+    _notrun "F_SETLEASE not supported on this CIFS mount"
+elif [ $rc -ne 0 ]; then
+    _fail "F_SETLEASE read lease test failed"
+fi
+
+echo "cifs244: read lease OK" >> "$seqres.full"
+
+# --- Test 2: F_SETLEASE F_WRLCK + lease break ---
+python3 -c "
+import fcntl, os, sys, signal, errno, time, multiprocessing
+
+F_WRLCK = fcntl.F_WRLCK
+F_UNLCK = fcntl.F_UNLCK
+lease_broken = multiprocessing.Value('i', 0)
+
+def lease_break_handler(signum, frame):
+    lease_broken.value = 1
+
+fd = os.open('$W/leasefile', os.O_RDWR)
+try:
+    # Set SIGIO handler for lease breaks
+    old_handler = signal.signal(signal.SIGIO, lease_break_handler)
+    fcntl.fcntl(fd, fcntl.F_SETOWN, os.getpid())
+    fcntl.fcntl(fd, fcntl.F_SETSIG, signal.SIGIO)
+
+    # Set write lease
+    try:
+        fcntl.fcntl(fd, fcntl.F_SETLEASE, F_WRLCK)
+        print('F_SETLEASE F_WRLCK succeeded', file=sys.stderr)
+    except OSError as e:
+        if e.errno in (errno.EINVAL, errno.EAGAIN, errno.EACCES):
+            print(f'F_SETLEASE WRLCK not supported: {e}', file=sys.stderr)
+            sys.exit(0)  # still pass, write lease may not be supported
+        raise
+
+    lease_type = fcntl.fcntl(fd, fcntl.F_GETLEASE)
+    print(f'Write lease held: F_GETLEASE={lease_type}', file=sys.stderr)
+
+    # Release write lease
+    fcntl.fcntl(fd, fcntl.F_SETLEASE, F_UNLCK)
+    signal.signal(signal.SIGIO, old_handler)
+    print('Write lease released', file=sys.stderr)
+
+finally:
+    os.close(fd)
+" 2>>"$seqres.full" || _fail "F_SETLEASE write lease test failed"
+
+echo "cifs244: write lease OK" >> "$seqres.full"
+
+# --- Test 3: verify lease works with different file modes ---
+echo "read_mode_test" > "$W/rdonly_lease" || _fail "create rdonly_lease failed"
+
+python3 -c "
+import fcntl, os, sys, errno
+
+fd = os.open('$W/rdonly_lease', os.O_RDONLY)
+try:
+    try:
+        fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_RDLCK)
+        lease = fcntl.fcntl(fd, fcntl.F_GETLEASE)
+        print(f'Lease on O_RDONLY fd: {lease}', file=sys.stderr)
+        fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_UNLCK)
+    except OSError as e:
+        print(f'Lease on O_RDONLY: {e}', file=sys.stderr)
+finally:
+    os.close(fd)
+" 2>>"$seqres.full" || true
+
+echo "F_SETLEASE OK"
+
+status=0
+exit

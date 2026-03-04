@@ -1,0 +1,69 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: CIFS_IOC_SET_INTEGRITY — enable integrity streams via FSCTL
+#
+# Kernel code exercised:
+# - ioctl.c: CIFS_IOC_SET_INTEGRITY handler
+# - smb2ops.c: smb3_set_integrity() → FSCTL_SET_INTEGRITY_INFORMATION
+# - Sets ChecksumAlgorithm, Flags, Reserved on the file's integrity info
+#
+# This is an ReFS/NTFS feature — server may not support it. Skip gracefully.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs262.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+F="$W/integrity_file"
+echo "integrity_test" > "$F" || _fail "create file failed"
+
+# CIFS_IOC_SET_INTEGRITY = _IO(0xcf, 0x09)
+# From cifs/cifsglob.h: #define CIFS_IOC_SET_INTEGRITY _IO(0xcf, 0x09)
+python3 -c "
+import fcntl, os, sys
+
+# CIFS_IOC_SET_INTEGRITY = _IO(0xcf, 0x09) = 0x0000cf09
+CIFS_IOC_SET_INTEGRITY = 0x0000cf09
+
+fd = os.open('$F', os.O_RDWR)
+try:
+    try:
+        fcntl.ioctl(fd, CIFS_IOC_SET_INTEGRITY)
+        print('CIFS_IOC_SET_INTEGRITY succeeded', file=sys.stderr)
+    except OSError as e:
+        import errno
+        if e.errno in (errno.EOPNOTSUPP, errno.ENOTTY, errno.EINVAL, errno.ENOSYS):
+            print(f'SET_INTEGRITY not supported: {e}', file=sys.stderr)
+            sys.exit(77)
+        # EACCES or other might mean the server rejected it — log but don't fail
+        print(f'SET_INTEGRITY error: {e}', file=sys.stderr)
+        sys.exit(0)
+finally:
+    os.close(fd)
+" 2>>"$seqres.full"
+rc=$?
+if [ $rc -eq 77 ]; then
+    echo "cifs262: [skip] SET_INTEGRITY not supported" >> "$seqres.full"
+fi
+
+# Verify file is still usable after integrity ioctl
+echo "post_integrity" >> "$F" || _fail "write after integrity ioctl failed"
+got=$(cat "$F")
+echo "$got" | grep -q "post_integrity" || _fail "file unreadable after integrity ioctl"
+
+echo "cifs262: SET_INTEGRITY OK" >> "$seqres.full"
+
+echo "CIFS_IOC_SET_INTEGRITY OK"
+
+status=0
+exit

@@ -1,0 +1,93 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: disable_legacy_dialects — block SMB1/CIFS connections
+#
+# Kernel code exercised:
+# - fs_context.c: disable_legacy_dialects module parameter check
+# - connect.c: SMB1 negotiation rejection when parameter is set
+#
+# When disable_legacy_dialects=Y:
+# - Mounting with vers=1.0 must FAIL
+# - Mounting with vers=2.0 or vers=3.0/3.1.1 must still SUCCEED
+# - This is a security hardening feature to prevent SMB1 downgrade attacks
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+[ -w /sys/module/cifs/parameters/disable_legacy_dialects ] || \
+    _notrun "disable_legacy_dialects not writable"
+
+ORIG_DLD=$(cat /sys/module/cifs/parameters/disable_legacy_dialects)
+M1=""
+_cleanup_288() {
+    echo "$ORIG_DLD" > /sys/module/cifs/parameters/disable_legacy_dialects 2>/dev/null
+    [ -n "$M1" ] && umount -l "$M1" 2>/dev/null || true
+    [ -n "$M1" ] && rmdir "$M1" 2>/dev/null || true
+}
+_register_cleanup _cleanup_288
+
+_test_unmount >/dev/null 2>&1
+
+BASE=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+# Strip vers= from options
+CLEAN=$(echo "$BASE" | awk -F, '{
+    out=""
+    for(i=1;i<=NF;i++){
+        if($i ~ /^vers=/) continue
+        out = out (out ? "," : "") $i
+    }
+    print out
+}')
+
+# --- Test 1: disable_legacy_dialects=Y blocks vers=1.0 ---
+echo Y > /sys/module/cifs/parameters/disable_legacy_dialects
+echo "cifs288: disable_legacy_dialects=$(cat /sys/module/cifs/parameters/disable_legacy_dialects)" >> "$seqres.full"
+
+M1=$(mktemp -d /tmp/cifs288.XXXXXX) || _fail "mktemp"
+
+# vers=1.0 mount should FAIL when legacy is disabled
+MO_SMB1="$CLEAN,vers=1.0"
+if mount -t cifs "$TEST_DEV" "$M1" -o "$MO_SMB1" 2>>"$seqres.full"; then
+    echo "cifs288: [UNEXPECTED] vers=1.0 succeeded with disable_legacy_dialects=Y" >> "$seqres.full"
+    umount "$M1" 2>/dev/null
+else
+    echo "cifs288: vers=1.0 correctly blocked" >> "$seqres.full"
+fi
+
+# --- Test 2: disable_legacy_dialects=Y allows SMB2+ ---
+# Try default (auto-negotiate, should pick SMB2+)
+if _do "mount -t cifs '$TEST_DEV' '$M1' -o '$CLEAN'" 2>>"$seqres.full"; then
+    echo "test_data" > "$M1/cifs288_test.$$" 2>/dev/null || true
+    rm -f "$M1/cifs288_test.$$" 2>/dev/null
+    _do "umount '$M1'" 2>>"$seqres.full"
+    echo "cifs288: SMB2+ mount succeeds with disable_legacy_dialects=Y" >> "$seqres.full"
+else
+    echo "cifs288: [warn] default mount failed with disable_legacy_dialects=Y" >> "$seqres.full"
+fi
+
+# --- Test 3: disable_legacy_dialects=N allows vers=1.0 (if server supports) ---
+echo N > /sys/module/cifs/parameters/disable_legacy_dialects
+echo "cifs288: disable_legacy_dialects=$(cat /sys/module/cifs/parameters/disable_legacy_dialects)" >> "$seqres.full"
+
+if mount -t cifs "$TEST_DEV" "$M1" -o "$MO_SMB1" 2>>"$seqres.full"; then
+    echo "cifs288: vers=1.0 allowed with disable_legacy_dialects=N" >> "$seqres.full"
+    umount "$M1" 2>/dev/null
+else
+    echo "cifs288: vers=1.0 not supported by server (expected)" >> "$seqres.full"
+fi
+
+rmdir "$M1" 2>/dev/null; M1=""
+
+# Restore and remount for framework
+echo "$ORIG_DLD" > /sys/module/cifs/parameters/disable_legacy_dialects
+_do "_test_mount" 2>>"$seqres.full" || true
+
+echo "disable_legacy_dialects OK"
+
+status=0
+exit

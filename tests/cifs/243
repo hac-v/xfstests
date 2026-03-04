@@ -1,0 +1,94 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: filesystem freeze / thaw (fsfreeze)
+#
+# Behavior under test
+# - fsfreeze -f quiesces all I/O on the CIFS mount.
+# - During freeze, new writes should block (not fail).
+# - fsfreeze -u resumes I/O.
+# - Data written before freeze is persisted.
+# - Exercises cifs_freeze() in cifsfs.c.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+
+command -v fsfreeze >/dev/null 2>&1 || _notrun "requires fsfreeze"
+
+W="$TEST_DIR/cifs243.$$"
+FROZEN=false
+_cleanup_243() {
+    $FROZEN && fsfreeze -u "$TEST_DIR" 2>/dev/null || true
+    # Kill any blocked writer
+    [ -n "$WRITER_PID" ] && kill $WRITER_PID 2>/dev/null || true
+    rm -rf "$W" >/dev/null 2>&1 || true
+}
+_register_cleanup _cleanup_243
+mkdir -p "$W" || _fail "mkdir workspace failed"
+WRITER_PID=""
+
+# --- Test 1: write before freeze is persisted ---
+echo "before_freeze_data" > "$W/pre_freeze" || _fail "pre-freeze write failed"
+sync
+
+echo "cifs243: pre-freeze file created" >> "$seqres.full"
+
+# --- Test 2: fsfreeze -f ---
+if ! fsfreeze -f "$TEST_DIR" 2>>"$seqres.full"; then
+    _notrun "fsfreeze not supported on this CIFS mount"
+fi
+FROZEN=true
+
+echo "cifs243: filesystem frozen" >> "$seqres.full"
+
+# --- Test 3: write during freeze should block ---
+# Start a background writer — it should block (not fail immediately)
+(echo "during_freeze" > "$W/frozen_write" 2>/dev/null) &
+WRITER_PID=$!
+
+# Give it a moment — the write should NOT complete while frozen
+sleep 1
+if ! kill -0 $WRITER_PID 2>/dev/null; then
+    # Writer already exited — could be a quick failure or pass-through
+    wait $WRITER_PID 2>/dev/null
+    echo "cifs243: [note] writer exited during freeze (may not block on CIFS)" >> "$seqres.full"
+else
+    echo "cifs243: writer blocked during freeze OK" >> "$seqres.full"
+fi
+
+# --- Test 4: fsfreeze -u resumes ---
+fsfreeze -u "$TEST_DIR" 2>>"$seqres.full" || _fail "fsfreeze -u failed"
+FROZEN=false
+
+echo "cifs243: filesystem thawed" >> "$seqres.full"
+
+# Wait for the blocked writer to finish
+if [ -n "$WRITER_PID" ]; then
+    wait $WRITER_PID 2>/dev/null || true
+    WRITER_PID=""
+fi
+
+# Give a moment for I/O to complete
+sleep 0.5
+
+# --- Test 5: verify pre-freeze data survived ---
+got=$(cat "$W/pre_freeze" 2>/dev/null)
+[ "$got" = "before_freeze_data" ] || _fail "pre-freeze data lost: got '$got'"
+
+echo "cifs243: pre-freeze data OK" >> "$seqres.full"
+
+# --- Test 6: verify normal I/O works after thaw ---
+echo "after_thaw_data" > "$W/post_thaw" || _fail "post-thaw write failed"
+got2=$(cat "$W/post_thaw")
+[ "$got2" = "after_thaw_data" ] || _fail "post-thaw data mismatch"
+
+echo "fsfreeze/thaw OK"
+
+status=0
+exit

@@ -32,19 +32,51 @@ cleanup_156() {
 }
 _register_cleanup cleanup_156
 
-base_opts="username=$USER,password=$PASS,noperm"
-[ -n "$CIFS_USER" ] && base_opts="username=$CIFS_USER,password=$CIFS_PASS,noperm"
+# Resolve credentials: prefer credentials file, then CIFS_USER/CIFS_PASS, then
+# parse credentials= from MOUNT_OPTIONS, then inline username=/password= from
+# MOUNT_OPTIONS.
+_resolve_cifs_creds() {
+    # 1. Explicit credentials file
+    if [ -n "$CIFS_CRED_FILE" ] && [ -r "$CIFS_CRED_FILE" ]; then
+        echo "credentials=$CIFS_CRED_FILE,noperm"; return
+    fi
+    # 2. Well-known credentials file
+    if [ -r /root/.cifs-cred-xfstest ]; then
+        echo "credentials=/root/.cifs-cred-xfstest,noperm"; return
+    fi
+    # 3. credentials= in MOUNT_OPTIONS
+    local cred_file
+    cred_file=$(echo "${MOUNT_OPTIONS:-}" | sed -n 's/.*credentials=\([^,]*\).*/\1/p')
+    if [ -n "$cred_file" ] && [ -r "$cred_file" ]; then
+        echo "credentials=$cred_file,noperm"; return
+    fi
+    # 4. CIFS_USER/CIFS_PASS environment
+    if [ -n "$CIFS_USER" ] && [ -n "$CIFS_PASS" ]; then
+        echo "username=$CIFS_USER,password=$CIFS_PASS,noperm"; return
+    fi
+    # 5. Inline username=/password= from MOUNT_OPTIONS
+    local u p
+    u=$(echo "${MOUNT_OPTIONS:-}" | sed -n 's/.*username=\([^,]*\).*/\1/p')
+    p=$(echo "${MOUNT_OPTIONS:-}" | sed -n 's/.*password=\([^,]*\).*/\1/p')
+    if [ -n "$u" ] && [ -n "$p" ]; then
+        echo "username=$u,password=$p,noperm"; return
+    fi
+    return 1
+}
 
-# Prefer configured credentials from local.config when available.
-if [ -n "$CIFS_CRED_FILE" ] && [ -r "$CIFS_CRED_FILE" ]; then
-	base_opts="credentials=$CIFS_CRED_FILE,noperm"
-elif [ -r /root/.cifs-cred-xfstest ]; then
-	base_opts="credentials=/root/.cifs-cred-xfstest,noperm"
-elif [ -n "$CIFS_USER" ] && [ -n "$CIFS_PASS" ]; then
-	base_opts="username=$CIFS_USER,password=$CIFS_PASS,noperm"
-else
-	_notrun "no CIFS credentials available for explicit hard/soft mounts"
-fi
+base_opts=$(_resolve_cifs_creds) || _notrun "no CIFS credentials available for explicit hard/soft mounts"
+
+# Also carry essential options from MOUNT_OPTIONS (vers=, dir_mode=, etc.)
+extra_opts=$(echo "${MOUNT_OPTIONS#-o}" | sed 's/^[[:space:]]*//' | awk -F, '{
+	out=""
+	for(i=1;i<=NF;i++){
+		if($i ~ /^(vers=|dir_mode=|file_mode=|serverino|mfsymlinks|reparse=)/) {
+			out = out (out ? "," : "") $i
+		}
+	}
+	print out
+}')
+[ -n "$extra_opts" ] && base_opts="$base_opts,$extra_opts"
 
 make_mount "$HARD_MNT" "hard,timeo=600,retrans=3,$base_opts"
 make_mount "$SOFT_MNT" "soft,timeo=5,retrans=1,$base_opts"

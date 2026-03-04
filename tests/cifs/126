@@ -32,7 +32,7 @@ _register_cleanup _cleanup_attrcache
 # Start from a clean state for the default mount
 _test_unmount >/dev/null 2>&1
 
-A1=5   # actimeo seconds for M1 (cache TTL)
+A1=10  # actimeo seconds for M1 (cache TTL) — use 10s to avoid race with network latency
 A2=1   # actimeo seconds for M2
 
 # Build mount options by taking existing MOUNT_OPTIONS and overriding actimeo at the end (last wins)
@@ -46,9 +46,10 @@ _opts_wo() {
 
 MO=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
 MO1=$(_opts_wo "$MO" "actimeo")
+MO1=$(_opts_wo "$MO1" "nosharesock")
 MO2=$MO1
-[ -n "$MO1" ] && MO1="$MO1,actimeo=$A1" || MO1="actimeo=$A1"
-[ -n "$MO2" ] && MO2="$MO2,actimeo=$A2" || MO2="actimeo=$A2"
+[ -n "$MO1" ] && MO1="$MO1,actimeo=$A1,nosharesock,nolease" || MO1="actimeo=$A1,nosharesock,nolease"
+[ -n "$MO2" ] && MO2="$MO2,actimeo=$A2,nosharesock" || MO2="actimeo=$A2,nosharesock"
 
 # Create two independent mount points to the same share
 M1=$(mktemp -d /tmp/cifs126.m1.XXXXXX) || _fail "mktemp M1 failed"

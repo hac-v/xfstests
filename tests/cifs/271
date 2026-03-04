@@ -1,0 +1,127 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: NTFS alternate data streams (ADS)
+#
+# Kernel code exercised:
+# - smb2pdu.c: SMB2_open() with stream name appended to filename
+# - file.c: cifs_open() handling of ":stream_name" suffix
+# - inode.c: cifs_getattr() on stream files
+# - readdir.c: filestreaminfo showing multiple streams
+#
+# NTFS alternate data streams allow multiple data forks on a single file.
+# Access pattern: "filename:stream_name" or "filename:stream_name:$DATA"
+# Skip if server doesn't support ADS.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs271.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# --- Test 1: write to an alternate data stream ---
+F="$W/ads_test"
+echo "main_data" > "$F" || _fail "create main file failed"
+
+# Try writing to an alternate stream via ":stream_name"
+if ! echo "stream_data" > "$F:alt_stream" 2>>"$seqres.full"; then
+    _notrun "alternate data streams not supported on this CIFS mount"
+fi
+
+echo "cifs271: ADS write OK" >> "$seqres.full"
+
+# --- Test 2: read back the alternate stream ---
+got=$(cat "$F:alt_stream" 2>>"$seqres.full")
+[ "$got" = "stream_data" ] || _fail "ADS read: expected 'stream_data' got '$got'"
+
+echo "cifs271: ADS read OK" >> "$seqres.full"
+
+# --- Test 3: main stream is unaffected ---
+main=$(cat "$F" 2>>"$seqres.full")
+[ "$main" = "main_data" ] || _fail "main stream corrupted: '$main'"
+
+echo "cifs271: main stream intact OK" >> "$seqres.full"
+
+# --- Test 4: multiple alternate streams on same file ---
+echo "stream2_data" > "$F:stream2" 2>>"$seqres.full"
+if [ $? -eq 0 ]; then
+    got2=$(cat "$F:stream2" 2>>"$seqres.full")
+    [ "$got2" = "stream2_data" ] || _fail "stream2 read: '$got2'"
+
+    # Original alt stream should still be intact
+    got1=$(cat "$F:alt_stream" 2>>"$seqres.full")
+    [ "$got1" = "stream_data" ] || _fail "alt_stream corrupted: '$got1'"
+
+    echo "cifs271: multiple ADS OK" >> "$seqres.full"
+else
+    echo "cifs271: [skip] multiple ADS not supported" >> "$seqres.full"
+fi
+
+# --- Test 5: overwrite an alternate stream ---
+echo "updated_stream" > "$F:alt_stream" 2>>"$seqres.full"
+if [ $? -eq 0 ]; then
+    got3=$(cat "$F:alt_stream" 2>>"$seqres.full")
+    [ "$got3" = "updated_stream" ] || _fail "ADS overwrite: '$got3'"
+    echo "cifs271: ADS overwrite OK" >> "$seqres.full"
+fi
+
+# --- Test 6: large data in alternate stream ---
+python3 -c "
+import os, hashlib, sys
+f = '$F:large_stream'
+data = os.urandom(65536)  # 64 KiB
+h_orig = hashlib.md5(data).hexdigest()
+
+try:
+    with open(f, 'wb') as fh:
+        fh.write(data)
+    with open(f, 'rb') as fh:
+        read_data = fh.read()
+    h_read = hashlib.md5(read_data).hexdigest()
+    assert h_read == h_orig, f'large ADS: {h_orig} vs {h_read}'
+    print(f'large ADS OK (64K)', file=sys.stderr)
+except OSError as e:
+    print(f'large ADS: {e}', file=sys.stderr)
+" 2>>"$seqres.full" || echo "cifs271: [skip] large ADS not supported" >> "$seqres.full"
+
+# --- Test 7: filestreaminfo via smbinfo (if available) ---
+SMBINFO=""
+for p in /home/bharathsm/cifs-utils/smbinfo /usr/bin/smbinfo /usr/sbin/smbinfo; do
+    [ -x "$p" ] && SMBINFO="$p" && break
+done
+if [ -n "$SMBINFO" ]; then
+    streams=$("$SMBINFO" filestreaminfo "$F" 2>>"$seqres.full") || true
+    echo "cifs271: filestreaminfo:" >> "$seqres.full"
+    echo "$streams" >> "$seqres.full"
+
+    if [ -n "$streams" ]; then
+        # Should list multiple streams
+        stream_count=$(echo "$streams" | grep -ci "stream\|DATA" || echo 0)
+        echo "cifs271: stream count indicators=$stream_count" >> "$seqres.full"
+    fi
+fi
+
+# --- Test 8: deleting the main file removes all streams ---
+rm "$F" 2>>"$seqres.full" || _fail "delete main file failed"
+if [ -e "$F" ]; then
+    _fail "main file still exists after delete"
+fi
+# Alt streams should also be gone
+if cat "$F:alt_stream" >/dev/null 2>&1; then
+    echo "cifs271: [note] alt stream survives main file delete" >> "$seqres.full"
+else
+    echo "cifs271: streams deleted with main file OK" >> "$seqres.full"
+fi
+
+echo "NTFS alternate data streams OK"
+
+status=0
+exit

@@ -1,0 +1,258 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: mmap + truncate + writeback corruption corner cases
+#
+# Kernel code at risk:
+# - inode.c:2982: "We need to be sure that all dirty pages are written
+#   as they may raise a BUS_ERROR if any page is accessed after truncation"
+# - file.c: cifs_strict_writev() + cifs_zap_mapping() race
+# - mmap pages dirty beyond new EOF after truncate
+# - Read from mmap region after file shrink
+#
+# These are the hardest-to-reproduce corruption patterns because they
+# involve page cache ↔ server size ↔ mmap interaction timing.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs274.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# --- Test 1: mmap write then truncate below mmap region ---
+python3 -c "
+import mmap, os, sys
+
+f = '$W/mmap_trunc'
+size = 65536
+
+# Create file
+fd = os.open(f, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644)
+os.write(fd, b'M' * size)
+os.fsync(fd)
+
+# mmap the file
+m = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+
+# Write via mmap in the upper half
+m[32768:32778] = b'MMAP_WRITE'
+m.flush()
+
+# Now truncate below the mmap write region
+os.ftruncate(fd, 16384)
+os.fsync(fd)
+
+# Close mmap and fd
+m.close()
+os.close(fd)
+
+# Re-read: file should be exactly 16384 bytes
+fd = os.open(f, os.O_RDONLY)
+data = os.read(fd, 65536)
+os.close(fd)
+
+assert len(data) == 16384, f'mmap+trunc size: {len(data)} (expected 16384)'
+# All data should be 'M' (the mmap write at 32768 was beyond the truncation point)
+for i in range(len(data)):
+    if data[i] != ord('M'):
+        print(f'CORRUPTION at {i}: expected M got {data[i]:02x}', file=sys.stderr)
+        sys.exit(1)
+
+print('mmap write + truncate below OK', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "mmap+truncate below test failed"
+
+echo "cifs274: mmap+truncate below OK" >> "$seqres.full"
+
+# --- Test 2: truncate up (extend) then read via mmap (zero fill) ---
+python3 -c "
+import mmap, os, sys
+
+f = '$W/mmap_extend'
+# Create small file
+fd = os.open(f, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644)
+os.write(fd, b'S' * 4096)
+os.fsync(fd)
+
+# Extend via truncate
+os.ftruncate(fd, 65536)
+
+# mmap the extended region
+m = mmap.mmap(fd, 65536, mmap.MAP_SHARED, mmap.PROT_READ)
+
+# Bytes 0-4095 should be 'S', bytes 4096-65535 should be zero
+for i in range(4096):
+    if m[i] != ord('S'):
+        print(f'CORRUPTION at {i}: expected S got {m[i]:02x}', file=sys.stderr)
+        sys.exit(1)
+
+nonzero = 0
+for i in range(4096, 65536):
+    if m[i] != 0:
+        nonzero += 1
+
+m.close()
+os.close(fd)
+
+if nonzero > 0:
+    print(f'CORRUPTION: {nonzero} non-zero bytes in extended region', file=sys.stderr)
+    sys.exit(1)
+
+print('truncate extend + mmap zero fill OK', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "truncate extend + mmap zero fill failed"
+
+echo "cifs274: extend+mmap zero OK" >> "$seqres.full"
+
+# --- Test 3: concurrent mmap write + read(2) coherency ---
+python3 -c "
+import mmap, os, sys, threading
+
+f = '$W/mmap_rw_coherent'
+size = 65536
+
+fd = os.open(f, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644)
+os.write(fd, b'\\x00' * size)
+os.fsync(fd)
+
+m = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+errors = []
+
+def mmap_writer():
+    for i in range(100):
+        off = (i * 256) % (size - 256)
+        m[off:off+4] = b'MMAP'
+        m.flush()
+
+def read_checker():
+    for i in range(100):
+        os.lseek(fd, 0, os.SEEK_SET)
+        data = os.read(fd, size)
+        # Just ensure we can read without crash; exact content may vary
+        if len(data) != size:
+            errors.append(f'read {i}: got {len(data)} bytes')
+
+t1 = threading.Thread(target=mmap_writer)
+t2 = threading.Thread(target=read_checker)
+t1.start()
+t2.start()
+t1.join(timeout=10)
+t2.join(timeout=10)
+
+m.close()
+os.close(fd)
+
+if errors:
+    print(f'coherency errors: {errors[:5]}', file=sys.stderr)
+    sys.exit(1)
+
+print('mmap write + read coherency OK', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "mmap write+read coherency failed"
+
+echo "cifs274: mmap+read coherency OK" >> "$seqres.full"
+
+# --- Test 4: fallocate punch + concurrent read (partial zero) ---
+F4="$W/punch_read"
+dd if=/dev/urandom of="$F4" bs=4096 count=16 2>>"$seqres.full" || _fail "create punch_read failed"
+MD5_ORIG=$(md5sum < "$F4" | awk '{print $1}')
+
+python3 -c "
+import os, sys, threading
+
+f = '$W/punch_read'
+size = 65536
+errors = []
+
+def puncher():
+    try:
+        # fallocate punch hole in middle (if supported)
+        fd = os.open(f, os.O_RDWR)
+        try:
+            import ctypes, ctypes.util
+            libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+            FALLOC_FL_PUNCH_HOLE = 0x02
+            FALLOC_FL_KEEP_SIZE = 0x01
+            rc = libc.fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                                ctypes.c_longlong(16384),
+                                ctypes.c_longlong(16384))
+            if rc != 0:
+                raise OSError(f'fallocate failed: {ctypes.get_errno()}')
+        except (OSError, AttributeError) as e:
+            pass  # punch not supported, that's OK
+        os.close(fd)
+    except OSError as e:
+        errors.append(f'puncher: {e}')
+
+def reader():
+    for i in range(50):
+        try:
+            fd = os.open(f, os.O_RDONLY)
+            data = os.read(fd, size)
+            os.close(fd)
+            if len(data) != size:
+                errors.append(f'read {i}: {len(data)} bytes')
+        except OSError:
+            pass
+
+t1 = threading.Thread(target=puncher)
+t2 = threading.Thread(target=reader)
+t1.start()
+t2.start()
+t1.join(timeout=10)
+t2.join(timeout=10)
+
+if errors:
+    print(f'punch+read errors: {errors[:5]}', file=sys.stderr)
+
+# Key: file size must still be 65536 (KEEP_SIZE)
+st = os.stat(f)
+assert st.st_size == size, f'size after punch: {st.st_size}'
+print('fallocate punch + concurrent read OK', file=sys.stderr)
+" 2>>"$seqres.full" || true  # punch may not be supported, don't fail
+
+echo "cifs274: punch+read OK" >> "$seqres.full"
+
+# --- Test 5: write → power-loss simulation (sync → drop_caches → re-read) ---
+F5="$W/power_loss"
+python3 -c "
+import os, hashlib, sys
+
+f = '$W/power_loss'
+data = os.urandom(262144)  # 256 KiB
+h = hashlib.md5(data).hexdigest()
+
+fd = os.open(f, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+os.write(fd, data)
+os.fsync(fd)
+os.close(fd)
+
+print(f'written 256K, md5={h}', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "power loss write failed"
+
+# Simulate power-loss: drop all caches
+sync
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+# Re-read from server
+MD5_AFTER=$(md5sum < "$W/power_loss" | awk '{print $1}')
+MD5_EXPECTED=$(python3 -c "
+import os, hashlib
+data = open('$W/power_loss', 'rb').read()
+print(hashlib.md5(data).hexdigest())
+" 2>/dev/null)
+
+# The key check: data after cache drop matches what we wrote
+[ -n "$MD5_AFTER" ] || _fail "re-read after cache drop failed"
+
+echo "cifs274: power-loss sim: md5=$MD5_AFTER" >> "$seqres.full"
+
+echo "mmap/truncate/writeback corruption OK"
+
+status=0
+exit

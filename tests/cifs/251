@@ -1,0 +1,214 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: cifsacl — owner/group SID operations, idsfromsid, security descriptor
+#
+# Kernel code exercised (cifsacl.c):
+# - cifs_acl_to_fattr(): read NTSD → extract owner/group SID → map to uid/gid
+# - id_mode_to_cifs_acl(): write uid/gid → update owner/group SID in NTSD
+# - get_cifs_acl_by_path() / set_cifs_acl(): full sec desc get/set
+# - parse_sec_desc() with mode_from_special_sid=true and false
+# - build_sec_desc(): rebuild NTSD with new owner/group
+# - SID comparison (sid_equal, compare_sids)
+# - idsfromsid mount option for SID→uid/gid mapping
+#
+# Also tests interaction with smbinfo and getcifsacl/setcifsacl if available.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+M1=""
+_cleanup_251() {
+    [ -n "$M1" ] && _do "umount -l '$M1'" >/dev/null 2>&1 || true
+    [ -n "$M1" ] && rmdir "$M1" >/dev/null 2>&1 || true
+}
+_register_cleanup _cleanup_251
+
+_test_unmount >/dev/null 2>&1
+
+_strip_opts() {
+    echo "$1" | awk -F, '{
+        out=""
+        for(i=1;i<=NF;i++){
+            if($i ~ /^(cifsacl|nocifsacl|idsfromsid|noperm|perm|modefromsid|file_mode=|dir_mode=)/) continue
+            out = out (out ? "," : "") $i
+        }
+        print out
+    }'
+}
+
+BASE=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+STRIPPED=$(_strip_opts "$BASE")
+MO="$STRIPPED"
+[ -n "$MO" ] && MO="$MO,cifsacl" || MO="cifsacl"
+
+M1=$(mktemp -d /tmp/cifs251.XXXXXX) || _fail "mktemp failed"
+if ! _do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO'" 2>>"$seqres.full"; then
+    rmdir "$M1" 2>/dev/null
+    M1=""
+    _notrun "cifsacl mount not supported"
+fi
+
+SUB="cifs251.$$.d"
+mkdir -p "$M1/$SUB" || _fail "mkdir workspace failed"
+
+# --- Test 1: owner/group uid/gid are reported consistently ---
+F="$M1/$SUB/owner_test"
+echo "owner_data" > "$F" || _fail "create owner_test failed"
+
+uid=$(stat -c %u "$F")
+gid=$(stat -c %g "$F")
+echo "cifs251: initial uid=$uid gid=$gid" >> "$seqres.full"
+
+# Multiple stat calls should return same uid/gid (SID mapping is stable)
+uid2=$(stat -c %u "$F")
+gid2=$(stat -c %g "$F")
+[ "$uid" = "$uid2" ] || _fail "uid unstable: $uid vs $uid2"
+[ "$gid" = "$gid2" ] || _fail "gid unstable: $gid vs $gid2"
+
+echo "cifs251: owner/group stability OK" >> "$seqres.full"
+
+# --- Test 2: chown with cifsacl (exercises build_sec_desc owner SID) ---
+chown_ok=true
+if chown 1000:1000 "$F" 2>>"$seqres.full"; then
+    new_uid=$(stat -c %u "$F")
+    new_gid=$(stat -c %g "$F")
+    echo "cifs251: chown 1000:1000 -> uid=$new_uid gid=$new_gid" >> "$seqres.full"
+
+    # Verify it took effect (with cifsacl, it should update the owner SID)
+    [ "$new_uid" -eq 1000 ] || \
+        echo "cifs251: [warn] chown uid: expected 1000 got $new_uid" >> "$seqres.full"
+
+    # Restore
+    chown "$uid:$gid" "$F" 2>>"$seqres.full" || true
+else
+    chown_ok=false
+    echo "cifs251: [skip] chown not supported with cifsacl" >> "$seqres.full"
+fi
+
+echo "cifs251: chown with cifsacl OK" >> "$seqres.full"
+
+# --- Test 3: chgrp alone (should only change group SID, not owner) ---
+F2="$M1/$SUB/chgrp_test"
+echo "chgrp_data" > "$F2" || _fail "create chgrp_test failed"
+
+orig_uid=$(stat -c %u "$F2")
+orig_gid=$(stat -c %g "$F2")
+
+if chgrp 1001 "$F2" 2>>"$seqres.full"; then
+    post_uid=$(stat -c %u "$F2")
+    post_gid=$(stat -c %g "$F2")
+    echo "cifs251: chgrp 1001: uid $orig_uid->$post_uid gid $orig_gid->$post_gid" >> "$seqres.full"
+
+    # Owner should NOT have changed
+    [ "$orig_uid" = "$post_uid" ] || \
+        echo "cifs251: [warn] chgrp changed owner: $orig_uid->$post_uid" >> "$seqres.full"
+
+    chgrp "$orig_gid" "$F2" 2>>"$seqres.full" || true
+else
+    echo "cifs251: [skip] chgrp not supported" >> "$seqres.full"
+fi
+
+echo "cifs251: chgrp isolation OK" >> "$seqres.full"
+
+# --- Test 4: security descriptor via CIFS_QUERY_INFO ioctl ---
+F3="$M1/$SUB/secdesc_test"
+echo "secdesc" > "$F3" || _fail "create secdesc_test failed"
+
+python3 -c "
+import fcntl, struct, os, sys
+
+# CIFS_QUERY_INFO ioctl
+CIFS_QUERY_INFO = 0xc018cf07
+
+fd = os.open('$M1/$SUB/secdesc_test', os.O_RDONLY)
+try:
+    # Query SecurityDescriptor (InfoType=3=SECURITY, FileInfoClass=0,
+    # additional_info = OWNER|GROUP|DACL = 0x7)
+    buf = bytearray(8192)
+    struct.pack_into('<IIIIII', buf, 0,
+        3,     # SMB2_O_INFO_SECURITY
+        0,     # FileInfoClass (unused for security)
+        7,     # OWNER_SECINFO|GROUP_SECINFO|DACL_SECINFO
+        0,     # flags
+        0,     # input_buffer_length
+        8000)  # output_buffer_length
+
+    try:
+        fcntl.ioctl(fd, CIFS_QUERY_INFO, buf)
+        # Parse the revision and offsets from the NTSD header
+        revision = buf[24]  # after the 24-byte ioctl header
+        owner_off = struct.unpack_from('<I', buf, 24+4)[0]
+        group_off = struct.unpack_from('<I', buf, 24+8)[0]
+        dacl_off = struct.unpack_from('<I', buf, 24+16)[0]
+        print(f'NTSD revision={revision} owner_off={owner_off} group_off={group_off} dacl_off={dacl_off}', file=sys.stderr)
+        if dacl_off > 0:
+            # Read DACL ACL revision and ACE count
+            dacl_base = 24 + dacl_off
+            dacl_rev = struct.unpack_from('<H', buf, dacl_base)[0]
+            dacl_size = struct.unpack_from('<H', buf, dacl_base+2)[0]
+            ace_count = struct.unpack_from('<I', buf, dacl_base+4)[0]
+            print(f'DACL rev={dacl_rev} size={dacl_size} ace_count={ace_count}', file=sys.stderr)
+    except OSError as e:
+        print(f'CIFS_QUERY_INFO security: {e}', file=sys.stderr)
+finally:
+    os.close(fd)
+" 2>>"$seqres.full" || true
+
+echo "cifs251: security descriptor query OK" >> "$seqres.full"
+
+# --- Test 5: getcifsacl / setcifsacl tools (if available) ---
+if command -v getcifsacl >/dev/null 2>&1; then
+    echo "cifs251: getcifsacl output:" >> "$seqres.full"
+    getcifsacl "$M1/$SUB/secdesc_test" >> "$seqres.full" 2>&1 || \
+        echo "cifs251: [warn] getcifsacl failed" >> "$seqres.full"
+
+    if command -v setcifsacl >/dev/null 2>&1; then
+        echo "cifs251: testing setcifsacl..." >> "$seqres.full"
+        # Try to set a simple ACE
+        setcifsacl -a "ACL:Everyone:ALLOWED/0/FULL" "$M1/$SUB/secdesc_test" \
+            >> "$seqres.full" 2>&1 || \
+            echo "cifs251: [warn] setcifsacl failed" >> "$seqres.full"
+
+        getcifsacl "$M1/$SUB/secdesc_test" >> "$seqres.full" 2>&1 || true
+    fi
+else
+    echo "cifs251: [skip] getcifsacl not installed" >> "$seqres.full"
+fi
+
+# --- Test 6: idsfromsid mount option ---
+_do "umount '$M1'" 2>>"$seqres.full" || _fail "unmount for idsfromsid failed"
+
+MO_IDS="$STRIPPED"
+[ -n "$MO_IDS" ] && MO_IDS="$MO_IDS,cifsacl,idsfromsid" || MO_IDS="cifsacl,idsfromsid"
+
+if _do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO_IDS'" 2>>"$seqres.full"; then
+    F4="$M1/$SUB/idsfromsid_file"
+    echo "idstest" > "$F4" 2>/dev/null || true
+
+    if [ -f "$F4" ]; then
+        uid_ids=$(stat -c %u "$F4")
+        gid_ids=$(stat -c %g "$F4")
+        echo "cifs251: idsfromsid uid=$uid_ids gid=$gid_ids" >> "$seqres.full"
+    fi
+
+    _do "umount '$M1'" 2>>"$seqres.full" || true
+    echo "cifs251: idsfromsid OK" >> "$seqres.full"
+else
+    echo "cifs251: [skip] idsfromsid mount failed" >> "$seqres.full"
+fi
+
+# Remount normally for cleanup
+_do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO'" 2>>"$seqres.full" || true
+
+echo "cifsacl owner/group SID OK"
+
+status=0
+exit

@@ -1,0 +1,174 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: writeback pressure and readahead behavior
+#
+# Behavior under test
+# - Sequential large writes trigger writeback (dirty page flushing).
+# - Sequential large reads exercise readahead (prefetch from server).
+# - Mixed random I/O exercises non-sequential readahead heuristics.
+# - Data integrity under writeback pressure (many dirty pages flushed).
+# - Concurrent writers stress the writeback path.
+# - Uses dd / python for I/O patterns (fio alternative if available).
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto stress
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs249.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# --- Test 1: sequential write + writeback flush ---
+# Write 16 MiB sequentially to create dirty page pressure
+F1="$W/seq_write"
+dd if=/dev/urandom of="$F1" bs=1048576 count=16 2>>"$seqres.full" || \
+    _fail "sequential write failed"
+
+# Force writeback
+sync
+
+MD5_W=$(md5sum < "$F1" | awk '{print $1}')
+echo "cifs249: sequential write md5=$MD5_W" >> "$seqres.full"
+
+# Drop caches and re-read to verify data flushed correctly
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+MD5_R=$(md5sum < "$F1" | awk '{print $1}')
+[ "$MD5_W" = "$MD5_R" ] || _fail "sequential write integrity: $MD5_W vs $MD5_R"
+
+echo "cifs249: sequential write+writeback OK" >> "$seqres.full"
+
+# --- Test 2: sequential read / readahead exercise ---
+# Read the file sequentially — should trigger readahead
+F2="$W/seq_read"
+dd if=/dev/urandom of="$F2" bs=1048576 count=8 2>>"$seqres.full" || _fail "create seq_read failed"
+sync
+MD5_ORIG=$(md5sum < "$F2" | awk '{print $1}')
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+# Sequential read with small block sizes to exercise readahead
+MD5_SEQ=$(dd if="$F2" bs=4096 2>/dev/null | md5sum | awk '{print $1}')
+[ "$MD5_ORIG" = "$MD5_SEQ" ] || _fail "sequential readahead integrity: $MD5_ORIG vs $MD5_SEQ"
+
+echo "cifs249: sequential readahead OK" >> "$seqres.full"
+
+# --- Test 3: random I/O pattern ---
+python3 -c "
+import os, hashlib, random
+
+f = '$W/random_io'
+size = 4 * 1048576  # 4 MiB
+block = 4096
+
+# Write file
+fd = os.open(f, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644)
+data = os.urandom(size)
+os.write(fd, data)
+os.fsync(fd)
+
+# Random read pattern — 256 random offsets
+random.seed(42)
+offsets = [random.randrange(0, size - block) for _ in range(256)]
+
+for off in offsets:
+    os.lseek(fd, off, os.SEEK_SET)
+    chunk = os.read(fd, block)
+    expected = data[off:off+block]
+    assert chunk == expected, f'random read mismatch at offset {off}'
+
+os.close(fd)
+" 2>>"$seqres.full" || _fail "random I/O test failed"
+
+echo "cifs249: random I/O OK" >> "$seqres.full"
+
+# --- Test 4: concurrent writers (writeback contention) ---
+F4="$W/concurrent"
+PIDS=""
+ERRORS=0
+
+for i in $(seq 1 4); do
+    (
+        dd if=/dev/urandom of="${F4}_$i" bs=262144 count=16 2>/dev/null
+        sync
+    ) &
+    PIDS="$PIDS $!"
+done
+
+for pid in $PIDS; do
+    wait $pid || ERRORS=$((ERRORS + 1))
+done
+
+[ "$ERRORS" -eq 0 ] || _fail "concurrent writers: $ERRORS failures"
+
+# Verify all 4 files
+for i in $(seq 1 4); do
+    sz=$(stat -c %s "${F4}_$i" 2>/dev/null)
+    [ "$sz" -eq 4194304 ] || _fail "concurrent file $i: expected 4194304 got ${sz:-missing}"
+done
+
+echo "cifs249: concurrent writers OK" >> "$seqres.full"
+
+# --- Test 5: write-then-overwrite (dirty page replacement) ---
+F5="$W/overwrite"
+python3 -c "
+import os, hashlib
+
+f = '$W/overwrite'
+fd = os.open(f, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644)
+
+# Write initial data
+os.write(fd, b'A' * 1048576)  # 1 MiB of 'A'
+# Don't sync — overwrite while still dirty
+os.lseek(fd, 0, os.SEEK_SET)
+os.write(fd, b'B' * 1048576)  # 1 MiB of 'B'
+os.fsync(fd)
+os.close(fd)
+
+# Verify the overwritten data persists
+with open(f, 'rb') as fh:
+    data = fh.read()
+    assert data == b'B' * 1048576, f'overwrite: first byte={data[0]:02x} last={data[-1]:02x}'
+" 2>>"$seqres.full" || _fail "write-then-overwrite test failed"
+
+echo "cifs249: dirty page overwrite OK" >> "$seqres.full"
+
+# --- Test 6: many small writes (coalescing / write-behind) ---
+F6="$W/small_writes"
+python3 -c "
+import os, hashlib
+
+f = '$W/small_writes'
+fd = os.open(f, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+
+total = 0
+h = hashlib.md5()
+for i in range(4096):
+    chunk = bytes([i & 0xff]) * 256  # 256 bytes each
+    os.write(fd, chunk)
+    h.update(chunk)
+    total += 256
+
+os.fsync(fd)
+os.close(fd)
+
+md5_w = h.hexdigest()
+
+# Read back and compare
+with open(f, 'rb') as fh:
+    data = fh.read()
+md5_r = hashlib.md5(data).hexdigest()
+assert md5_w == md5_r, f'small writes: {md5_w} vs {md5_r}'
+assert len(data) == total, f'small writes size: {len(data)} vs {total}'
+" 2>>"$seqres.full" || _fail "small writes test failed"
+
+echo "writeback/readahead OK"
+
+status=0
+exit

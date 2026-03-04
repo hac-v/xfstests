@@ -1,0 +1,208 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: cache=strict vs cache=none read throughput comparison
+#
+# Kernel code exercised:
+# - file.c: cifs_strict_readv() — uses page cache, readahead
+# - file.c: cifs_file_read_iter() for cache=none — every read goes to server
+# - inode.c: cifs_revalidate_mapping() — cache invalidation check
+# - Page cache hit path vs uncached SMB2 READ path
+#
+# Strategy:
+# - Create a 32 MiB test file
+# - Mount A: cache=strict — reads are served from page cache after first read
+# - Mount B: cache=none — every read goes to the server (no page cache)
+# - Workload: read the same 32 MiB file 5 times sequentially
+# - Measure: elapsed time, Reads counter from Stats
+# - Expected: cache=strict 2nd+ reads much faster (page cache), fewer Reads
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto stress perf
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+[ -r /proc/fs/cifs/Stats ] || _notrun "requires /proc/fs/cifs/Stats"
+
+MA=""; MB=""
+_cleanup_277() {
+    [ -n "$MB" ] && umount -l "$MB" 2>/dev/null || true
+    [ -n "$MA" ] && umount -l "$MA" 2>/dev/null || true
+    [ -n "$MB" ] && rmdir "$MB" 2>/dev/null || true
+    [ -n "$MA" ] && rmdir "$MA" 2>/dev/null || true
+}
+_register_cleanup _cleanup_277
+
+_test_unmount >/dev/null 2>&1
+
+_strip_cache_opts() {
+    echo "$1" | awk -F, '{
+        out=""
+        for(i=1;i<=NF;i++){
+            if($i ~ /^(cache=|nosharesock$|actimeo=)/) continue
+            out = out (out ? "," : "") $i
+        }
+        print out
+    }'
+}
+
+BASE=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+CLEAN=$(_strip_cache_opts "$BASE")
+
+# Helper: get Reads count from Stats
+_get_reads() {
+    awk '/Reads:/ && !/ReadDir/ {split($2, a, " "); sum += a[1]} END {print sum+0}' \
+        /proc/fs/cifs/Stats 2>/dev/null
+}
+
+# Helper: get Bytes read from Stats
+_get_bytes_read() {
+    awk '/Bytes read:/ {for(i=1;i<=NF;i++){if($i=="read:") print $(i+1)}}' \
+        /proc/fs/cifs/Stats 2>/dev/null | awk '{sum+=$1} END {print sum+0}'
+}
+
+# Helper: reset Stats
+_reset_stats() {
+    echo 0 > /proc/fs/cifs/Stats 2>/dev/null || true
+    sleep 0.5
+}
+
+FILE_SIZE=$((32 * 1048576))  # 32 MiB
+SUBDIR="cifs277.$$"
+TESTFILE="$SUBDIR/perf_read.dat"
+READ_PASSES=5
+
+# ============================================================
+# Create test file via a temporary mount
+# ============================================================
+SEED_MNT=$(mktemp -d /tmp/cifs277.seed.XXXXXX) || _fail "mktemp seed"
+_do "mount -t cifs '$TEST_DEV' '$SEED_MNT' -o '$CLEAN,nosharesock'" 2>>"$seqres.full" || \
+    _fail "seed mount failed"
+
+mkdir -p "$SEED_MNT/$SUBDIR" || _fail "mkdir subdir failed"
+dd if=/dev/urandom of="$SEED_MNT/$TESTFILE" bs=1048576 count=32 2>>"$seqres.full" || \
+    _fail "create test file failed"
+sync
+ORIG_MD5=$(md5sum < "$SEED_MNT/$TESTFILE" | awk '{print $1}')
+echo "cifs277: test file created, md5=$ORIG_MD5, size=$FILE_SIZE" >> "$seqres.full"
+
+_do "umount '$SEED_MNT'" 2>>"$seqres.full"
+rmdir "$SEED_MNT" 2>/dev/null
+
+# ============================================================
+# Phase 1: cache=strict (page cache enabled)
+# ============================================================
+MO_STRICT="$CLEAN,cache=strict,nosharesock,actimeo=0"
+
+MA=$(mktemp -d /tmp/cifs277.strict.XXXXXX) || _fail "mktemp MA"
+_do "mount -t cifs '$TEST_DEV' '$MA' -o '$MO_STRICT'" 2>>"$seqres.full" || \
+    _fail "mount cache=strict failed"
+
+echo "cifs277: Phase 1 — cache=strict" >> "$seqres.full"
+
+_reset_stats
+READS_BEFORE_A=$(_get_reads)
+T_START_A=$(date +%s%N)
+
+# Read the file N times — first read populates cache, rest from page cache
+for pass in $(seq 1 $READ_PASSES); do
+    dd if="$MA/$TESTFILE" of=/dev/null bs=1048576 2>>"$seqres.full"
+done
+
+T_END_A=$(date +%s%N)
+READS_AFTER_A=$(_get_reads)
+
+ELAPSED_A=$(( (T_END_A - T_START_A) / 1000000 ))
+READS_A=$((READS_AFTER_A - READS_BEFORE_A))
+
+# Verify data integrity on last read
+READ_MD5=$(md5sum < "$MA/$TESTFILE" | awk '{print $1}')
+[ "$READ_MD5" = "$ORIG_MD5" ] || _fail "cache=strict md5 mismatch: $READ_MD5 vs $ORIG_MD5"
+
+echo "cifs277: cache=strict: ${ELAPSED_A}ms, Reads=$READS_A (${READ_PASSES} passes × 32M)" >> "$seqres.full"
+
+_do "umount '$MA'" 2>>"$seqres.full"
+rmdir "$MA" 2>/dev/null; MA=""
+
+# ============================================================
+# Phase 2: cache=none (no page cache)
+# ============================================================
+MO_NONE="$CLEAN,cache=none,nosharesock,actimeo=0"
+
+MB=$(mktemp -d /tmp/cifs277.none.XXXXXX) || _fail "mktemp MB"
+if ! _do "mount -t cifs '$TEST_DEV' '$MB' -o '$MO_NONE'" 2>>"$seqres.full"; then
+    # cache=none might not be supported, try without it
+    rmdir "$MB" 2>/dev/null; MB=""
+    _notrun "cache=none mount not supported"
+fi
+
+echo "cifs277: Phase 2 — cache=none" >> "$seqres.full"
+
+_reset_stats
+READS_BEFORE_B=$(_get_reads)
+T_START_B=$(date +%s%N)
+
+# Same workload — every read goes to server
+for pass in $(seq 1 $READ_PASSES); do
+    dd if="$MB/$TESTFILE" of=/dev/null bs=1048576 2>>"$seqres.full"
+done
+
+T_END_B=$(date +%s%N)
+READS_AFTER_B=$(_get_reads)
+
+ELAPSED_B=$(( (T_END_B - T_START_B) / 1000000 ))
+READS_B=$((READS_AFTER_B - READS_BEFORE_B))
+
+# Verify data integrity
+READ_MD5_B=$(md5sum < "$MB/$TESTFILE" | awk '{print $1}')
+[ "$READ_MD5_B" = "$ORIG_MD5" ] || _fail "cache=none md5 mismatch: $READ_MD5_B vs $ORIG_MD5"
+
+echo "cifs277: cache=none: ${ELAPSED_B}ms, Reads=$READS_B (${READ_PASSES} passes × 32M)" >> "$seqres.full"
+
+_do "umount '$MB'" 2>>"$seqres.full"
+rmdir "$MB" 2>/dev/null; MB=""
+
+# ============================================================
+# Analysis
+# ============================================================
+echo "" >> "$seqres.full"
+echo "=== Cache Mode Read Throughput Summary ===" >> "$seqres.full"
+echo "File: 32 MiB, Read passes: $READ_PASSES" >> "$seqres.full"
+echo "" >> "$seqres.full"
+echo "cache=strict: ${ELAPSED_A}ms total, Reads=$READS_A" >> "$seqres.full"
+echo "cache=none:   ${ELAPSED_B}ms total, Reads=$READS_B" >> "$seqres.full"
+
+# Calculate throughput
+if [ "$ELAPSED_A" -gt 0 ]; then
+    TOTAL_MB=$((32 * READ_PASSES))
+    TPUT_A=$(( TOTAL_MB * 1000 / ELAPSED_A ))
+    echo "cache=strict throughput: ~${TPUT_A} MB/s" >> "$seqres.full"
+fi
+if [ "$ELAPSED_B" -gt 0 ]; then
+    TPUT_B=$(( TOTAL_MB * 1000 / ELAPSED_B ))
+    echo "cache=none throughput:   ~${TPUT_B} MB/s" >> "$seqres.full"
+fi
+
+if [ "$READS_A" -gt 0 ] && [ "$READS_B" -gt 0 ]; then
+    if [ "$READS_A" -lt "$READS_B" ]; then
+        read_savings=$(( (READS_B - READS_A) * 100 / READS_B ))
+        echo "" >> "$seqres.full"
+        echo "cache=strict saved ${read_savings}% server Reads ($READS_B → $READS_A)" >> "$seqres.full"
+    fi
+fi
+
+if [ "$ELAPSED_A" -gt 0 ] && [ "$ELAPSED_B" -gt 0 ]; then
+    if [ "$ELAPSED_A" -lt "$ELAPSED_B" ]; then
+        speedup=$(( (ELAPSED_B - ELAPSED_A) * 100 / ELAPSED_B ))
+        echo "cache=strict ${speedup}% faster (${ELAPSED_B}ms → ${ELAPSED_A}ms)" >> "$seqres.full"
+    else
+        echo "cifs277: [note] cache=strict not faster (possible on local server with fast I/O)" >> "$seqres.full"
+    fi
+fi
+
+echo "cache mode read throughput OK"
+
+status=0
+exit

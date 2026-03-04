@@ -75,8 +75,18 @@ for idx in "${!__parsed[@]}"; do
     OTHER_OPTS+=("${__parsed[$idx]}")
 done
 
-[ -n "$USER" ] || _notrun "username not found in mount options"
-[ -n "$PASS" ] || _notrun "password not found in mount options"
+[ -n "$USER" ] && [ -n "$PASS" ] || {
+    # Fallback: try reading from credentials file referenced in MOUNT_OPTIONS
+    _cred_file=$(echo "${MOUNT_OPTIONS:-}" | sed -n 's/.*credentials=\([^,]*\).*/\1/p')
+    if [ -n "$_cred_file" ] && [ -r "$_cred_file" ]; then
+        [ -n "$USER" ] || USER=$(sed -n 's/^username=//p' "$_cred_file" | head -1)
+        [ -n "$PASS" ] || PASS=$(sed -n 's/^password=//p' "$_cred_file" | head -1)
+        DOMAIN=${DOMAIN:-$(sed -n 's/^domain=//p' "$_cred_file" | head -1)}
+        echo "cifs203: extracted credentials from $_cred_file" >> $seqres.full
+    fi
+    [ -n "$USER" ] || _notrun "username not found in mount options or credentials file"
+    [ -n "$PASS" ] || _notrun "password not found in mount options or credentials file"
+}
 
 _is_mounted() {
     if command -v findmnt >/dev/null 2>&1; then

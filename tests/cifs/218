@@ -1,0 +1,139 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: chmod / chown / chgrp with POSIX mount extensions
+#
+# Behavior under test
+# - Mount with SMB3.1.1 POSIX extensions (unix) or modefromsid.
+# - Verify chmod changes file mode and persists across stat.
+# - Verify chown changes owner UID (if server allows).
+# - Verify chgrp changes group GID (if server allows).
+# - Gracefully skip if server does not support POSIX extensions.
+#
+# Output
+# - Single success line; diagnostics go to $seqres.full.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+
+M1=""
+_cleanup_218() {
+    [ -n "$M1" ] && _do "umount -l '$M1'" >/dev/null 2>&1 || true
+    [ -n "$M1" ] && rmdir "$M1" >/dev/null 2>&1 || true
+}
+_register_cleanup _cleanup_218
+
+_test_unmount >/dev/null 2>&1
+
+# Strip options that conflict with what we need to set
+_strip_opts() {
+    echo "$1" | awk -F, '{
+        out=""
+        for(i=1;i<=NF;i++){
+            if($i ~ /^(unix|nounix|posix|noposix|modefromsid|file_mode=|dir_mode=|noperm|perm)$/) continue
+            if($i ~ /^file_mode=/ || $i ~ /^dir_mode=/) continue
+            out = out (out ? "," : "") $i
+        }
+        print out
+    }'
+}
+
+BASE=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+STRIPPED=$(_strip_opts "$BASE")
+
+# Try multiple POSIX extension methods in order of preference
+POSIX_MODE=""
+for try_opt in "unix" "modefromsid"; do
+    MO="$STRIPPED"
+    [ -n "$MO" ] && MO="$MO,$try_opt" || MO="$try_opt"
+
+    M1=$(mktemp -d /tmp/cifs218.XXXXXX) || _fail "mktemp failed"
+    if _do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO'" 2>>"$seqres.full"; then
+        POSIX_MODE="$try_opt"
+        echo "cifs218: mounted with $try_opt" >> "$seqres.full"
+        break
+    fi
+    rmdir "$M1" 2>/dev/null
+    M1=""
+done
+
+[ -n "$POSIX_MODE" ] || _notrun "server does not support unix or modefromsid extensions"
+
+SUB="cifs218.$$.d"
+mkdir -p "$M1/$SUB" || _fail "mkdir workspace failed"
+F="$M1/$SUB/testfile"
+echo "chmod_test" > "$F" || _fail "create file failed"
+
+# --- Test 1: chmod ---
+chmod 0644 "$F" 2>>"$seqres.full"
+m1=$(stat -c %a "$F")
+echo "cifs218: initial mode=$m1" >> "$seqres.full"
+
+chmod 0755 "$F" 2>>"$seqres.full"
+if [ $? -ne 0 ]; then
+    echo "cifs218: [skip] chmod failed (server may not support)" >> "$seqres.full"
+else
+    m2=$(stat -c %a "$F")
+    echo "cifs218: after chmod 755, mode=$m2" >> "$seqres.full"
+    if [ "$m2" != "755" ]; then
+        # Some servers round mode bits; check at least the user bits changed
+        u_bits=$(( (0$m2 / 64) % 8 ))
+        [ "$u_bits" -eq 7 ] || _fail "chmod did not apply: expected 755 got $m2"
+        echo "cifs218: [note] mode rounded to $m2 (user bits OK)" >> "$seqres.full"
+    fi
+fi
+
+chmod 0600 "$F" 2>>"$seqres.full"
+m3=$(stat -c %a "$F")
+echo "cifs218: after chmod 600, mode=$m3" >> "$seqres.full"
+if [ "$m3" != "600" ]; then
+    u_bits=$(( (0$m3 / 64) % 8 ))
+    [ "$u_bits" -eq 6 ] || _fail "chmod 600 did not apply: got $m3"
+fi
+
+echo "cifs218: chmod OK" >> "$seqres.full"
+
+# --- Test 2: chmod on directory ---
+D="$M1/$SUB/testdir"
+mkdir "$D" 2>>"$seqres.full" || _fail "mkdir testdir failed"
+chmod 0700 "$D" 2>>"$seqres.full"
+dm=$(stat -c %a "$D")
+echo "cifs218: dir mode after chmod 700=$dm" >> "$seqres.full"
+chmod 0755 "$D" 2>>"$seqres.full"
+dm2=$(stat -c %a "$D")
+echo "cifs218: dir mode after chmod 755=$dm2" >> "$seqres.full"
+
+# --- Test 3: chown (may fail on Azure Files; that's OK) ---
+chown_ok=true
+chown 1000 "$F" 2>>"$seqres.full" || chown_ok=false
+if $chown_ok; then
+    owner=$(stat -c %u "$F")
+    echo "cifs218: chown to 1000, got uid=$owner" >> "$seqres.full"
+    [ "$owner" -eq 1000 ] || echo "cifs218: [warn] chown uid mismatch: expected 1000 got $owner" >> "$seqres.full"
+    # Restore
+    chown 0 "$F" 2>>"$seqres.full" || true
+else
+    echo "cifs218: [skip] chown not supported by server" >> "$seqres.full"
+fi
+
+# --- Test 4: chgrp (may fail on Azure Files; that's OK) ---
+chgrp_ok=true
+chgrp 1000 "$F" 2>>"$seqres.full" || chgrp_ok=false
+if $chgrp_ok; then
+    group=$(stat -c %g "$F")
+    echo "cifs218: chgrp to 1000, got gid=$group" >> "$seqres.full"
+    [ "$group" -eq 1000 ] || echo "cifs218: [warn] chgrp gid mismatch: expected 1000 got $group" >> "$seqres.full"
+    chgrp 0 "$F" 2>>"$seqres.full" || true
+else
+    echo "cifs218: [skip] chgrp not supported by server" >> "$seqres.full"
+fi
+
+echo "posix chmod/chown/chgrp OK"
+
+status=0
+exit

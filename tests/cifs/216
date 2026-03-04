@@ -1,0 +1,113 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: POSIX readdir correctness and stress
+#
+# Behavior under test
+# - readdir(3) lists all entries in a directory with many files.
+# - File deletion during readdir iteration doesn't crash or loop.
+# - Filenames with spaces, dots, unicode survive round-trip.
+# - Empty directory readdir returns only . and ..
+#
+# Output
+# - Single success line; diagnostics go to $seqres.full.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+W="$TEST_DIR/cifs216.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# --- Test 1: readdir with many files ---
+NFILES=500
+DIR1="$W/manyfiles"
+mkdir -p "$DIR1" || _fail "mkdir manyfiles failed"
+
+for i in $(seq 1 $NFILES); do
+    : > "$DIR1/file_$i"
+done 2>>"$seqres.full" || _fail "creating $NFILES files failed"
+
+count=$(ls -1 "$DIR1" | wc -l)
+[ "$count" -eq "$NFILES" ] || _fail "readdir: expected $NFILES entries, got $count"
+
+echo "cifs216: many files readdir OK ($count)" >> "$seqres.full"
+
+# --- Test 2: deletion during listing ---
+DIR2="$W/delduring"
+mkdir -p "$DIR2" || _fail "mkdir delduring failed"
+for i in $(seq 1 100); do
+    echo "content_$i" > "$DIR2/del_$i"
+done
+
+# List files while concurrently deleting some
+(
+    sleep 0.1
+    for i in $(seq 1 2 100); do
+        rm -f "$DIR2/del_$i" 2>/dev/null
+    done
+) &
+DEL_PID=$!
+
+# Read directory listing — should not crash or hang
+listing=$(ls -1 "$DIR2" 2>>"$seqres.full") || true
+wait $DEL_PID 2>/dev/null
+
+# Verify remaining files (even-numbered) are accessible
+surviving=0
+for i in $(seq 2 2 100); do
+    if [ -f "$DIR2/del_$i" ]; then
+        got=$(cat "$DIR2/del_$i")
+        [ "$got" = "content_$i" ] || _fail "surviving file del_$i has wrong content"
+        surviving=$((surviving + 1))
+    fi
+done
+[ "$surviving" -eq 50 ] || _fail "expected 50 surviving files, got $surviving"
+
+echo "cifs216: delete-during-readdir OK" >> "$seqres.full"
+
+# --- Test 3: special filenames ---
+DIR3="$W/special_names"
+mkdir -p "$DIR3" || _fail "mkdir special_names failed"
+
+# Filenames with spaces, leading dots, multiple dots, long names
+names=(
+    "file with spaces"
+    ".hidden_file"
+    "multi...dots"
+    "MiXeD.CaSe.TxT"
+    "$(printf 'x%.0s' $(seq 1 200))"
+)
+
+for name in "${names[@]}"; do
+    echo "data" > "$DIR3/$name" 2>>"$seqres.full" || \
+        echo "cifs216: [warn] could not create '$name'" >> "$seqres.full"
+done
+
+found=0
+for name in "${names[@]}"; do
+    if [ -f "$DIR3/$name" ]; then
+        found=$((found + 1))
+    fi
+done
+[ "$found" -eq "${#names[@]}" ] || \
+    echo "cifs216: [warn] only $found of ${#names[@]} special names survived" >> "$seqres.full"
+
+echo "cifs216: special names OK ($found/${#names[@]})" >> "$seqres.full"
+
+# --- Test 4: empty directory readdir ---
+DIR4="$W/emptydir"
+mkdir -p "$DIR4" || _fail "mkdir emptydir failed"
+entries=$(ls -1a "$DIR4" | wc -l)
+# Should have . and .. only
+[ "$entries" -eq 2 ] || _fail "empty dir: expected 2 entries (. ..), got $entries"
+
+echo "posix readdir OK"
+
+status=0
+exit

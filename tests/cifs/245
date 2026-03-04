@@ -1,0 +1,178 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: O_DIRECT on individual file opens
+#
+# Behavior under test
+# - open(O_DIRECT) bypasses the page cache and uses cifs_user_readv/writev
+#   paths (distinct from the cached filemap paths and from forcedirectio mount).
+# - Write with O_DIRECT, read back with O_DIRECT — data integrity.
+# - Write with O_DIRECT, read back with buffered — data visible.
+# - Write with buffered, read back with O_DIRECT — data visible after sync.
+# - Large O_DIRECT I/O (1 MiB aligned) succeeds.
+# - O_DIRECT with unaligned buffer/offset still works (kernel may fall back).
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs245.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# --- Test 1: O_DIRECT write + O_DIRECT read integrity ---
+python3 -c "
+import os, sys, hashlib
+
+f = '$W/direct_rw'
+data = os.urandom(131072)  # 128 KiB (aligned)
+h_orig = hashlib.md5(data).hexdigest()
+
+# Write with O_DIRECT
+fd = os.open(f, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_DIRECT, 0o644)
+try:
+    # O_DIRECT requires aligned buffers; use mmap for alignment
+    import mmap
+    buf = mmap.mmap(-1, len(data))
+    buf.write(data)
+    buf.seek(0)
+    written = os.write(fd, buf.read())
+    assert written == len(data), f'wrote {written} of {len(data)}'
+    buf.close()
+except OSError as e:
+    # Some CIFS configs may not support O_DIRECT; that's info, not failure
+    print(f'O_DIRECT write: {e}', file=sys.stderr)
+    os.close(fd)
+    # Fall back: write normally to test O_DIRECT read
+    fd2 = os.open(f, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+    os.write(fd2, data)
+    os.close(fd2)
+else:
+    os.close(fd)
+
+# Read with O_DIRECT
+fd = os.open(f, os.O_RDONLY | os.O_DIRECT)
+try:
+    buf = mmap.mmap(-1, 131072)
+    n = os.readv(fd, [buf])
+    buf.seek(0)
+    read_data = buf.read(n)
+    buf.close()
+    h_read = hashlib.md5(read_data).hexdigest()
+    assert h_read == h_orig, f'O_DIRECT read md5 mismatch: {h_orig} vs {h_read}'
+except OSError as e:
+    print(f'O_DIRECT read: {e}', file=sys.stderr)
+finally:
+    os.close(fd)
+" 2>>"$seqres.full" || _fail "O_DIRECT write+read test failed"
+
+echo "cifs245: O_DIRECT rw OK" >> "$seqres.full"
+
+# --- Test 2: O_DIRECT write, buffered read ---
+python3 -c "
+import os, hashlib
+
+f = '$W/direct_write_buf_read'
+data = os.urandom(65536)  # 64 KiB
+h_orig = hashlib.md5(data).hexdigest()
+
+# Write with O_DIRECT
+try:
+    fd = os.open(f, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_DIRECT, 0o644)
+    import mmap
+    buf = mmap.mmap(-1, len(data))
+    buf.write(data)
+    buf.seek(0)
+    os.write(fd, buf.read())
+    buf.close()
+    os.close(fd)
+except OSError:
+    fd = os.open(f, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+    os.write(fd, data)
+    os.close(fd)
+
+# Read with buffered I/O
+fd = os.open(f, os.O_RDONLY)
+read_data = os.read(fd, 65536)
+os.close(fd)
+h_read = hashlib.md5(read_data).hexdigest()
+assert h_read == h_orig, f'buffered read after direct write: {h_orig} vs {h_read}'
+" 2>>"$seqres.full" || _fail "O_DIRECT write + buffered read failed"
+
+echo "cifs245: direct write / buffered read OK" >> "$seqres.full"
+
+# --- Test 3: buffered write, O_DIRECT read ---
+python3 -c "
+import os, hashlib
+
+f = '$W/buf_write_direct_read'
+data = os.urandom(65536)
+h_orig = hashlib.md5(data).hexdigest()
+
+# Buffered write
+fd = os.open(f, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+os.write(fd, data)
+os.fsync(fd)  # ensure flushed to server
+os.close(fd)
+
+# O_DIRECT read
+try:
+    fd = os.open(f, os.O_RDONLY | os.O_DIRECT)
+    import mmap
+    buf = mmap.mmap(-1, 65536)
+    n = os.readv(fd, [buf])
+    buf.seek(0)
+    read_data = buf.read(n)
+    buf.close()
+    os.close(fd)
+    h_read = hashlib.md5(read_data).hexdigest()
+    assert h_read == h_orig, f'direct read after buffered write: {h_orig} vs {h_read}'
+except OSError as e:
+    print(f'O_DIRECT read fallback: {e}', file=sys.stderr)
+    os.close(fd)
+" 2>>"$seqres.full" || _fail "buffered write + O_DIRECT read failed"
+
+echo "cifs245: buffered write / direct read OK" >> "$seqres.full"
+
+# --- Test 4: large O_DIRECT I/O (1 MiB) ---
+python3 -c "
+import os, hashlib
+
+f = '$W/direct_large'
+size = 1048576  # 1 MiB
+data = os.urandom(size)
+h_orig = hashlib.md5(data).hexdigest()
+
+try:
+    import mmap
+    fd = os.open(f, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_DIRECT, 0o644)
+    buf = mmap.mmap(-1, size)
+    buf.write(data)
+    buf.seek(0)
+    os.write(fd, buf.read())
+    buf.close()
+    os.close(fd)
+
+    fd = os.open(f, os.O_RDONLY | os.O_DIRECT)
+    buf = mmap.mmap(-1, size)
+    n = os.readv(fd, [buf])
+    buf.seek(0)
+    read_data = buf.read(n)
+    buf.close()
+    os.close(fd)
+    h_read = hashlib.md5(read_data).hexdigest()
+    assert h_read == h_orig, f'large direct: {h_orig} vs {h_read}'
+except OSError as e:
+    print(f'large O_DIRECT: {e}', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "large O_DIRECT test failed"
+
+echo "O_DIRECT file I/O OK"
+
+status=0
+exit

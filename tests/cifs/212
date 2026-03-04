@@ -1,0 +1,90 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: POSIX open flags — O_CREAT|O_EXCL, O_TRUNC, O_APPEND
+#
+# Behavior under test
+# - O_CREAT|O_EXCL: creates file exclusively; second attempt fails EEXIST.
+# - O_TRUNC: opening an existing file with O_TRUNC truncates it to zero.
+# - O_APPEND: writes always append regardless of lseek position.
+#
+# Output
+# - Single success line; diagnostics go to $seqres.full.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs212.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# --- Test 1: O_CREAT|O_EXCL ---
+python3 -c "
+import os, errno
+
+f = '$W/excl_file'
+# First create should succeed
+fd = os.open(f, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+os.write(fd, b'exclusive')
+os.close(fd)
+
+# Second create with O_EXCL must fail with EEXIST
+try:
+    fd2 = os.open(f, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    os.close(fd2)
+    raise AssertionError('O_EXCL did not fail on existing file')
+except OSError as e:
+    assert e.errno == errno.EEXIST, f'expected EEXIST, got {e}'
+" 2>>"$seqres.full" || _fail "O_CREAT|O_EXCL test failed"
+
+echo "cifs212: O_EXCL OK" >> "$seqres.full"
+
+# --- Test 2: O_TRUNC ---
+echo "original_content_here" > "$W/trunc_file" || _fail "create trunc_file failed"
+sz_before=$(stat -c %s "$W/trunc_file")
+[ "$sz_before" -gt 0 ] || _fail "trunc_file should not be empty"
+
+python3 -c "
+import os
+fd = os.open('$W/trunc_file', os.O_WRONLY | os.O_TRUNC)
+os.close(fd)
+" 2>>"$seqres.full" || _fail "O_TRUNC open failed"
+
+sz_after=$(stat -c %s "$W/trunc_file")
+[ "$sz_after" -eq 0 ] || _fail "O_TRUNC did not truncate: size=$sz_after"
+
+echo "cifs212: O_TRUNC OK" >> "$seqres.full"
+
+# --- Test 3: O_APPEND ---
+python3 -c "
+import os
+
+f = '$W/append_file'
+fd = os.open(f, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+os.write(fd, b'AAA')
+os.close(fd)
+
+# Open with O_APPEND, seek to beginning, write should still append
+fd = os.open(f, os.O_WRONLY | os.O_APPEND)
+os.lseek(fd, 0, os.SEEK_SET)  # seek to start
+os.write(fd, b'BBB')           # should still go to end
+os.close(fd)
+
+# Verify: file should contain 'AAABBB', not 'BBB'
+fd = os.open(f, os.O_RDONLY)
+data = os.read(fd, 4096)
+os.close(fd)
+assert data == b'AAABBB', f'O_APPEND broken: got {data!r}'
+" 2>>"$seqres.full" || _fail "O_APPEND test failed"
+
+echo "posix open flags OK"
+
+status=0
+exit

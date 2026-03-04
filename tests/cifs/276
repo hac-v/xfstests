@@ -1,0 +1,227 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: deferred close performance — closetimeo=N vs closetimeo=0
+#
+# Kernel code exercised:
+# - file.c: cifs_close() → smb2_can_defer_close() → cifs_add_deferred_close()
+# - file.c: deferred close timer queues delayed SMB2_CLOSE
+# - smb2ops.c: handle reuse when reopening a file with deferred close pending
+# - Stats: Creates counter — deferred close reuses handles, fewer Creates
+#
+# Scenario:
+# - Mount A: closetimeo=30 (deferred close enabled, 30 second window)
+# - Mount B: closetimeo=0 (deferred close disabled, immediate close)
+# - Workload: 500 rapid open→read→close cycles on the same set of files
+#   (simulates build system / git / rsync stat-heavy workloads)
+# - Measure: Creates counter from /proc/fs/cifs/Stats
+# - Expected: closetimeo=30 → significantly fewer Creates (handle reuse)
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto stress perf
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+[ -r /proc/fs/cifs/Stats ] || _notrun "requires /proc/fs/cifs/Stats"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+MA=""; MB=""
+_cleanup_276() {
+    [ -n "$MB" ] && umount -l "$MB" 2>/dev/null || true
+    [ -n "$MA" ] && umount -l "$MA" 2>/dev/null || true
+    [ -n "$MB" ] && rmdir "$MB" 2>/dev/null || true
+    [ -n "$MA" ] && rmdir "$MA" 2>/dev/null || true
+}
+_register_cleanup _cleanup_276
+
+_test_unmount >/dev/null 2>&1
+
+_strip_close_opts() {
+    echo "$1" | awk -F, '{
+        out=""
+        for(i=1;i<=NF;i++){
+            if($i ~ /^(closetimeo=|nosharesock$|actimeo=)/) continue
+            out = out (out ? "," : "") $i
+        }
+        print out
+    }'
+}
+
+BASE=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+CLEAN=$(_strip_close_opts "$BASE")
+
+# Helper: get Creates count from Stats
+_get_creates() {
+    awk '/Creates:/ {split($2, a, " "); sum += a[1]} END {print sum+0}' \
+        /proc/fs/cifs/Stats 2>/dev/null
+}
+
+# Helper: get Closes count from Stats
+_get_closes() {
+    awk '/Closes:/ {split($2, a, " "); sum += a[1]} END {print sum+0}' \
+        /proc/fs/cifs/Stats 2>/dev/null
+}
+
+# Helper: reset Stats
+_reset_stats() {
+    echo 0 > /proc/fs/cifs/Stats 2>/dev/null || true
+    sleep 0.5
+}
+
+# Create seed files on a temporary mount
+SEED_MNT=$(mktemp -d /tmp/cifs276.seed.XXXXXX) || _fail "mktemp seed"
+_do "mount -t cifs '$TEST_DEV' '$SEED_MNT' -o '$CLEAN,nosharesock'" 2>>"$seqres.full" || \
+    _fail "seed mount failed"
+
+SUBDIR="cifs276.$$"
+mkdir -p "$SEED_MNT/$SUBDIR" || _fail "mkdir subdir failed"
+
+# Create 50 files with content (so open+read is meaningful)
+for i in $(seq 1 50); do
+    echo "seed_data_file_$i_content_here" > "$SEED_MNT/$SUBDIR/file_$i.txt"
+done
+sync
+
+_do "umount '$SEED_MNT'" 2>>"$seqres.full"
+rmdir "$SEED_MNT" 2>/dev/null
+
+# ============================================================
+# Phase 1: closetimeo=30 (deferred close ON)
+# ============================================================
+MO_DEFER="$CLEAN,nosharesock,actimeo=0,closetimeo=30"
+
+MA=$(mktemp -d /tmp/cifs276.defer.XXXXXX) || _fail "mktemp MA"
+_do "mount -t cifs '$TEST_DEV' '$MA' -o '$MO_DEFER'" 2>>"$seqres.full" || \
+    _fail "mount closetimeo=30 failed"
+
+echo "cifs276: Phase 1 — closetimeo=30 (deferred close)" >> "$seqres.full"
+
+_reset_stats
+
+CREATES_BEFORE_A=$(_get_creates)
+CLOSES_BEFORE_A=$(_get_closes)
+T_START_A=$(date +%s%N)
+
+# Workload: 500 rapid open→read→close on 50 files (10 cycles each)
+python3 -c "
+import os, sys, time
+
+d = '$MA/$SUBDIR'
+files = [os.path.join(d, f'file_{i}.txt') for i in range(1, 51)]
+total_ops = 0
+
+for cycle in range(10):
+    for f in files:
+        fd = os.open(f, os.O_RDONLY)
+        data = os.read(fd, 4096)
+        os.close(fd)
+        total_ops += 1
+
+print(f'deferred: {total_ops} open/read/close ops', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "deferred workload failed"
+
+T_END_A=$(date +%s%N)
+CREATES_AFTER_A=$(_get_creates)
+CLOSES_AFTER_A=$(_get_closes)
+
+ELAPSED_A=$(( (T_END_A - T_START_A) / 1000000 ))
+CREATES_A=$((CREATES_AFTER_A - CREATES_BEFORE_A))
+CLOSES_A=$((CLOSES_AFTER_A - CLOSES_BEFORE_A))
+
+echo "cifs276: closetimeo=30: ${ELAPSED_A}ms, Creates=$CREATES_A, Closes=$CLOSES_A" >> "$seqres.full"
+
+_do "umount '$MA'" 2>>"$seqres.full"
+rmdir "$MA" 2>/dev/null; MA=""
+
+# ============================================================
+# Phase 2: closetimeo=0 (deferred close OFF)
+# ============================================================
+MO_NODEFER="$CLEAN,nosharesock,actimeo=0,closetimeo=0"
+
+MB=$(mktemp -d /tmp/cifs276.nodefer.XXXXXX) || _fail "mktemp MB"
+_do "mount -t cifs '$TEST_DEV' '$MB' -o '$MO_NODEFER'" 2>>"$seqres.full" || \
+    _fail "mount closetimeo=0 failed"
+
+echo "cifs276: Phase 2 — closetimeo=0 (no deferred close)" >> "$seqres.full"
+
+_reset_stats
+
+CREATES_BEFORE_B=$(_get_creates)
+CLOSES_BEFORE_B=$(_get_closes)
+T_START_B=$(date +%s%N)
+
+# Same workload
+python3 -c "
+import os, sys
+
+d = '$MB/$SUBDIR'
+files = [os.path.join(d, f'file_{i}.txt') for i in range(1, 51)]
+total_ops = 0
+
+for cycle in range(10):
+    for f in files:
+        fd = os.open(f, os.O_RDONLY)
+        data = os.read(fd, 4096)
+        os.close(fd)
+        total_ops += 1
+
+print(f'no-defer: {total_ops} open/read/close ops', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "no-defer workload failed"
+
+T_END_B=$(date +%s%N)
+CREATES_AFTER_B=$(_get_creates)
+CLOSES_AFTER_B=$(_get_closes)
+
+ELAPSED_B=$(( (T_END_B - T_START_B) / 1000000 ))
+CREATES_B=$((CREATES_AFTER_B - CREATES_BEFORE_B))
+CLOSES_B=$((CLOSES_AFTER_B - CLOSES_BEFORE_B))
+
+echo "cifs276: closetimeo=0: ${ELAPSED_B}ms, Creates=$CREATES_B, Closes=$CLOSES_B" >> "$seqres.full"
+
+_do "umount '$MB'" 2>>"$seqres.full"
+rmdir "$MB" 2>/dev/null; MB=""
+
+# ============================================================
+# Analysis
+# ============================================================
+echo "" >> "$seqres.full"
+echo "=== Deferred Close Performance Summary ===" >> "$seqres.full"
+echo "Workload: 500 open→read→close ops (50 files × 10 cycles)" >> "$seqres.full"
+echo "" >> "$seqres.full"
+echo "closetimeo=30 (deferred): ${ELAPSED_A}ms, Creates=$CREATES_A, Closes=$CLOSES_A" >> "$seqres.full"
+echo "closetimeo=0  (no defer): ${ELAPSED_B}ms, Creates=$CREATES_B, Closes=$CLOSES_B" >> "$seqres.full"
+
+if [ "$CREATES_A" -gt 0 ] && [ "$CREATES_B" -gt 0 ]; then
+    if [ "$CREATES_A" -lt "$CREATES_B" ]; then
+        savings=$(( (CREATES_B - CREATES_A) * 100 / CREATES_B ))
+        echo "" >> "$seqres.full"
+        echo "Deferred close saved ${savings}% Creates ($CREATES_B → $CREATES_A)" >> "$seqres.full"
+    elif [ "$CREATES_A" -eq "$CREATES_B" ]; then
+        echo "" >> "$seqres.full"
+        echo "cifs276: [note] same Creates count — server may not grant leases needed for deferred close" >> "$seqres.full"
+    fi
+fi
+
+if [ "$CLOSES_A" -gt 0 ] && [ "$CLOSES_B" -gt 0 ]; then
+    if [ "$CLOSES_A" -lt "$CLOSES_B" ]; then
+        close_savings=$(( (CLOSES_B - CLOSES_A) * 100 / CLOSES_B ))
+        echo "Deferred close saved ${close_savings}% Closes ($CLOSES_B → $CLOSES_A)" >> "$seqres.full"
+    fi
+fi
+
+if [ "$ELAPSED_A" -gt 0 ] && [ "$ELAPSED_B" -gt 0 ]; then
+    if [ "$ELAPSED_A" -lt "$ELAPSED_B" ]; then
+        speedup=$(( (ELAPSED_B - ELAPSED_A) * 100 / ELAPSED_B ))
+        echo "Time speedup: ${speedup}% (${ELAPSED_B}ms → ${ELAPSED_A}ms)" >> "$seqres.full"
+    else
+        echo "cifs276: [note] no time improvement (local server, low latency)" >> "$seqres.full"
+    fi
+fi
+
+echo "deferred close perf OK"
+
+status=0
+exit

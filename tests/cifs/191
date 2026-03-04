@@ -72,7 +72,7 @@ strip_multichannel() {
     echo "$1" | sed -E 's/(^|,)no?multichannel//g; s/,,/,/g; s/^,//; s/,$//'
 }
 
-base_opts=${MOUNT_OPTIONS#-o}
+base_opts=$(echo "${MOUNT_OPTIONS#-o}" | sed 's/^[[:space:]]*//')
 if [ -z "$base_opts" ]; then
     base_opts=$(awk -v mnt="$TEST_DIR" '$2==mnt {print $4}' /proc/mounts)
 fi

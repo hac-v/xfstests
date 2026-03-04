@@ -1,0 +1,114 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: VSS snapshot enumeration (FSCTL_SRV_ENUMERATE_SNAPSHOTS)
+#
+# Behavior under test
+# - Use the CIFS_IOC_GET_SNAPSHOTS ioctl (or smbinfo snapshots) to enumerate
+#   server-side VSS snapshots (previous versions) for the mounted share.
+# - Verify the ioctl returns successfully. If snapshots exist, validate the
+#   timestamp format. If no snapshots exist, that's still a valid response.
+# - Skip if the ioctl is not supported or smbinfo is unavailable.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+_register_cleanup "_test_unmount >/dev/null 2>&1; rm -rf \"$TEST_DIR/cifs234.$$\" >/dev/null 2>&1"
+
+_test_unmount > /dev/null 2>&1
+_do "_test_mount" || _fail "mount failed"
+
+W="$TEST_DIR/cifs234.$$"
+mkdir -p "$W" || _fail "mkdir failed"
+echo "snapshot_test" > "$W/testfile" || _fail "create failed"
+
+snapshot_count=""
+snapshot_output=""
+
+# Method 1: Try the Python ioctl approach (CIFS_IOC_GET_SNAPSHOTS = 0xc010cf06)
+# The ioctl takes a buffer and returns snapshot count + timestamps
+if python3 -c "
+import fcntl, struct, os, sys
+
+# CIFS_ENUMERATE_SNAPSHOTS ioctl number
+# #define CIFS_ENUMERATE_SNAPSHOTS _IOR(0xcf, 0x06, struct smb_snapshot_array)
+# struct smb_snapshot_array { __u32 number_of_snapshots; __u32 number_of_snapshots_returned; __u32 snapshot_array_size; char snapshot_array[]; }
+CIFS_ENUMERATE_SNAPSHOTS = 0x800ccf06  # _IOR
+
+fd = os.open('$W', os.O_RDONLY | os.O_DIRECTORY)
+try:
+    # First call with small buffer to get count
+    buf = bytearray(16)
+    try:
+        fcntl.ioctl(fd, CIFS_ENUMERATE_SNAPSHOTS, buf)
+    except OSError as e:
+        # Try alternate ioctl number
+        CIFS_ENUMERATE_SNAPSHOTS = 0xc010cf06
+        try:
+            buf = bytearray(4096)
+            fcntl.ioctl(fd, CIFS_ENUMERATE_SNAPSHOTS, buf)
+        except OSError as e2:
+            print(f'ioctl failed: {e2}')
+            sys.exit(77)
+
+    num_snapshots = struct.unpack_from('<I', buf, 0)[0]
+    num_returned = struct.unpack_from('<I', buf, 4)[0]
+    array_size = struct.unpack_from('<I', buf, 8)[0]
+    print(f'snapshots={num_snapshots} returned={num_returned} array_size={array_size}')
+
+    if num_returned > 0 and array_size > 0:
+        # Parse snapshot timestamps (UTF-16LE null-terminated strings)
+        offset = 12
+        for i in range(min(num_returned, 5)):
+            # Each timestamp is a wide string like @GMT-YYYY.MM.DD-HH.MM.SS
+            end = buf.find(b'\x00\x00', offset)
+            if end > offset:
+                ts = buf[offset:end+1].decode('utf-16-le', errors='replace').rstrip('\x00')
+                print(f'  [{i}] {ts}')
+                offset = end + 2
+    sys.exit(0)
+finally:
+    os.close(fd)
+" >> $seqres.full 2>&1; then
+    snapshot_output=$(tail -1 $seqres.full)
+    echo "ioctl method succeeded" >> $seqres.full
+else
+    rc=$?
+    if [ $rc -eq 77 ]; then
+        echo "ioctl method not supported, trying smbinfo" >> $seqres.full
+    else
+        echo "ioctl method failed with rc=$rc" >> $seqres.full
+    fi
+fi
+
+# Method 2: Try smbinfo if available
+if [ -z "$snapshot_output" ] && command -v smbinfo >/dev/null 2>&1; then
+    snap_out=$(smbinfo snapshots "$W/testfile" 2>>$seqres.full) || true
+    echo "smbinfo output: $snap_out" >> $seqres.full
+    if [ -n "$snap_out" ]; then
+        snapshot_output="$snap_out"
+    fi
+fi
+
+# Method 3: Try xfs_io -c snapshot if available
+if [ -z "$snapshot_output" ] && command -v $XFS_IO_PROG >/dev/null 2>&1; then
+    snap_out=$($XFS_IO_PROG -c "snapshot" "$W/testfile" 2>>$seqres.full) || true
+    echo "xfs_io snapshot output: $snap_out" >> $seqres.full
+    if [ -n "$snap_out" ]; then
+        snapshot_output="$snap_out"
+    fi
+fi
+
+if [ -z "$snapshot_output" ]; then
+    _notrun "VSS snapshot enumeration not supported (no working method found)"
+fi
+
+echo "VSS snapshot enumeration OK"
+
+status=0
+exit

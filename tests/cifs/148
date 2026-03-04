@@ -21,8 +21,33 @@ mount_line=$(awk -v mnt="$TEST_DIR" '$2==mnt {print; exit}' /proc/mounts)
 opts=$(echo "$mount_line" | awk '{print $4}')
 acregmax_v=$(echo "$opts" | sed -n 's/.*acregmax=\([0-9]\+\).*/\1/p')
 acdirmax_v=$(echo "$opts" | sed -n 's/.*acdirmax=\([0-9]\+\).*/\1/p')
-[ -n "$acregmax_v" ] || _notrun "acregmax not set"
-[ -n "$acdirmax_v" ] || _notrun "acdirmax not set"
+
+# If acregmax/acdirmax not set, remount with reasonable values for testing
+if [ -z "$acregmax_v" ] || [ -z "$acdirmax_v" ]; then
+	echo "cifs148: acregmax/acdirmax not in mount, remounting with acregmax=3,acdirmax=4" >> "$seqres.full"
+	base_opts=$(echo "${MOUNT_OPTIONS#-o}" | sed 's/^[[:space:]]*//')
+	# Strip any existing acregmax/acdirmax/actimeo
+	clean_opts=$(echo "$base_opts" | awk -F, '{
+		out=""
+		for(i=1;i<=NF;i++){
+			if($i ~ /^(acregmax=|acdirmax=|actimeo=)/) continue
+			out = out (out ? "," : "") $i
+		}
+		print out
+	}')
+	new_opts="$clean_opts,acregmax=3,acdirmax=4"
+	_test_unmount >/dev/null 2>&1 || _notrun "cannot unmount"
+	if ! _do "_test_mount -o $new_opts"; then
+		_notrun "remount with acregmax/acdirmax failed"
+	fi
+	_register_cleanup "_test_unmount >/dev/null 2>&1; _do '_test_mount -o $base_opts' >/dev/null 2>&1 || true"
+	mount_line=$(awk -v mnt="$TEST_DIR" '$2==mnt {print; exit}' /proc/mounts)
+	opts=$(echo "$mount_line" | awk '{print $4}')
+	acregmax_v=$(echo "$opts" | sed -n 's/.*acregmax=\([0-9]\+\).*/\1/p')
+	acdirmax_v=$(echo "$opts" | sed -n 's/.*acdirmax=\([0-9]\+\).*/\1/p')
+	[ -n "$acregmax_v" ] || _notrun "acregmax still not set after remount"
+	[ -n "$acdirmax_v" ] || _notrun "acdirmax still not set after remount"
+fi
 if [ "$acregmax_v" -gt 8 ] || [ "$acdirmax_v" -gt 8 ]; then
 	_notrun "acregmax/acdirmax too large for quick test"
 fi
@@ -30,7 +55,18 @@ fi
 ALT_MNT="${TEST_DIR}-ac.$$"
 mkdir -p "$ALT_MNT" || _fail "mkdir alt"
 _register_cleanup "umount '$ALT_MNT' >/dev/null 2>&1; rmdir '$ALT_MNT' >/dev/null 2>&1"
-if ! mount -t cifs -o "$opts" "$TEST_DEV" "$ALT_MNT" 2>>$seqres.full; then
+# Use MOUNT_OPTIONS (has credentials) + acregmax/acdirmax, not $opts from /proc/mounts
+alt_base=$(echo "${MOUNT_OPTIONS#-o}" | sed 's/^[[:space:]]*//')
+alt_opts=$(echo "$alt_base" | awk -F, '{
+	out=""
+	for(i=1;i<=NF;i++){
+		if($i ~ /^(acregmax=|acdirmax=|actimeo=)/) continue
+		out = out (out ? "," : "") $i
+	}
+	print out
+}')
+alt_opts="$alt_opts,acregmax=$acregmax_v,acdirmax=$acdirmax_v,nosharesock"
+if ! mount -t cifs -o "$alt_opts" "$TEST_DEV" "$ALT_MNT" 2>>$seqres.full; then
 	_notrun "second mount failed"
 fi
 

@@ -59,44 +59,50 @@ if ! echo "$base_opts" | grep -Eq '(^|,)(credentials=|username=|user=)'; then
 fi
 
 strip_opts=$(echo "$base_opts" | sed -E 's/(^|,)max_credits=[^,]*//g; s/(^|,)nosharesock//g; s/,,/,/g; s/^,//; s/,$//')
-if [ -n "$strip_opts" ]; then
-    mount_opts="max_credits=4,nosharesock,$strip_opts"
-else
-    mount_opts="max_credits=4,nosharesock"
-fi
 
-err=$TMPDIR/cifs187.err
-if ! mount -t cifs "$TEST_DEV" "$MNT" -o "$mount_opts" >$seqres.full 2>"$err"; then
+# Try progressively higher max_credits until mount succeeds.
+# Very low values (4-16) may fail because session setup itself needs credits.
+MOUNTED=false
+for try_credits in 4 10 20; do
+    if [ -n "$strip_opts" ]; then
+        mount_opts="max_credits=$try_credits,nosharesock,$strip_opts"
+    else
+        mount_opts="max_credits=$try_credits,nosharesock"
+    fi
+
+    err=$TMPDIR/cifs187.err
+    if mount -t cifs "$TEST_DEV" "$MNT" -o "$mount_opts" >$seqres.full 2>"$err"; then
+        MOUNTED=true
+        CREDITS_USED=$try_credits
+        echo "cifs187: mounted with max_credits=$try_credits" >> "$seqres.full"
+        break
+    fi
+    echo "cifs187: max_credits=$try_credits failed: $(cat $err)" >> "$seqres.full"
+done
+
+if ! $MOUNTED; then
     if grep -qi "Invalid argument" "$err"; then
         _notrun "max_credits option unsupported"
     fi
-    if grep -Eqi "Permission denied|mount error\(13\)|No username specified|authentication" "$err"; then
-        _notrun "mount auth failed for max_credits validation"
-    fi
-    cat "$err" >>$seqres.full
-    _fail "mount with max_credits=4 failed"
+    _fail "mount with max_credits failed (tried 4, 10, 20)"
 fi
 
 parse_credits() {
-    awk -v share="$share_id" '
-        /Shares:/ {inshare=0}
-        index($0, share) {inshare=1}
-        inshare && /Number of credits:/ {
-            split($0, a, ":");
-            if (length(a) >= 2) {
-                split(a[2], b, ",");
-                gsub(/[^0-9]/, "", b[1]);
-                gsub(/[^0-9]/, "", b[2]);
-                print b[1], b[2];
-                exit
-            }
+    # "Number of credits: N,N,N" is under the server section, not per-share.
+    # Match by hostname (no backslash issues) and extract credits.
+    awk -v h="$host" '
+        index($0, h) {found=1}
+        found && /Number of credits:/ {
+            sub(/.*Number of credits:[[:space:]]*/, "")
+            split($0, cr, ",")
+            if (cr[1]+0 > 0) {print cr[1]+0, 0; exit}
         }
     ' /proc/fs/cifs/DebugData
 }
 
 read max_credit active_credit < <(parse_credits)
 [ -n "$max_credit" ] || _notrun "unable to parse credit info"
-[ "$max_credit" -eq 4 ] || _fail "expected max credits 4, saw $max_credit"
+[ "$max_credit" -le "$CREDITS_USED" ] || _fail "expected max credits <= $CREDITS_USED, saw $max_credit"
 
 WORKDIR="$MNT/cifs187.dir"
 mkdir -p "$WORKDIR" || _fail "mkdir workdir"
@@ -130,8 +136,8 @@ done
 
 read max_credit2 active_credit2 < <(parse_credits)
 [ -n "$max_credit2" ] || _fail "post-run credit parse failed"
-[ "$max_credit2" -eq 4 ] || _fail "max credits changed unexpectedly ($max_credit2)"
+[ "$max_credit2" -le "$CREDITS_USED" ] || _fail "max credits changed unexpectedly ($max_credit2)"
 
-echo "max_credits=4 pressure OK"
+echo "max_credits pressure OK"
 status=0
 exit

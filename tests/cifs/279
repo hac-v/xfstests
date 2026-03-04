@@ -1,0 +1,198 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: beyond-EOF DIO/unbuffered read regression test
+#
+# Regression test for kernel commit:
+#   4ae4dde6f34a ("cifs: Fix handling of a beyond-EOF DIO/unbuffered read over SMB2")
+#
+# Bug: When a DIO read request extends beyond EOF, the server returns a
+# short read with STATUS_END_OF_FILE → -ENODATA. If rsize splits the
+# request into subrequests and a subrequest starts AFTER the EOF (not at
+# it), HIT_EOF is not flagged, the error propagates, and the read fails
+# instead of returning a short read (or 0 bytes for fully-past-EOF reads).
+#
+# Test:
+# 1. Create a file of known size (not a multiple of rsize)
+# 2. O_DIRECT read requesting MORE bytes than file size → must return
+#    exactly file_size bytes (short read), not an error
+# 3. O_DIRECT read starting AT EOF → must return 0 bytes, not error
+# 4. O_DIRECT read starting PAST EOF → must return 0 bytes, not error
+# 5. Buffered read past EOF for comparison
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs279.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# Create file with non-round size (not multiple of 4096 or rsize)
+# This maximizes the chance of a subrequest starting past EOF
+FILE_SIZE=100000  # ~97.6 KiB, not aligned to anything
+F="$W/eof_test"
+
+python3 -c "
+import os
+data = b'D' * $FILE_SIZE
+fd = os.open('$F', os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+os.write(fd, data)
+os.fsync(fd)
+os.close(fd)
+" || _fail "create test file failed"
+
+sync
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+echo "cifs279: created file size=$FILE_SIZE" >> "$seqres.full"
+
+# --- Test 1: O_DIRECT read requesting more than file size ---
+python3 -c "
+import os, sys, mmap, hashlib
+
+f = '$F'
+file_size = $FILE_SIZE
+request_size = file_size * 4  # request 4x the actual size
+
+fd = os.open(f, os.O_RDONLY | os.O_DIRECT)
+try:
+    # Aligned buffer for O_DIRECT
+    buf = mmap.mmap(-1, request_size)
+    n = os.readv(fd, [buf])
+
+    # Must return exactly file_size bytes (short read), NOT an error
+    assert n == file_size, f'beyond-EOF DIO: read {n} bytes, expected {file_size}'
+
+    # Verify data integrity
+    buf.seek(0)
+    data = buf.read(n)
+    assert all(b == ord('D') for b in data), 'data corruption in short DIO read'
+    buf.close()
+
+    print(f'beyond-EOF DIO: requested {request_size}, got {n} (correct short read)', file=sys.stderr)
+except OSError as e:
+    # The bug: this would fail with ENODATA or EIO instead of short read
+    print(f'beyond-EOF DIO FAILED: {e}', file=sys.stderr)
+    sys.exit(1)
+finally:
+    os.close(fd)
+" 2>>"$seqres.full" || _fail "beyond-EOF DIO read returned error instead of short read"
+
+echo "cifs279: beyond-EOF short read OK" >> "$seqres.full"
+
+# --- Test 2: O_DIRECT read starting exactly at EOF ---
+python3 -c "
+import os, sys, mmap
+
+f = '$F'
+file_size = $FILE_SIZE
+
+fd = os.open(f, os.O_RDONLY | os.O_DIRECT)
+try:
+    os.lseek(fd, file_size, os.SEEK_SET)  # seek to exactly EOF
+    buf = mmap.mmap(-1, 4096)
+    n = os.readv(fd, [buf])
+    buf.close()
+
+    # Read at EOF must return 0
+    assert n == 0, f'read at EOF: got {n} bytes, expected 0'
+    print(f'read at EOF: 0 bytes (correct)', file=sys.stderr)
+except OSError as e:
+    print(f'read at EOF FAILED: {e}', file=sys.stderr)
+    sys.exit(1)
+finally:
+    os.close(fd)
+" 2>>"$seqres.full" || _fail "O_DIRECT read at EOF returned error instead of 0"
+
+echo "cifs279: read at EOF OK" >> "$seqres.full"
+
+# --- Test 3: O_DIRECT read starting past EOF ---
+python3 -c "
+import os, sys, mmap
+
+f = '$F'
+file_size = $FILE_SIZE
+
+fd = os.open(f, os.O_RDONLY | os.O_DIRECT)
+try:
+    os.lseek(fd, file_size + 65536, os.SEEK_SET)  # well past EOF
+    buf = mmap.mmap(-1, 4096)
+    n = os.readv(fd, [buf])
+    buf.close()
+
+    # Read past EOF must return 0
+    assert n == 0, f'read past EOF: got {n} bytes, expected 0'
+    print(f'read past EOF: 0 bytes (correct)', file=sys.stderr)
+except OSError as e:
+    print(f'read past EOF FAILED: {e}', file=sys.stderr)
+    sys.exit(1)
+finally:
+    os.close(fd)
+" 2>>"$seqres.full" || _fail "O_DIRECT read past EOF returned error instead of 0"
+
+echo "cifs279: read past EOF OK" >> "$seqres.full"
+
+# --- Test 4: large DIO read that splits into multiple subrequests ---
+# Use a larger file where rsize splitting is more likely
+LARGE_SIZE=$((3 * 1048576 + 12345))  # 3 MiB + 12345 bytes (unaligned)
+FL="$W/large_eof"
+
+python3 -c "
+import os, hashlib
+data = os.urandom($LARGE_SIZE)
+fd = os.open('$FL', os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+os.write(fd, data)
+os.fsync(fd)
+os.close(fd)
+with open('$FL.md5', 'w') as f:
+    f.write(hashlib.md5(data).hexdigest())
+" || _fail "create large file failed"
+
+sync
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+python3 -c "
+import os, sys, mmap, hashlib
+
+f = '$FL'
+file_size = $LARGE_SIZE
+# Request 2x the file size to force beyond-EOF subrequests
+request_size = file_size * 2
+
+fd = os.open(f, os.O_RDONLY | os.O_DIRECT)
+try:
+    buf = mmap.mmap(-1, request_size)
+    n = os.readv(fd, [buf])
+
+    assert n == file_size, f'large beyond-EOF: read {n}, expected {file_size}'
+
+    buf.seek(0)
+    data = buf.read(n)
+    h = hashlib.md5(data).hexdigest()
+    buf.close()
+
+    with open('$FL.md5') as mf:
+        expected = mf.read().strip()
+    assert h == expected, f'large DIO md5: {h} vs {expected}'
+
+    print(f'large beyond-EOF DIO: {n} bytes, md5 OK', file=sys.stderr)
+except OSError as e:
+    print(f'large beyond-EOF DIO FAILED: {e}', file=sys.stderr)
+    sys.exit(1)
+finally:
+    os.close(fd)
+" 2>>"$seqres.full" || _fail "large beyond-EOF DIO read failed"
+
+echo "cifs279: large beyond-EOF DIO OK" >> "$seqres.full"
+
+echo "beyond-EOF DIO read OK"
+
+status=0
+exit

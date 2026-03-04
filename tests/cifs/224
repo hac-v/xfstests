@@ -1,0 +1,96 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: SEEK_DATA / SEEK_HOLE (smb3_llseek) correctness
+#
+# Behavior under test
+# - Write data, punch a hole, then use SEEK_DATA and SEEK_HOLE to navigate
+#   the sparse regions. Verifies the kernel smb3_llseek() implementation.
+# - Skip if SEEK_DATA/SEEK_HOLE or fallocate punch-hole not supported.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+_register_cleanup "_test_unmount >/dev/null 2>&1; rm -rf \"$TEST_DIR/cifs224.$$\" >/dev/null 2>&1"
+
+_test_unmount > /dev/null 2>&1
+_do "_test_mount" || _fail "mount failed"
+
+W="$TEST_DIR/cifs224.$$"
+mkdir -p "$W" || _fail "mkdir failed"
+F="$W/sparse"
+
+BS=65536
+
+# Write 3 blocks of data
+dd if=/dev/urandom of="$F" bs=$BS count=3 status=none || _fail "write failed"
+sync
+
+# Verify file size
+sz=$(stat -c %s "$F")
+[ "$sz" -eq $((BS * 3)) ] || _fail "unexpected file size $sz"
+
+# Punch hole in the middle block (offset BS, length BS)
+if ! fallocate --punch-hole --keep-size -o $BS -l $BS "$F" 2>>$seqres.full; then
+    _notrun "fallocate punch-hole not supported"
+fi
+sync
+
+# Now use SEEK_DATA and SEEK_HOLE via xfs_io or python
+# Try xfs_io first
+if command -v $XFS_IO_PROG >/dev/null 2>&1; then
+    # SEEK_HOLE from offset 0 should find the hole at BS
+    hole_off=$($XFS_IO_PROG -c "seek -h 0" "$F" 2>>$seqres.full | awk '/Whence.*HOLE/{print $NF}')
+    # SEEK_DATA from the hole should find data at 2*BS
+    data_off=$($XFS_IO_PROG -c "seek -d $BS" "$F" 2>>$seqres.full | awk '/Whence.*DATA/{print $NF}')
+
+    echo "hole_off=$hole_off data_off=$data_off" >> $seqres.full
+
+    if [ -z "$hole_off" ] && [ -z "$data_off" ]; then
+        _notrun "SEEK_DATA/SEEK_HOLE not supported by this server/kernel"
+    fi
+
+    # Validate hole offset: should be <= BS (could be 0 if entire first block also shows as hole)
+    if [ -n "$hole_off" ]; then
+        [ "$hole_off" -le $BS ] || _fail "SEEK_HOLE expected <= $BS, got $hole_off"
+    fi
+
+    # Validate data offset after hole: should be 2*BS
+    if [ -n "$data_off" ]; then
+        [ "$data_off" -eq $((BS * 2)) ] || _fail "SEEK_DATA expected $((BS * 2)), got $data_off"
+    fi
+else
+    # Fallback: python lseek
+    python3 -c "
+import os, errno
+SEEK_DATA = 3
+SEEK_HOLE = 4
+fd = os.open('$F', os.O_RDONLY)
+try:
+    hole = os.lseek(fd, 0, SEEK_HOLE)
+    data = os.lseek(fd, $BS, SEEK_DATA)
+    print(f'hole={hole} data={data}')
+    assert hole <= $BS, f'SEEK_HOLE expected <= $BS, got {hole}'
+    assert data == $((BS * 2)), f'SEEK_DATA expected $((BS * 2)), got {data}'
+except OSError as e:
+    if e.errno in (errno.ENXIO, errno.EINVAL, errno.EOPNOTSUPP):
+        print('SEEK_DATA/SEEK_HOLE not supported')
+        exit(77)
+    raise
+finally:
+    os.close(fd)
+" >> $seqres.full 2>&1
+    rc=$?
+    [ $rc -eq 77 ] && _notrun "SEEK_DATA/SEEK_HOLE not supported"
+    [ $rc -eq 0 ] || _fail "SEEK_DATA/SEEK_HOLE validation failed"
+fi
+
+echo "SEEK_DATA/SEEK_HOLE correctness OK"
+
+status=0
+exit

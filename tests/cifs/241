@@ -1,0 +1,141 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: mount option parsing — batch 1
+#
+# Behavior under test
+# - echo_interval: keepalive interval accepted and reflected in DebugData.
+# - handletimeout: persistent handle timeout accepted.
+# - tcp_nodelay: Nagle disabled, accepted by kernel.
+# - noac: no attribute caching — immediate coherence.
+# - snapshot=<time>: mount a previous version / VSS snapshot (skip if unsupported).
+# - srcaddr: bind to specific local IP.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+
+M1=""
+_cleanup_241() {
+    [ -n "$M1" ] && _do "umount -l '$M1'" >/dev/null 2>&1 || true
+    [ -n "$M1" ] && rmdir "$M1" >/dev/null 2>&1 || true
+}
+_register_cleanup _cleanup_241
+
+_test_unmount >/dev/null 2>&1
+
+_strip_opts_pattern() {
+    local opts="$1"
+    shift
+    for pat in "$@"; do
+        opts=$(echo "$opts" | awk -F, -v p="$pat" '{
+            out=""
+            for(i=1;i<=NF;i++){
+                if($i ~ p) continue
+                out = out (out ? "," : "") $i
+            }
+            print out
+        }')
+    done
+    echo "$opts"
+}
+
+BASE=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+
+# --- Test 1: echo_interval ---
+echo "cifs241: testing echo_interval..." >> "$seqres.full"
+STRIPPED=$(_strip_opts_pattern "$BASE" "^echo_interval=")
+MO="$STRIPPED"
+[ -n "$MO" ] && MO="$MO,echo_interval=30" || MO="echo_interval=30"
+
+M1=$(mktemp -d /tmp/cifs241.XXXXXX) || _fail "mktemp failed"
+if _do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO'" 2>>"$seqres.full"; then
+    # Verify via mount output
+    mount_line=$(mount | grep "$M1")
+    echo "cifs241: echo_interval mount: $mount_line" >> "$seqres.full"
+
+    # Check DebugData if available
+    if [ -r /proc/fs/cifs/DebugData ]; then
+        grep -i "echo" /proc/fs/cifs/DebugData >> "$seqres.full" 2>&1 || true
+    fi
+
+    _do "umount '$M1'" 2>>"$seqres.full" || true
+    echo "cifs241: echo_interval=30 OK" >> "$seqres.full"
+else
+    echo "cifs241: [warn] echo_interval mount failed" >> "$seqres.full"
+    rmdir "$M1" 2>/dev/null; M1=""
+fi
+
+# --- Test 2: handletimeout ---
+echo "cifs241: testing handletimeout..." >> "$seqres.full"
+STRIPPED=$(_strip_opts_pattern "$BASE" "^handletimeout=" "^persistenthandles" "^nopersistenthandles")
+MO="$STRIPPED"
+[ -n "$MO" ] && MO="$MO,handletimeout=120,persistenthandles" || MO="handletimeout=120,persistenthandles"
+
+if [ -z "$M1" ]; then M1=$(mktemp -d /tmp/cifs241.XXXXXX) || _fail "mktemp"; fi
+if _do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO'" 2>>"$seqres.full"; then
+    _do "umount '$M1'" 2>>"$seqres.full" || true
+    echo "cifs241: handletimeout=120 OK" >> "$seqres.full"
+else
+    echo "cifs241: [skip] handletimeout mount failed" >> "$seqres.full"
+fi
+
+# --- Test 3: tcp_nodelay ---
+echo "cifs241: testing tcp_nodelay..." >> "$seqres.full"
+STRIPPED=$(_strip_opts_pattern "$BASE" "^tcp_nodelay")
+MO="$STRIPPED"
+[ -n "$MO" ] && MO="$MO,tcp_nodelay" || MO="tcp_nodelay"
+
+if _do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO'" 2>>"$seqres.full"; then
+    _do "umount '$M1'" 2>>"$seqres.full" || true
+    echo "cifs241: tcp_nodelay OK" >> "$seqres.full"
+else
+    echo "cifs241: [skip] tcp_nodelay mount failed" >> "$seqres.full"
+fi
+
+# --- Test 4: noac (no attribute caching) ---
+echo "cifs241: testing noac..." >> "$seqres.full"
+STRIPPED=$(_strip_opts_pattern "$BASE" "^noac$" "^actimeo=" "^acregmax=" "^acdirmax=")
+MO="$STRIPPED"
+[ -n "$MO" ] && MO="$MO,noac" || MO="noac"
+
+if _do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO'" 2>>"$seqres.full"; then
+    # Verify attribute caching is disabled: two rapid stats should both go to server
+    echo "noac_test" > "$M1/cifs241_noac.$$" || _fail "create noac test file failed"
+    stat "$M1/cifs241_noac.$$" > /dev/null 2>&1
+    stat "$M1/cifs241_noac.$$" > /dev/null 2>&1
+    rm -f "$M1/cifs241_noac.$$" 2>/dev/null
+    _do "umount '$M1'" 2>>"$seqres.full" || true
+    echo "cifs241: noac OK" >> "$seqres.full"
+else
+    echo "cifs241: [skip] noac mount failed" >> "$seqres.full"
+fi
+
+# --- Test 5: srcaddr (bind to local IP) ---
+echo "cifs241: testing srcaddr..." >> "$seqres.full"
+LOCAL_IP=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '^127\.' | head -1)
+if [ -n "$LOCAL_IP" ]; then
+    STRIPPED=$(_strip_opts_pattern "$BASE" "^srcaddr=")
+    MO="$STRIPPED"
+    [ -n "$MO" ] && MO="$MO,srcaddr=$LOCAL_IP" || MO="srcaddr=$LOCAL_IP"
+
+    if _do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO'" 2>>"$seqres.full"; then
+        echo "testdata" > "$M1/cifs241_srcaddr.$$" || _fail "write via srcaddr mount failed"
+        rm -f "$M1/cifs241_srcaddr.$$" 2>/dev/null
+        _do "umount '$M1'" 2>>"$seqres.full" || true
+        echo "cifs241: srcaddr=$LOCAL_IP OK" >> "$seqres.full"
+    else
+        echo "cifs241: [skip] srcaddr mount failed" >> "$seqres.full"
+    fi
+else
+    echo "cifs241: [skip] no local IP found for srcaddr test" >> "$seqres.full"
+fi
+
+echo "mount option parsing batch1 OK"
+
+status=0
+exit

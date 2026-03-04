@@ -1,0 +1,119 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: forceuid / forcegid vs noforceuid / noforcegid behavior
+#
+# Behavior under test
+# - Mount with forceuid,uid=N: all files appear owned by uid N regardless
+#   of server-reported owner.
+# - Mount with noforceuid,uid=N: uid=N is the default but server-reported
+#   ownership may override it (when POSIX extensions are available).
+# - Same for forcegid / noforcegid.
+# - The uid=,gid= values are reflected consistently in stat output.
+#
+# Output
+# - Single success line; diagnostics go to $seqres.full.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+
+M1=""; M2=""
+_cleanup_219() {
+    [ -n "$M2" ] && _do "umount -l '$M2'" >/dev/null 2>&1 || true
+    [ -n "$M1" ] && _do "umount -l '$M1'" >/dev/null 2>&1 || true
+    [ -n "$M2" ] && rmdir "$M2" >/dev/null 2>&1 || true
+    [ -n "$M1" ] && rmdir "$M1" >/dev/null 2>&1 || true
+}
+_register_cleanup _cleanup_219
+
+_test_unmount >/dev/null 2>&1
+
+_strip_uid_gid_force() {
+    echo "$1" | awk -F, '{
+        out=""
+        for(i=1;i<=NF;i++){
+            if($i ~ /^(uid=|gid=|forceuid|noforceuid|forcegid|noforcegid)/) continue
+            out = out (out ? "," : "") $i
+        }
+        print out
+    }'
+}
+
+BASE=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+STRIPPED=$(_strip_uid_gid_force "$BASE")
+
+# --- Test 1: forceuid — all files owned by specified uid ---
+UID_FORCE=1234
+GID_FORCE=5678
+
+MO1="$STRIPPED"
+[ -n "$MO1" ] && MO1="$MO1,uid=$UID_FORCE,forceuid,gid=$GID_FORCE,forcegid" || \
+    MO1="uid=$UID_FORCE,forceuid,gid=$GID_FORCE,forcegid"
+
+M1=$(mktemp -d /tmp/cifs219.m1.XXXXXX) || _fail "mktemp M1 failed"
+_do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO1'" || _fail "mount M1 (forceuid) failed"
+
+SUB="cifs219.$$.d"
+mkdir -p "$M1/$SUB" || _fail "mkdir workspace failed"
+F1="$M1/$SUB/testfile"
+echo "forceuid_test" > "$F1" || _fail "create file M1 failed"
+
+owner_uid=$(stat -c %u "$F1")
+owner_gid=$(stat -c %g "$F1")
+echo "cifs219: forceuid mount: uid=$owner_uid gid=$owner_gid (expect $UID_FORCE:$GID_FORCE)" >> "$seqres.full"
+
+[ "$owner_uid" -eq "$UID_FORCE" ] || _fail "forceuid: expected uid=$UID_FORCE got $owner_uid"
+[ "$owner_gid" -eq "$GID_FORCE" ] || _fail "forcegid: expected gid=$GID_FORCE got $owner_gid"
+
+# Directory should also show forced uid/gid
+dir_uid=$(stat -c %u "$M1/$SUB")
+dir_gid=$(stat -c %g "$M1/$SUB")
+[ "$dir_uid" -eq "$UID_FORCE" ] || _fail "forceuid dir: expected uid=$UID_FORCE got $dir_uid"
+[ "$dir_gid" -eq "$GID_FORCE" ] || _fail "forcegid dir: expected gid=$GID_FORCE got $dir_gid"
+
+echo "cifs219: forceuid/forcegid OK" >> "$seqres.full"
+
+# --- Test 2: noforceuid — uid= is default but not forced ---
+UID_DEFAULT=4321
+GID_DEFAULT=8765
+
+MO2="$STRIPPED"
+[ -n "$MO2" ] && MO2="$MO2,uid=$UID_DEFAULT,noforceuid,gid=$GID_DEFAULT,noforcegid" || \
+    MO2="uid=$UID_DEFAULT,noforceuid,gid=$GID_DEFAULT,noforcegid"
+
+M2=$(mktemp -d /tmp/cifs219.m2.XXXXXX) || _fail "mktemp M2 failed"
+_do "mount -t cifs '$TEST_DEV' '$M2' -o '$MO2'" || _fail "mount M2 (noforceuid) failed"
+
+# Read the same file through M2
+F2="$M2/$SUB/testfile"
+owner_uid2=$(stat -c %u "$F2")
+owner_gid2=$(stat -c %g "$F2")
+echo "cifs219: noforceuid mount: uid=$owner_uid2 gid=$owner_gid2 (default=$UID_DEFAULT:$GID_DEFAULT)" >> "$seqres.full"
+
+# With noforceuid, the server may report actual ownership or fall back to default.
+# The key invariant: it should be a valid uid (not error), and may differ from
+# the forceuid mount's result if the server provides real ownership info.
+# At minimum, verify stat doesn't fail.
+[ -n "$owner_uid2" ] || _fail "noforceuid: stat uid empty"
+[ -n "$owner_gid2" ] || _fail "noforcegid: stat gid empty"
+
+echo "cifs219: noforceuid/noforcegid OK" >> "$seqres.full"
+
+# --- Test 3: forceuid overrides even pre-existing files ---
+# Create a new file via M2 (noforceuid), then check it via M1 (forceuid)
+echo "cross_mount_test" > "$M2/$SUB/crossfile" || _fail "create crossfile failed"
+
+cross_uid=$(stat -c %u "$M1/$SUB/crossfile")
+echo "cifs219: crossfile via forceuid mount: uid=$cross_uid (expect $UID_FORCE)" >> "$seqres.full"
+[ "$cross_uid" -eq "$UID_FORCE" ] || \
+    _fail "forceuid not applied to file created via other mount: got $cross_uid"
+
+echo "posix forceuid/forcegid OK"
+
+status=0
+exit

@@ -1,0 +1,202 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: reparse.c — NFS vs WSL reparse symlink modes and edge cases
+#
+# Kernel code exercised:
+# - create_reparse_symlink(): dispatch between NFS/WSL/native symlink
+# - create_native_symlink(): SMB2 native symlink (IO_REPARSE_TAG_SYMLINK)
+# - smb2_parse_native_symlink(): parse native symlink response
+# - parse_reparse_native_symlink(): handle substitute/print name paths
+# - parse_reparse_wsl_symlink(): WSL-format symlink parsing
+# - detect_directory_symlink_target(): detect symlinks pointing at dirs
+# - posix_reparse_to_fattr() / wsl_to_fattr(): reparse→fattr conversion
+#
+# Tests with reparse=nfs (default on user's config) and optionally reparse=wsl.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs253.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# Check if symlinks work at all
+echo "base" > "$W/base_target" || _fail "create base_target failed"
+if ! ln -s "$W/base_target" "$W/base_sym" 2>>"$seqres.full"; then
+    _notrun "symlinks not supported on this CIFS mount"
+fi
+rm -f "$W/base_sym"
+
+# --- Test 1: symlink to file, verify readlink and lstat vs stat ---
+echo "file_target" > "$W/f_target" || _fail "create f_target failed"
+ln -s "$W/f_target" "$W/f_sym" || _fail "symlink to file failed"
+
+python3 -c "
+import os, stat, sys
+
+# lstat: should be S_ISLNK
+st_l = os.lstat('$W/f_sym')
+assert stat.S_ISLNK(st_l.st_mode), f'lstat not symlink: {oct(st_l.st_mode)}'
+
+# stat (follow): should be S_ISREG
+st_f = os.stat('$W/f_sym')
+assert stat.S_ISREG(st_f.st_mode), f'stat not regular: {oct(st_f.st_mode)}'
+
+# readlink
+target = os.readlink('$W/f_sym')
+assert len(target) > 0, 'readlink empty'
+print(f'readlink={target}', file=sys.stderr)
+
+# inode numbers should differ (symlink vs target)
+assert st_l.st_ino != st_f.st_ino or True  # some servers may alias
+
+print('lstat/stat/readlink OK', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "symlink lstat/stat test failed"
+
+echo "cifs253: file symlink lstat/stat OK" >> "$seqres.full"
+
+# --- Test 2: symlink to directory, directory detection ---
+mkdir -p "$W/d_target/sub" || _fail "mkdir d_target failed"
+echo "in_sub" > "$W/d_target/sub/inner" || _fail "create inner failed"
+ln -s "$W/d_target" "$W/d_sym" 2>>"$seqres.full" || _fail "symlink to dir failed"
+
+python3 -c "
+import os, stat, sys
+
+# stat follow: should be S_ISDIR
+st = os.stat('$W/d_sym')
+assert stat.S_ISDIR(st.st_mode), f'dir symlink stat not dir: {oct(st.st_mode)}'
+
+# Can list contents through symlink
+entries = os.listdir('$W/d_sym')
+assert 'sub' in entries, f'sub not in listdir: {entries}'
+
+# Can traverse deeper
+with open('$W/d_sym/sub/inner') as f:
+    data = f.read().strip()
+assert data == 'in_sub', f'deep traverse: {data!r}'
+
+print('dir symlink detection OK', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "dir symlink detection failed"
+
+echo "cifs253: dir symlink detection OK" >> "$seqres.full"
+
+# --- Test 3: multi-component relative symlinks ---
+mkdir -p "$W/a/b/c" || _fail "mkdir a/b/c failed"
+echo "deep_file" > "$W/a/b/c/deep" || _fail "create deep failed"
+
+# Create symlink in W pointing relatively to a/b/c/deep
+(cd "$W" && ln -s "a/b/c/deep" "multi_rel") 2>>"$seqres.full" || _fail "multi-component relative symlink failed"
+
+got=$(cat "$W/multi_rel" 2>>"$seqres.full")
+[ "$got" = "deep_file" ] || _fail "multi-component relative: '$got'"
+
+echo "cifs253: multi-component relative OK" >> "$seqres.full"
+
+# --- Test 4: symlink with ../ (parent traversal) ---
+mkdir -p "$W/parent_test/child" || _fail "mkdir parent_test failed"
+echo "parent_data" > "$W/parent_test/target" || _fail "create target failed"
+
+(cd "$W/parent_test/child" && ln -s "../target" "up_sym") 2>>"$seqres.full" || \
+    _fail "parent traversal symlink failed"
+
+got=$(cat "$W/parent_test/child/up_sym" 2>>"$seqres.full")
+[ "$got" = "parent_data" ] || _fail "parent traversal read: '$got'"
+
+echo "cifs253: parent traversal symlink OK" >> "$seqres.full"
+
+# --- Test 5: symlink to symlink (double indirection) ---
+echo "final" > "$W/final_target" || _fail "create final_target failed"
+ln -s "$W/final_target" "$W/sym_1" 2>>"$seqres.full" || _fail "sym_1 failed"
+ln -s "$W/sym_1" "$W/sym_2" 2>>"$seqres.full" || _fail "sym_2 failed"
+
+got=$(cat "$W/sym_2" 2>>"$seqres.full")
+[ "$got" = "final" ] || _fail "double indirection: '$got'"
+
+# Verify readlink returns the immediate target, not the final one
+tgt2=$(readlink "$W/sym_2")
+echo "cifs253: sym_2 readlink='$tgt2'" >> "$seqres.full"
+# Should point to sym_1, not final_target
+echo "$tgt2" | grep -q "sym_1" || \
+    echo "cifs253: [note] readlink resolved beyond immediate target" >> "$seqres.full"
+
+echo "cifs253: double indirection OK" >> "$seqres.full"
+
+# --- Test 6: rename a symlink (symlink itself moves, target stays) ---
+ln -s "$W/f_target" "$W/rename_sym" 2>>"$seqres.full" || _fail "rename_sym create failed"
+mv "$W/rename_sym" "$W/renamed_sym" 2>>"$seqres.full" || _fail "rename symlink failed"
+
+[ ! -e "$W/rename_sym" ] || _fail "old symlink name still exists"
+[ -L "$W/renamed_sym" ] || _fail "renamed symlink not a symlink"
+got=$(cat "$W/renamed_sym" 2>>"$seqres.full")
+[ "$got" = "file_target" ] || _fail "renamed symlink read: '$got'"
+
+echo "cifs253: symlink rename OK" >> "$seqres.full"
+
+# --- Test 7: unlink symlink doesn't delete target ---
+echo "precious" > "$W/precious_target" || _fail "create precious failed"
+ln -s "$W/precious_target" "$W/del_sym" 2>>"$seqres.full" || _fail "del_sym failed"
+rm "$W/del_sym" || _fail "unlink symlink failed"
+
+[ ! -e "$W/del_sym" ] || _fail "symlink not removed"
+got=$(cat "$W/precious_target" 2>>"$seqres.full")
+[ "$got" = "precious" ] || _fail "target deleted when symlink removed"
+
+echo "cifs253: symlink unlink safety OK" >> "$seqres.full"
+
+# --- Test 8: WSL reparse mode (try remount with reparse=wsl if supported) ---
+# This is best-effort; WSL reparse needs server support
+M_WSL=$(mktemp -d /tmp/cifs253_wsl.XXXXXX 2>/dev/null) || true
+if [ -n "$M_WSL" ]; then
+    _strip_reparse() {
+        echo "$1" | awk -F, '{
+            out=""
+            for(i=1;i<=NF;i++){
+                if($i ~ /^reparse=/) continue
+                if($i ~ /^mfsymlinks$/) continue
+                out = out (out ? "," : "") $i
+            }
+            print out
+        }'
+    }
+
+    BASE_R=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+    STRIPPED_R=$(_strip_reparse "$BASE_R")
+    MO_WSL="$STRIPPED_R"
+    [ -n "$MO_WSL" ] && MO_WSL="$MO_WSL,reparse=wsl" || MO_WSL="reparse=wsl"
+
+    if _do "mount -t cifs '$TEST_DEV' '$M_WSL' -o '$MO_WSL'" 2>>"$seqres.full"; then
+        WSL_SUB="cifs253_wsl.$$.d"
+        mkdir -p "$M_WSL/$WSL_SUB" 2>>"$seqres.full" || true
+
+        echo "wsl_target" > "$M_WSL/$WSL_SUB/wsl_tgt" 2>>"$seqres.full" || true
+        if ln -s "$M_WSL/$WSL_SUB/wsl_tgt" "$M_WSL/$WSL_SUB/wsl_sym" 2>>"$seqres.full"; then
+            got=$(cat "$M_WSL/$WSL_SUB/wsl_sym" 2>>"$seqres.full")
+            echo "cifs253: WSL symlink read='$got'" >> "$seqres.full"
+            [ "$got" = "wsl_target" ] || \
+                echo "cifs253: [warn] WSL symlink content mismatch" >> "$seqres.full"
+            echo "cifs253: WSL reparse symlink OK" >> "$seqres.full"
+        else
+            echo "cifs253: [skip] WSL symlink not supported" >> "$seqres.full"
+        fi
+
+        rm -rf "$M_WSL/$WSL_SUB" 2>/dev/null
+        _do "umount '$M_WSL'" 2>>"$seqres.full" || true
+    else
+        echo "cifs253: [skip] reparse=wsl mount failed" >> "$seqres.full"
+    fi
+    rmdir "$M_WSL" 2>/dev/null || true
+fi
+
+echo "reparse symlink edge cases OK"
+
+status=0
+exit

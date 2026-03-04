@@ -1,0 +1,135 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: POSIX pread / pwrite positional I/O
+#
+# Behavior under test
+# - pwrite(2) writes at a specific offset without moving the file position.
+# - pread(2) reads at a specific offset without moving the file position.
+# - Concurrent pwrite at different offsets don't corrupt each other.
+#
+# Output
+# - Single success line; diagnostics go to $seqres.full.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs211.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# --- Test 1: pwrite at offset, verify pread ---
+python3 -c "
+import os, sys
+
+f = '$W/f1'
+fd = os.open(f, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644)
+
+# Write at offset 0
+os.pwrite(fd, b'AAAA', 0)
+# Write at offset 4096 (leaving a gap of zeros)
+os.pwrite(fd, b'BBBB', 4096)
+# Write at offset 8192
+os.pwrite(fd, b'CCCC', 8192)
+
+# Verify each region via pread
+a = os.pread(fd, 4, 0)
+b = os.pread(fd, 4, 4096)
+c = os.pread(fd, 4, 8192)
+
+assert a == b'AAAA', f'offset 0: expected AAAA got {a!r}'
+assert b == b'BBBB', f'offset 4096: expected BBBB got {b!r}'
+assert c == b'CCCC', f'offset 8192: expected CCCC got {c!r}'
+
+# Verify the gap (bytes 4-4095) is zero-filled
+gap = os.pread(fd, 4092, 4)
+nonzero = sum(1 for x in gap if x != 0)
+assert nonzero == 0, f'gap has {nonzero} non-zero bytes'
+
+os.close(fd)
+" 2>>"$seqres.full" || _fail "pwrite/pread basic test failed"
+
+echo "cifs211: pwrite/pread basic OK" >> "$seqres.full"
+
+# --- Test 2: pwrite does not move file position ---
+python3 -c "
+import os
+
+f = '$W/f2'
+fd = os.open(f, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644)
+
+# Write 'XXXX' at position 0 via normal write
+os.write(fd, b'XXXX')
+# File position is now 4
+pos1 = os.lseek(fd, 0, os.SEEK_CUR)
+assert pos1 == 4, f'pos after write: expected 4 got {pos1}'
+
+# pwrite at offset 8192 should NOT move file position
+os.pwrite(fd, b'YYYY', 8192)
+pos2 = os.lseek(fd, 0, os.SEEK_CUR)
+assert pos2 == 4, f'pos after pwrite: expected 4 got {pos2}'
+
+# pread at offset 8192 should NOT move file position
+data = os.pread(fd, 4, 8192)
+pos3 = os.lseek(fd, 0, os.SEEK_CUR)
+assert pos3 == 4, f'pos after pread: expected 4 got {pos3}'
+assert data == b'YYYY', f'pread data mismatch: {data!r}'
+
+os.close(fd)
+" 2>>"$seqres.full" || _fail "pwrite/pread position preservation failed"
+
+echo "cifs211: position preservation OK" >> "$seqres.full"
+
+# --- Test 3: concurrent pwrite at different offsets ---
+python3 -c "
+import os, threading
+
+f = '$W/f3'
+fd = os.open(f, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644)
+# Pre-allocate file
+os.ftruncate(fd, 1048576)  # 1 MiB
+errors = []
+
+def writer(offset, pattern, count):
+    try:
+        data = pattern * count
+        os.pwrite(fd, data, offset)
+    except Exception as e:
+        errors.append(str(e))
+
+# 4 threads writing 64 KiB each at non-overlapping offsets
+threads = []
+for i in range(4):
+    pat = bytes([0x41 + i]) * 1024  # A, B, C, D repeated
+    t = threading.Thread(target=writer, args=(i * 262144, pat, 64))
+    threads.append(t)
+
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+
+assert not errors, f'pwrite errors: {errors}'
+
+# Verify each region
+for i in range(4):
+    data = os.pread(fd, 1024, i * 262144)
+    expected = bytes([0x41 + i]) * 1024
+    assert data == expected, f'region {i} mismatch at start'
+    data = os.pread(fd, 1024, i * 262144 + 63 * 1024)
+    assert data == expected, f'region {i} mismatch at end'
+
+os.close(fd)
+" 2>>"$seqres.full" || _fail "concurrent pwrite test failed"
+
+echo "posix pread/pwrite OK"
+
+status=0
+exit

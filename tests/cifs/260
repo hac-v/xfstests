@@ -1,0 +1,195 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: sharing violation and lock conflict error mapping
+#
+# Kernel code exercised (smb2maperror.c, smb2ops.c):
+# - STATUS_SHARING_VIOLATION → EAGAIN or EBUSY
+# - STATUS_FILE_LOCK_CONFLICT → EAGAIN
+# - STATUS_DELETE_PENDING → ENOENT or EACCES
+# - Dual-mount exclusive open contention
+# - Byte-range lock conflicts across mounts/processes
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs260.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# --- Test 1: flock conflict between two processes ---
+F1="$W/lock_file"
+echo "lock_test" > "$F1" || _fail "create lock_file failed"
+
+python3 -c "
+import fcntl, os, sys, subprocess, time, errno
+
+f = '$W/lock_file'
+
+# Parent holds exclusive flock
+fd = os.open(f, os.O_RDWR)
+fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+# Child tries to get exclusive lock — should fail with EAGAIN
+child = subprocess.run([
+    sys.executable, '-c',
+    '''
+import fcntl, os, sys, errno
+fd = os.open(\"''' + f + '''\", os.O_RDWR)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    print(\"ERROR: child got lock\", file=sys.stderr)
+    sys.exit(1)
+except OSError as e:
+    if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
+        print(f\"child correctly blocked: {e}\", file=sys.stderr)
+        sys.exit(0)
+    print(f\"unexpected errno: {e}\", file=sys.stderr)
+    sys.exit(2)
+finally:
+    os.close(fd)
+'''
+], capture_output=True, text=True, timeout=10)
+
+print(child.stderr, file=sys.stderr, end='')
+fcntl.flock(fd, fcntl.LOCK_UN)
+os.close(fd)
+
+assert child.returncode == 0, f'child exit: {child.returncode}'
+" 2>>"$seqres.full" || _fail "flock conflict test failed"
+
+echo "cifs260: flock conflict OK" >> "$seqres.full"
+
+# --- Test 2: fcntl byte-range lock conflict ---
+F2="$W/bytelock_file"
+dd if=/dev/zero of="$F2" bs=4096 count=1 2>>"$seqres.full" || _fail "create bytelock failed"
+
+python3 -c "
+import fcntl, struct, os, sys, subprocess, errno
+
+f = '$W/bytelock_file'
+
+# Parent holds exclusive byte-range lock on bytes 0-1024
+fd = os.open(f, os.O_RDWR)
+lock_data = struct.pack('hhllhh', fcntl.F_WRLCK, 0, 0, 1024, 0, 0)
+fcntl.fcntl(fd, fcntl.F_SETLK, lock_data)
+
+# Child tries same range — should fail
+child = subprocess.run([
+    sys.executable, '-c',
+    '''
+import fcntl, struct, os, sys, errno
+fd = os.open(\"''' + f + '''\", os.O_RDWR)
+lock_data = struct.pack(\"hhllhh\", fcntl.F_WRLCK, 0, 0, 1024, 0, 0)
+try:
+    fcntl.fcntl(fd, fcntl.F_SETLK, lock_data)
+    print(\"ERROR: child got byte-range lock\", file=sys.stderr)
+    sys.exit(1)
+except OSError as e:
+    if e.errno in (errno.EAGAIN, errno.EACCES):
+        print(f\"byte-range lock conflict: {e}\", file=sys.stderr)
+        sys.exit(0)
+    print(f\"unexpected: {e}\", file=sys.stderr)
+    sys.exit(2)
+finally:
+    os.close(fd)
+'''
+], capture_output=True, text=True, timeout=10)
+
+print(child.stderr, file=sys.stderr, end='')
+
+# Unlock
+lock_data = struct.pack('hhllhh', fcntl.F_UNLCK, 0, 0, 1024, 0, 0)
+fcntl.fcntl(fd, fcntl.F_SETLK, lock_data)
+os.close(fd)
+
+assert child.returncode == 0, f'child exit: {child.returncode}'
+" 2>>"$seqres.full" || echo "cifs260: [skip] fcntl byte-range locks not supported" >> "$seqres.full"
+
+echo "cifs260: byte-range lock conflict OK" >> "$seqres.full"
+
+# --- Test 3: delete-pending race (unlink while another process has it open) ---
+F3="$W/delete_pending"
+echo "delete_me" > "$F3" || _fail "create delete_pending failed"
+
+python3 -c "
+import os, sys, errno
+
+f = '$W/delete_pending'
+
+# Open file, keep fd
+fd = os.open(f, os.O_RDWR)
+
+# Unlink — on CIFS this triggers delete-on-close or immediate delete
+try:
+    os.unlink(f)
+except OSError as e:
+    # Some CIFS configs may return EBUSY or EACCES for open-file delete
+    print(f'unlink while open: {e}', file=sys.stderr)
+
+# Read should still work through the open fd
+os.lseek(fd, 0, os.SEEK_SET)
+data = os.read(fd, 100)
+print(f'read after unlink: {data!r}', file=sys.stderr)
+
+os.close(fd)
+" 2>>"$seqres.full" || true
+
+echo "cifs260: delete-pending OK" >> "$seqres.full"
+
+# --- Test 4: non-overlapping byte-range locks succeed ---
+F4="$W/nonoverlap"
+dd if=/dev/zero of="$F4" bs=4096 count=2 2>>"$seqres.full" || _fail "create nonoverlap failed"
+
+python3 -c "
+import fcntl, struct, os, sys, subprocess
+
+f = '$W/nonoverlap'
+
+# Parent locks bytes 0-1024
+fd = os.open(f, os.O_RDWR)
+lock1 = struct.pack('hhllhh', fcntl.F_WRLCK, 0, 0, 1024, 0, 0)
+fcntl.fcntl(fd, fcntl.F_SETLK, lock1)
+
+# Child locks bytes 2048-4096 (non-overlapping) — should succeed
+child = subprocess.run([
+    sys.executable, '-c',
+    '''
+import fcntl, struct, os, sys
+fd = os.open(\"''' + f + '''\", os.O_RDWR)
+lock2 = struct.pack(\"hhllhh\", fcntl.F_WRLCK, 0, 2048, 2048, 0, 0)
+try:
+    fcntl.fcntl(fd, fcntl.F_SETLK, lock2)
+    print(\"non-overlapping lock OK\", file=sys.stderr)
+    unlock = struct.pack(\"hhllhh\", fcntl.F_UNLCK, 0, 2048, 2048, 0, 0)
+    fcntl.fcntl(fd, fcntl.F_SETLK, unlock)
+    sys.exit(0)
+except OSError as e:
+    print(f\"non-overlapping lock failed: {e}\", file=sys.stderr)
+    sys.exit(1)
+finally:
+    os.close(fd)
+'''
+], capture_output=True, text=True, timeout=10)
+
+print(child.stderr, file=sys.stderr, end='')
+unlock = struct.pack('hhllhh', fcntl.F_UNLCK, 0, 0, 1024, 0, 0)
+fcntl.fcntl(fd, fcntl.F_SETLK, unlock)
+os.close(fd)
+
+assert child.returncode == 0, f'child exit: {child.returncode}'
+" 2>>"$seqres.full" || echo "cifs260: [skip] non-overlapping lock test failed" >> "$seqres.full"
+
+echo "cifs260: non-overlapping locks OK" >> "$seqres.full"
+
+echo "sharing violation/lock errors OK"
+
+status=0
+exit

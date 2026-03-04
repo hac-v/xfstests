@@ -50,8 +50,23 @@ fi
 DBG=/proc/fs/cifs/DebugData
 
 parse_credits() {
-    # prints: max active (first occurrence)
-    awk '/Credits:/ {for(i=1;i<=NF;i++){if($i=="Max:") m=$(i+1); if($i=="Active:") a=$(i+1);} if(m!=""&&a!=""){gsub(/[,]/,"",m); gsub(/[,]/,"",a); print m, a; exit}}' $DBG 2>/dev/null
+    # Handle both old format "Credits: Max: N Active: N" and
+    # new format "Number of credits: N,N,N" (credits,echo,oplock)
+    awk '
+        /Credits:.*Max:.*Active:/ {
+            for(i=1;i<=NF;i++){
+                if($i=="Max:") m=$(i+1)
+                if($i=="Active:") a=$(i+1)
+            }
+            gsub(/[,]/,"",m); gsub(/[,]/,"",a)
+            if(m!=""&&a!=""){print m, a; exit}
+        }
+        /Number of credits:/ {
+            sub(/.*Number of credits:[[:space:]]*/,"")
+            split($0, cr, ",")
+            if(cr[1]+0 > 0){print cr[1]+0, 0; exit}
+        }
+    ' $DBG 2>/dev/null
 }
 
 read max base_active < <(parse_credits)

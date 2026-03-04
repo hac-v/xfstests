@@ -1,0 +1,120 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: enable_oplocks=N — disable oplocks, verify no caching behavior
+#
+# Kernel code exercised:
+# - cifsfs.c: enable_oplocks module parameter
+# - smb2ops.c: oplock/lease request suppressed when enable_oplocks=N
+# - file.c: cifs_strict_readv/writev fall through to uncached paths
+#
+# When enable_oplocks=N:
+# - Client does NOT request oplocks/leases on opens
+# - Every read goes to server (no page cache reuse)
+# - Stats should show more Reads than with oplocks enabled
+# - Data integrity must still be correct
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+[ -w /sys/module/cifs/parameters/enable_oplocks ] || _notrun "enable_oplocks not writable"
+[ -r /proc/fs/cifs/Stats ] || _notrun "requires Stats"
+
+ORIG_OPLOCKS=$(cat /sys/module/cifs/parameters/enable_oplocks)
+_cleanup_287() {
+    # Restore original value
+    echo "$ORIG_OPLOCKS" > /sys/module/cifs/parameters/enable_oplocks 2>/dev/null
+}
+_register_cleanup _cleanup_287
+
+W="$TEST_DIR/cifs287.$$"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# Helper: get Reads count
+_get_reads() {
+    awk '/Reads:/ && !/ReadDir/ {split($2, a, " "); sum += a[1]} END {print sum+0}' \
+        /proc/fs/cifs/Stats 2>/dev/null
+}
+_reset_stats() {
+    echo 0 > /proc/fs/cifs/Stats 2>/dev/null || true
+    sleep 0.3
+}
+
+# --- Phase 1: enable_oplocks=Y (default) — read with caching ---
+echo Y > /sys/module/cifs/parameters/enable_oplocks
+echo "cifs287: enable_oplocks=$(cat /sys/module/cifs/parameters/enable_oplocks)" >> "$seqres.full"
+
+F="$W/oplock_test"
+dd if=/dev/urandom of="$F" bs=65536 count=8 2>>"$seqres.full" || _fail "create file failed"
+sync
+MD5_ORIG=$(md5sum < "$F" | awk '{print $1}')
+
+_reset_stats
+
+# Read the file 3 times — with oplocks, 2nd and 3rd should hit cache
+for i in 1 2 3; do
+    dd if="$F" of=/dev/null bs=65536 2>>"$seqres.full"
+done
+
+READS_WITH=$(_get_reads)
+echo "cifs287: enable_oplocks=Y: Reads=$READS_WITH (3 passes)" >> "$seqres.full"
+
+# --- Phase 2: enable_oplocks=N — read without caching ---
+echo N > /sys/module/cifs/parameters/enable_oplocks
+echo "cifs287: enable_oplocks=$(cat /sys/module/cifs/parameters/enable_oplocks)" >> "$seqres.full"
+
+# Need a fresh file to avoid existing cached oplocks
+F2="$W/nooplock_test"
+dd if=/dev/urandom of="$F2" bs=65536 count=8 2>>"$seqres.full" || _fail "create file2 failed"
+sync
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+MD5_ORIG2=$(md5sum < "$F2" | awk '{print $1}')
+
+_reset_stats
+
+# Read 3 times — without oplocks, each read should go to server
+for i in 1 2 3; do
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    dd if="$F2" of=/dev/null bs=65536 2>>"$seqres.full"
+done
+
+READS_WITHOUT=$(_get_reads)
+echo "cifs287: enable_oplocks=N: Reads=$READS_WITHOUT (3 passes)" >> "$seqres.full"
+
+# --- Verify data integrity with oplocks disabled ---
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+MD5_CHECK=$(md5sum < "$F2" | awk '{print $1}')
+[ "$MD5_CHECK" = "$MD5_ORIG2" ] || _fail "data corruption with oplocks disabled: $MD5_CHECK vs $MD5_ORIG2"
+
+echo "cifs287: data integrity with oplocks disabled OK" >> "$seqres.full"
+
+# --- Restore and verify oplocks re-enable works ---
+echo Y > /sys/module/cifs/parameters/enable_oplocks
+
+F3="$W/restored_test"
+echo "restored" > "$F3" || _fail "write after restore failed"
+got=$(cat "$F3")
+[ "$got" = "restored" ] || _fail "read after restore: '$got'"
+
+echo "cifs287: oplock restore OK" >> "$seqres.full"
+
+# --- Analysis ---
+echo "" >> "$seqres.full"
+echo "=== enable_oplocks Summary ===" >> "$seqres.full"
+echo "With oplocks (Y):    Reads=$READS_WITH" >> "$seqres.full"
+echo "Without oplocks (N): Reads=$READS_WITHOUT" >> "$seqres.full"
+if [ "$READS_WITHOUT" -gt "$READS_WITH" ]; then
+    echo "Confirmed: disabling oplocks increases server Reads" >> "$seqres.full"
+fi
+
+rm -rf "$W"
+
+echo "enable_oplocks toggle OK"
+
+status=0
+exit

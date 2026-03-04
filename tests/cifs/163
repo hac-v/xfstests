@@ -29,6 +29,9 @@ _begin_fstest auto quick
 [ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
 
 TESTFILE=$TEST_DIR/cifs_sharemode_163.$$.
+
+_register_cleanup "rm -f \"$TESTFILE\" >/dev/null 2>&1"
+
 rm -f "$TESTFILE" 2>/dev/null || true
 
 echo "data" > "$TESTFILE" || _fail "create test file"

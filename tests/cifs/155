@@ -17,7 +17,7 @@ W="$TEST_DIR/cifs155.$$"; mkdir -p "$W" || _fail "mkdir"; _register_cleanup "rm 
 
 echo "Initial mount opts: $orig_opts" >> $seqres.full
 if ! echo "$orig_opts" | grep -qw nodelete; then
-	base_opts=${MOUNT_OPTIONS#-o}
+	base_opts=$(echo "${MOUNT_OPTIONS#-o}" | sed 's/^[[:space:]]*//')
 	_test_unmount >/dev/null 2>&1 || true
 	if ! _do "_test_mount -o nodelete,$base_opts"; then
 		_notrun "could not mount with nodelete"

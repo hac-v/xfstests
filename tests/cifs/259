@@ -1,0 +1,141 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: concurrent open stress — 100+ parallel file opens/closes
+#
+# Kernel code exercised:
+# - connect.c (4,702 lines): session management, credit allocation
+# - smb2pdu.c (6,403 lines): SMB2 CREATE/CLOSE PDU handling, MID allocation
+# - transport.c: request queuing, credit wait, compound handling
+# - Stress tests credit exhaustion/recovery and handle limits
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto stress
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs259.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# --- Test 1: 200 sequential open/write/close cycles ---
+python3 -c "
+import os, sys
+
+d = '$W'
+for i in range(200):
+    f = os.path.join(d, f'seq_{i:04d}')
+    fd = os.open(f, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+    os.write(fd, f'data_{i}\n'.encode())
+    os.close(fd)
+
+# Verify all exist
+count = len([e for e in os.listdir(d) if e.startswith('seq_')])
+assert count == 200, f'sequential: {count} != 200'
+print(f'sequential 200 OK', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "sequential open stress failed"
+
+echo "cifs259: sequential 200 OK" >> "$seqres.full"
+
+# --- Test 2: 100 files held open simultaneously ---
+python3 -c "
+import os, sys
+
+d = '$W'
+fds = []
+for i in range(100):
+    f = os.path.join(d, f'held_{i:04d}')
+    fd = os.open(f, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644)
+    os.write(fd, f'held_{i}\n'.encode())
+    fds.append(fd)
+
+# All 100 fds should be valid
+assert len(fds) == 100
+
+# Read from each while all are open
+for i, fd in enumerate(fds):
+    os.lseek(fd, 0, os.SEEK_SET)
+    data = os.read(fd, 100)
+    assert data == f'held_{i}\n'.encode(), f'fd {i}: {data!r}'
+
+# Close all
+for fd in fds:
+    os.close(fd)
+
+print('100 simultaneous opens OK', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "100 simultaneous opens failed"
+
+echo "cifs259: 100 simultaneous OK" >> "$seqres.full"
+
+# --- Test 3: parallel open/close from multiple threads ---
+python3 -c "
+import os, threading, sys
+
+d = '$W'
+errors = []
+THREADS = 16
+FILES_PER = 50
+
+def worker(tid):
+    try:
+        for i in range(FILES_PER):
+            f = os.path.join(d, f'par_{tid:02d}_{i:04d}')
+            fd = os.open(f, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+            os.write(fd, f't{tid}f{i}\n'.encode())
+            os.close(fd)
+    except Exception as e:
+        errors.append(f't{tid}: {e}')
+
+threads = [threading.Thread(target=worker, args=(t,)) for t in range(THREADS)]
+for t in threads: t.start()
+for t in threads: t.join()
+
+if errors:
+    print(f'errors: {errors}', file=sys.stderr)
+    sys.exit(1)
+
+# Count files
+par_count = len([e for e in os.listdir(d) if e.startswith('par_')])
+expected = THREADS * FILES_PER
+assert par_count == expected, f'parallel: {par_count} != {expected}'
+print(f'parallel {THREADS}x{FILES_PER}={expected} OK', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "parallel open stress failed"
+
+echo "cifs259: parallel 16x50 OK" >> "$seqres.full"
+
+# --- Test 4: rapid open/close same file (handle reuse / deferred close stress) ---
+python3 -c "
+import os, sys
+
+f = '$W/rapid_reopen'
+for i in range(1000):
+    fd = os.open(f, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+    os.write(fd, b'x')
+    os.close(fd)
+
+# Final read
+fd = os.open(f, os.O_RDONLY)
+data = os.read(fd, 10)
+os.close(fd)
+assert data == b'x', f'rapid reopen: {data!r}'
+print('rapid reopen 1000x OK', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "rapid reopen failed"
+
+echo "cifs259: rapid reopen OK" >> "$seqres.full"
+
+# --- Test 5: verify no handle leaks after stress ---
+# Count open_files if available
+if [ -r /proc/fs/cifs/open_files ]; then
+    open_count=$(wc -l < /proc/fs/cifs/open_files)
+    echo "cifs259: open_files after stress: $open_count" >> "$seqres.full"
+fi
+
+echo "concurrent open stress OK"
+
+status=0
+exit

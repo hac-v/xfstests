@@ -24,6 +24,9 @@ _begin_fstest auto stress
 [ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
 
 DIR="$TEST_DIR/cifs174.dir"
+
+_register_cleanup "rm -rf \"$DIR\" >/dev/null 2>&1"
+
 rm -rf "$DIR" 2>/dev/null || true
 mkdir -p "$DIR" || _fail "mkdir"
 COUNT=2000

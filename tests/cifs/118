@@ -18,10 +18,10 @@ _begin_fstest auto quick
 
 _host_from_unc() { echo "$1" | sed -E 's#^//([^/]+)/.*#\1#'; }
 _share_from_unc() { echo "$1" | sed -E 's#^//[^/]+/([^/]+).*#\1#'; }
-_unc_windows() { local h=$(_host_from_unc "$1"); local s=$(_share_from_unc "$1"); printf "\\\\%s\\%s" "$h" "$s"; }
+_unc_windows() { local h=$(_host_from_unc "$1"); local s=$(_share_from_unc "$1"); printf "\\\\\\\\%s\\\\%s" "$h" "$s"; }
 
 HOST=$(_host_from_unc "$TEST_DEV")
-UNCW=$(_unc_windows "$TEST_DEV")
+SHARE=$(_share_from_unc "$TEST_DEV")
 [ -n "$HOST" ] || _notrun "could not derive host"
 
 _dd_signing_on_for_host()
@@ -68,12 +68,12 @@ while [ $tries -gt 0 ]; do
     tries=$((tries-1)); sleep 0.2
 done
 
-[ -n "$state" ] || _notrun "DebugData lacks signing state for $UNCW"
+[ -n "$state" ] || _notrun "DebugData lacks signing state for \\$HOST\\$SHARE"
 
 if [ "$state" -eq 1 ]; then
     echo "SMB signing enabled OK"
 else
-    _notrun "server/share did not enable signing for $UNCW (requested with -o sign)"
+    _notrun "server/share did not enable signing for \\$HOST\\$SHARE (requested with -o sign)"
 fi
 
 status=0

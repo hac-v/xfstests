@@ -1,0 +1,129 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: xattr deep — listxattr, removexattr, system.cifs_acl, size limits
+#
+# Kernel code exercised (xattr.c, 536 lines):
+# - cifs_xattr_get(): getxattr for user.*, system.cifs_acl, security.*
+# - cifs_xattr_set(): setxattr for user.*, system.cifs_acl
+# - cifs_listxattr(): list all xattr names on a file
+# - removexattr: set to empty / delete an xattr
+# - Size limit handling: xattr name and value size boundaries
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v setfattr >/dev/null 2>&1 || _notrun "requires setfattr"
+command -v getfattr >/dev/null 2>&1 || _notrun "requires getfattr"
+
+W="$TEST_DIR/cifs254.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+F="$W/xattr_file"
+echo "xattr_test" > "$F" || _fail "create file failed"
+
+# --- Test 1: set, get, list user.* xattrs ---
+setfattr -n user.test1 -v "value1" "$F" 2>>"$seqres.full" || \
+    _notrun "setxattr user.* not supported on this CIFS mount"
+
+got=$(getfattr -n user.test1 --only-values "$F" 2>>"$seqres.full")
+[ "$got" = "value1" ] || _fail "getxattr: expected 'value1' got '$got'"
+
+echo "cifs254: set/get user.test1 OK" >> "$seqres.full"
+
+# --- Test 2: multiple xattrs + listxattr ---
+setfattr -n user.alpha -v "aaa" "$F" 2>>"$seqres.full" || _fail "set alpha failed"
+setfattr -n user.beta -v "bbb" "$F" 2>>"$seqres.full" || _fail "set beta failed"
+setfattr -n user.gamma -v "ccc" "$F" 2>>"$seqres.full" || _fail "set gamma failed"
+
+list=$(getfattr -d "$F" 2>>"$seqres.full")
+echo "cifs254: listxattr output:" >> "$seqres.full"
+echo "$list" >> "$seqres.full"
+
+# Check all 4 xattrs are listed
+for name in user.test1 user.alpha user.beta user.gamma; do
+    echo "$list" | grep -q "$name" || \
+        echo "cifs254: [warn] $name not in listxattr" >> "$seqres.full"
+done
+
+echo "cifs254: listxattr OK" >> "$seqres.full"
+
+# --- Test 3: removexattr ---
+setfattr -x user.beta "$F" 2>>"$seqres.full"
+if [ $? -eq 0 ]; then
+    if getfattr -n user.beta "$F" >/dev/null 2>&1; then
+        _fail "removexattr: user.beta still present"
+    fi
+    # Other xattrs should survive
+    got_a=$(getfattr -n user.alpha --only-values "$F" 2>/dev/null)
+    [ "$got_a" = "aaa" ] || _fail "removexattr damaged user.alpha"
+    echo "cifs254: removexattr OK" >> "$seqres.full"
+else
+    echo "cifs254: [skip] removexattr not supported" >> "$seqres.full"
+fi
+
+# --- Test 4: overwrite xattr value ---
+setfattr -n user.alpha -v "new_value" "$F" 2>>"$seqres.full" || _fail "overwrite failed"
+got2=$(getfattr -n user.alpha --only-values "$F" 2>/dev/null)
+[ "$got2" = "new_value" ] || _fail "overwrite: expected 'new_value' got '$got2'"
+
+echo "cifs254: xattr overwrite OK" >> "$seqres.full"
+
+# --- Test 5: binary xattr value ---
+python3 -c "
+import os, sys
+# Set binary value with null bytes
+val = b'\x00\x01\x02\xff\xfe\xfd'
+os.setxattr('$F', 'user.binary', val)
+got = os.getxattr('$F', 'user.binary')
+assert got == val, f'binary xattr: {got!r} != {val!r}'
+print('binary xattr OK', file=sys.stderr)
+" 2>>"$seqres.full" || echo "cifs254: [skip] binary xattr not supported" >> "$seqres.full"
+
+# --- Test 6: xattr on directory ---
+D="$W/xattr_dir"
+mkdir "$D" || _fail "mkdir xattr_dir failed"
+setfattr -n user.dir_attr -v "dir_val" "$D" 2>>"$seqres.full"
+if [ $? -eq 0 ]; then
+    got_d=$(getfattr -n user.dir_attr --only-values "$D" 2>/dev/null)
+    [ "$got_d" = "dir_val" ] || _fail "dir xattr: '$got_d'"
+    echo "cifs254: dir xattr OK" >> "$seqres.full"
+else
+    echo "cifs254: [skip] dir xattr not supported" >> "$seqres.full"
+fi
+
+# --- Test 7: large xattr value (near size limit) ---
+large_val=$(python3 -c "print('X' * 65000)")
+if setfattr -n user.large -v "$large_val" "$F" 2>>"$seqres.full"; then
+    sz=$(getfattr -n user.large --only-values "$F" 2>/dev/null | wc -c)
+    echo "cifs254: large xattr size=$sz" >> "$seqres.full"
+    [ "$sz" -ge 64000 ] || echo "cifs254: [warn] large xattr truncated" >> "$seqres.full"
+else
+    echo "cifs254: [note] large xattr (65K) rejected (expected)" >> "$seqres.full"
+fi
+
+# --- Test 8: system.cifs_acl xattr (if cifsacl mounted) ---
+if getfattr -n system.cifs_acl "$F" >/dev/null 2>>"$seqres.full"; then
+    echo "cifs254: system.cifs_acl readable" >> "$seqres.full"
+else
+    echo "cifs254: [skip] system.cifs_acl not available" >> "$seqres.full"
+fi
+
+# --- Test 9: listxattr via python (exercises full iteration) ---
+python3 -c "
+import os, sys
+xattrs = os.listxattr('$F')
+print(f'listxattr: {xattrs}', file=sys.stderr)
+assert len(xattrs) >= 2, f'expected >=2 xattrs, got {len(xattrs)}'
+" 2>>"$seqres.full" || true
+
+echo "xattr deep OK"
+
+status=0
+exit

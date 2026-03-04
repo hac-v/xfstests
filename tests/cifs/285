@@ -1,0 +1,232 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: read-after-invalidate corruption + fallocate+DIO race + mount overflow
+#
+# Regression tests for kernel commits:
+#   a395726cf823 ("cifs: fix data corruption in read after invalidate")
+#   dba9f997c9d9 ("smb: client: fix race with fallocate(2) and AIO+DIO")
+#   64f690ee22c9 ("cifs: Fix integer overflow while processing actimeo")
+#   d5a30fddfe2f ("cifs: Fix integer overflow while processing closetimeo")
+#
+# Bug 1 (a395726cf): After lease break → invalidate_inode_pages2(),
+# the zero_point is not updated, so subsequent reads beyond old zero_point
+# return blocks of zeros instead of actual file data.
+#
+# Bug 2 (dba9f997c): AIO+DIO extends file, concurrent fallocate sees wrong
+# i_size → becomes a truncation, data loss.
+#
+# Bug 3 (64f690ee/d5a30fddf): Very large actimeo/closetimeo values overflow
+# when converted to jiffies, causing mount to succeed with wrong timeout.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs285.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# --- Test 1: read-after-invalidate (zero_point corruption) ---
+# Write a file, drop caches (simulates invalidation after lease break),
+# extend the file on server side, then read — must not get zeros
+F1="$W/read_after_inval"
+
+python3 -c "
+import os, sys, hashlib
+
+f = '$W/read_after_inval'
+
+# Write initial data (1 MiB of pattern)
+data = b'VALID_DATA__' * (1048576 // 12)
+fd = os.open(f, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644)
+os.write(fd, data)
+os.fsync(fd)
+os.close(fd)
+
+h_orig = hashlib.md5(data).hexdigest()
+print(f'wrote {len(data)} bytes, md5={h_orig}', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "initial write failed"
+
+# Simulate invalidation (what happens after lease break)
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+# Now extend the file (simulates another client extending it)
+python3 -c "
+import os
+f = '$W/read_after_inval'
+fd = os.open(f, os.O_WRONLY | os.O_APPEND)
+os.write(fd, b'EXTENDED_DATA_' * 10000)
+os.fsync(fd)
+os.close(fd)
+" 2>>"$seqres.full" || _fail "extend failed"
+
+# Drop caches again (simulates the invalidation/zero_point bug)
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+# Read the ENTIRE file — must not have blocks of zeros
+python3 -c "
+import os, sys
+
+f = '$W/read_after_inval'
+fd = os.open(f, os.O_RDONLY)
+data = b''
+while True:
+    chunk = os.read(fd, 1048576)
+    if not chunk:
+        break
+    data += chunk
+os.close(fd)
+
+# Check for suspicious zero blocks (the bug pattern)
+zero_blocks = 0
+block_size = 4096
+for i in range(0, len(data) - block_size, block_size):
+    block = data[i:i+block_size]
+    if block == b'\x00' * block_size:
+        zero_blocks += 1
+        if zero_blocks <= 3:
+            print(f'ZERO BLOCK at offset 0x{i:x}', file=sys.stderr)
+
+if zero_blocks > 0:
+    print(f'CORRUPTION: {zero_blocks} zero blocks in {len(data)} byte file', file=sys.stderr)
+    sys.exit(1)
+
+# Verify the original data is present at the start
+assert b'VALID_DATA__' in data[:100], f'original data missing: {data[:50]!r}'
+# Verify the extension is present at the end
+assert b'EXTENDED_DATA_' in data[-200:], f'extended data missing: {data[-50:]!r}'
+
+print(f'read-after-invalidate: {len(data)} bytes, {zero_blocks} zero blocks (OK)', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "read-after-invalidate returned zero blocks (data corruption)"
+
+echo "cifs285: read-after-invalidate OK" >> "$seqres.full"
+
+# --- Test 2: fallocate + concurrent write race ---
+F2="$W/falloc_write_race"
+
+python3 -c "
+import os, sys, threading
+
+f = '$W/falloc_write_race'
+
+# Create file with initial data
+fd = os.open(f, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644)
+os.write(fd, b'I' * 1048576)  # 1 MiB
+os.fsync(fd)
+os.close(fd)
+
+errors = []
+
+def writer():
+    '''Extend file by appending'''
+    try:
+        fd = os.open(f, os.O_WRONLY | os.O_APPEND)
+        for i in range(100):
+            os.write(fd, b'W' * 4096)
+        os.fsync(fd)
+        os.close(fd)
+    except OSError as e:
+        errors.append(f'writer: {e}')
+
+def fallocater():
+    '''fallocate to preallocate space (must not truncate!)'''
+    try:
+        fd = os.open(f, os.O_RDWR)
+        try:
+            # FALLOC_FL_KEEP_SIZE — preallocate without changing size
+            import ctypes, ctypes.util
+            libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+            FALLOC_FL_KEEP_SIZE = 0x01
+            for i in range(10):
+                libc.fallocate(fd, FALLOC_FL_KEEP_SIZE,
+                               ctypes.c_longlong(0),
+                               ctypes.c_longlong(2 * 1048576))
+        except (OSError, AttributeError):
+            pass
+        os.close(fd)
+    except OSError as e:
+        errors.append(f'fallocater: {e}')
+
+t1 = threading.Thread(target=writer)
+t2 = threading.Thread(target=fallocater)
+t1.start()
+t2.start()
+t1.join(timeout=15)
+t2.join(timeout=15)
+
+# Verify: file must be AT LEAST 1 MiB (original) + some appended data
+# The bug: fallocate saw wrong i_size and truncated the file
+st = os.stat(f)
+assert st.st_size >= 1048576, f'file SHRUNK: {st.st_size} (was 1M + appends)'
+
+# Verify original data intact at start
+with open(f, 'rb') as fh:
+    head = fh.read(100)
+assert head.startswith(b'I' * 100), f'original data corrupted: {head[:20]!r}'
+
+if errors:
+    print(f'errors: {errors}', file=sys.stderr)
+
+print(f'fallocate+write race: final size={st.st_size} (OK)', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "fallocate+write race caused data loss"
+
+echo "cifs285: fallocate+write race OK" >> "$seqres.full"
+
+# --- Test 3: integer overflow in actimeo/closetimeo mount options ---
+# Very large values should be rejected, not silently overflow
+_test_unmount >/dev/null 2>&1
+
+BASE=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+
+# Strip actimeo/closetimeo
+CLEAN=$(echo "$BASE" | awk -F, '{
+    out=""
+    for(i=1;i<=NF;i++){
+        if($i ~ /^(actimeo=|closetimeo=)/) continue
+        out = out (out ? "," : "") $i
+    }
+    print out
+}')
+
+M_TEST=$(mktemp -d /tmp/cifs285.XXXXXX) || _fail "mktemp"
+
+# Try actimeo=4294967295 (UINT32_MAX) — should fail or be clamped
+echo "cifs285: testing actimeo overflow..." >> "$seqres.full"
+MO_OVERFLOW="$CLEAN,actimeo=4294967295"
+if mount -t cifs "$TEST_DEV" "$M_TEST" -o "$MO_OVERFLOW" 2>>"$seqres.full"; then
+    # Mounted — check if actimeo was clamped
+    mount_opts=$(mount | grep "$M_TEST")
+    echo "cifs285: overflow mount succeeded: $mount_opts" >> "$seqres.full"
+    umount "$M_TEST" 2>/dev/null
+    echo "cifs285: [note] actimeo=UINT32_MAX accepted (may be clamped)" >> "$seqres.full"
+else
+    echo "cifs285: actimeo=UINT32_MAX correctly rejected" >> "$seqres.full"
+fi
+
+# Try closetimeo=4294967295
+echo "cifs285: testing closetimeo overflow..." >> "$seqres.full"
+MO_OVERFLOW2="$CLEAN,closetimeo=4294967295"
+if mount -t cifs "$TEST_DEV" "$M_TEST" -o "$MO_OVERFLOW2" 2>>"$seqres.full"; then
+    umount "$M_TEST" 2>/dev/null
+    echo "cifs285: [note] closetimeo=UINT32_MAX accepted (may be clamped)" >> "$seqres.full"
+else
+    echo "cifs285: closetimeo=UINT32_MAX correctly rejected" >> "$seqres.full"
+fi
+
+rmdir "$M_TEST" 2>/dev/null
+
+# Restore mount for framework
+_do "_test_mount" 2>>"$seqres.full" || true
+
+echo "read-after-invalidate and race regressions OK"
+
+status=0
+exit

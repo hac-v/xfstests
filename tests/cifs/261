@@ -1,0 +1,323 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: SMB2 lease break mid-I/O — data integrity under concurrent access
+#
+# Kernel code exercised (smb2misc.c, ~200 lines):
+# - smb2_is_valid_lease_break(): validate incoming lease break notification
+# - smb2_tcon_has_lease(): find matching lease key in tcon's open file list
+# - cifs_close_deferred_file_under_lease(): flush deferred close on break
+# - Oplock/lease break handler in smb2_oplock_response()
+# - cifs_revalidate_mapping() after lease downgrade
+#
+# Strategy:
+# - Mount the same share twice (nosharesock → separate TCP connections)
+# - Client1: start a long sequential write (holds RWH lease)
+# - Client2: open same file mid-write (triggers lease break on client1)
+# - Verify: client1's write completes, data is intact, no corruption
+# - Also: client1 reads a file while client2 writes to it (read lease break)
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+# Need open_files or DebugData for lease verification
+[ -r /proc/fs/cifs/DebugData ] || _notrun "no DebugData"
+
+# Set up secondary mount
+BASE_OPTS=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+
+# Ensure nosharesock so we get a separate TCP connection (separate lease state)
+_strip_nosharesock() {
+    echo "$1" | awk -F, '{
+        out=""
+        for(i=1;i<=NF;i++){
+            if($i == "nosharesock") continue
+            out = out (out ? "," : "") $i
+        }
+        print out
+    }'
+}
+
+CLEAN_OPTS=$(_strip_nosharesock "$BASE_OPTS")
+[ -n "$CLEAN_OPTS" ] && SEC_OPTS="$CLEAN_OPTS,nosharesock" || SEC_OPTS="nosharesock"
+
+MNT2=""
+_cleanup_261() {
+    # Kill any background processes
+    [ -n "$WRITER_PID" ] && kill $WRITER_PID 2>/dev/null || true
+    [ -n "$READER_PID" ] && kill $READER_PID 2>/dev/null || true
+    wait 2>/dev/null || true
+    [ -n "$MNT2" ] && umount -l "$MNT2" 2>/dev/null || true
+    [ -n "$MNT2" ] && rmdir "$MNT2" 2>/dev/null || true
+    rm -rf "$TEST_DIR/cifs261.$$" 2>/dev/null || true
+}
+_register_cleanup _cleanup_261
+
+WRITER_PID=""
+READER_PID=""
+
+# Create secondary mount
+MNT2=$(mktemp -d /tmp/cifs261.sec.XXXXXX) || _fail "mktemp MNT2 failed"
+if ! mount -t cifs "$TEST_DEV" "$MNT2" -o "$SEC_OPTS" 2>>"$seqres.full"; then
+    rmdir "$MNT2" 2>/dev/null
+    MNT2=""
+    _notrun "secondary mount failed (need nosharesock for separate lease state)"
+fi
+
+W1="$TEST_DIR/cifs261.$$"
+W2="$MNT2/cifs261.$$"
+mkdir -p "$W1" || _fail "mkdir workspace failed"
+
+echo "cifs261: mounts OK (primary=$TEST_DIR secondary=$MNT2)" >> "$seqres.full"
+
+# --- Test 1: lease break during sequential write ---
+# Client1 starts a long write (gets RWH lease on the file)
+# Client2 opens the same file mid-write (triggers lease break)
+
+F_NAME="lease_break_write"
+F1="$W1/$F_NAME"
+F2="$W2/$F_NAME"
+
+# Start a slow writer on client1 (background)
+python3 -c "
+import os, time, sys, hashlib
+
+f = '$F1'
+fd = os.open(f, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+h = hashlib.md5()
+chunk_size = 65536
+chunks = 64  # 4 MiB total
+
+for i in range(chunks):
+    data = bytes([i & 0xff]) * chunk_size
+    os.write(fd, data)
+    h.update(data)
+    time.sleep(0.05)  # slow write to give time for lease break
+
+os.fsync(fd)
+os.close(fd)
+
+# Write the expected md5 to a sidecar
+with open(f + '.md5', 'w') as mf:
+    mf.write(h.hexdigest())
+
+print(f'writer done: md5={h.hexdigest()}', file=sys.stderr)
+" 2>>"$seqres.full" &
+WRITER_PID=$!
+
+# Wait for the file to be created and some data written
+sleep 0.5
+
+# Client2 opens the same file mid-write (triggers lease break on client1)
+python3 -c "
+import os, time, sys
+
+f = '$F2'
+# Wait until file exists
+for _ in range(20):
+    if os.path.exists(f):
+        break
+    time.sleep(0.2)
+
+# Open for read — this triggers lease break from RWH to RH on client1
+try:
+    fd = os.open(f, os.O_RDONLY)
+    # Read whatever is available
+    data = os.read(fd, 65536)
+    print(f'client2 read {len(data)} bytes mid-write', file=sys.stderr)
+    os.close(fd)
+except OSError as e:
+    print(f'client2 open: {e}', file=sys.stderr)
+" 2>>"$seqres.full"
+
+# Wait for writer to finish
+wait $WRITER_PID 2>/dev/null
+wr_rc=$?
+WRITER_PID=""
+[ $wr_rc -eq 0 ] || _fail "writer process failed (rc=$wr_rc)"
+
+# Verify data integrity — read back through client1
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+ACTUAL_MD5=$(md5sum < "$F1" | awk '{print $1}')
+EXPECTED_MD5=$(cat "$F1.md5" 2>/dev/null)
+
+echo "cifs261: write integrity: expected=$EXPECTED_MD5 actual=$ACTUAL_MD5" >> "$seqres.full"
+[ "$ACTUAL_MD5" = "$EXPECTED_MD5" ] || _fail "data corruption after lease break mid-write: $EXPECTED_MD5 vs $ACTUAL_MD5"
+
+# Also verify through client2
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+ACTUAL_MD5_2=$(md5sum < "$F2" | awk '{print $1}')
+[ "$ACTUAL_MD5_2" = "$EXPECTED_MD5" ] || _fail "data corruption on client2: $EXPECTED_MD5 vs $ACTUAL_MD5_2"
+
+echo "cifs261: lease break mid-write OK" >> "$seqres.full"
+
+# --- Test 2: lease break during sequential read ---
+# Client1 reads a large file; client2 writes to it mid-read
+
+F_NAME2="lease_break_read"
+F1R="$W1/$F_NAME2"
+F2R="$W2/$F_NAME2"
+
+# Create a 2 MiB file
+dd if=/dev/urandom of="$F1R" bs=1048576 count=2 2>>"$seqres.full" || _fail "create read file failed"
+sync
+READ_MD5=$(md5sum < "$F1R" | awk '{print $1}')
+
+# Client1 starts a slow read (background)
+python3 -c "
+import os, time, sys, hashlib
+
+f = '$F1R'
+fd = os.open(f, os.O_RDONLY)
+h = hashlib.md5()
+total = 0
+
+while True:
+    data = os.read(fd, 4096)
+    if not data:
+        break
+    h.update(data)
+    total += len(data)
+    time.sleep(0.01)  # slow read
+
+os.close(fd)
+print(f'reader done: {total} bytes md5={h.hexdigest()}', file=sys.stderr)
+
+# The read md5 may differ if client2 writes mid-read — that's OK
+# What matters is no crash/hang/corruption
+" 2>>"$seqres.full" &
+READER_PID=$!
+
+# Give reader a moment to start
+sleep 0.3
+
+# Client2 writes to the same file mid-read (triggers write lease break)
+python3 -c "
+import os, sys
+
+f = '$F2R'
+try:
+    fd = os.open(f, os.O_WRONLY | os.O_APPEND)
+    os.write(fd, b'LEASE_BREAK_MARKER')
+    os.fsync(fd)
+    os.close(fd)
+    print('client2 wrote marker during read', file=sys.stderr)
+except OSError as e:
+    print(f'client2 write during read: {e}', file=sys.stderr)
+" 2>>"$seqres.full"
+
+# Wait for reader to finish (must not hang)
+timeout 30 bash -c "wait $READER_PID" 2>/dev/null
+rd_rc=$?
+READER_PID=""
+
+[ $rd_rc -eq 0 ] || [ $rd_rc -eq 124 ] && {
+    [ $rd_rc -eq 124 ] && _fail "reader hung during lease break (timeout)"
+}
+
+# File should be intact (original + marker)
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+sz=$(stat -c %s "$F1R")
+# Should be >= original size
+[ "$sz" -ge 2097152 ] || _fail "file shrunk after lease break: $sz"
+
+echo "cifs261: lease break mid-read OK" >> "$seqres.full"
+
+# --- Test 3: concurrent writers (both get lease breaks) ---
+F_NAME3="lease_break_dual"
+F1D="$W1/$F_NAME3"
+F2D="$W2/$F_NAME3"
+
+: > "$F1D" || _fail "create dual file failed"
+
+# Both clients write concurrently — each triggers lease breaks on the other
+python3 -c "
+import os, time, sys
+
+f1 = '$F1D'
+f2 = '$F2D'
+fd1 = os.open(f1, os.O_WRONLY | os.O_APPEND)
+fd2 = os.open(f2, os.O_WRONLY | os.O_APPEND)
+
+# Interleave writes
+for i in range(100):
+    os.write(fd1, f'C1_{i:04d}\n'.encode())
+    os.write(fd2, f'C2_{i:04d}\n'.encode())
+
+os.fsync(fd1)
+os.fsync(fd2)
+os.close(fd1)
+os.close(fd2)
+
+print('dual concurrent writes OK', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "concurrent dual-write failed"
+
+# Verify file has data from both clients
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+c1_count=$(grep -c "^C1_" "$F1D" 2>/dev/null) || c1_count=0
+c2_count=$(grep -c "^C2_" "$F1D" 2>/dev/null) || c2_count=0
+total=$((c1_count + c2_count))
+
+echo "cifs261: dual write: C1=$c1_count C2=$c2_count total=$total" >> "$seqres.full"
+
+# Both clients should have written some data (append coherence may vary)
+if [ "$c1_count" -gt 0 ] && [ "$c2_count" -gt 0 ]; then
+    echo "cifs261: both clients' data present" >> "$seqres.full"
+elif [ "$total" -gt 0 ]; then
+    echo "cifs261: [note] only partial data visible (C1=$c1_count C2=$c2_count) — dual-mount append coherence limitation" >> "$seqres.full"
+else
+    _fail "no data in dual write file"
+fi
+
+echo "cifs261: concurrent dual write OK" >> "$seqres.full"
+
+# --- Test 4: rapid open/close from client2 while client1 streams ---
+F_NAME4="lease_break_rapid"
+F1S="$W1/$F_NAME4"
+F2S="$W2/$F_NAME4"
+
+# Client1 streams a big write
+dd if=/dev/urandom of="$F1S" bs=65536 count=32 2>>"$seqres.full" &
+WRITER_PID=$!
+
+# Client2 rapidly opens/closes the same file (many lease breaks)
+python3 -c "
+import os, time, sys
+
+f = '$F2S'
+opens = 0
+for _ in range(50):
+    try:
+        fd = os.open(f, os.O_RDONLY)
+        os.read(fd, 1)
+        os.close(fd)
+        opens += 1
+    except OSError:
+        pass
+    time.sleep(0.02)
+
+print(f'rapid open/close: {opens} successful opens', file=sys.stderr)
+" 2>>"$seqres.full" || true
+
+wait $WRITER_PID 2>/dev/null
+WRITER_PID=""
+
+# Verify file exists and has correct size
+sz4=$(stat -c %s "$F1S" 2>/dev/null || echo 0)
+[ "$sz4" -eq 2097152 ] || echo "cifs261: [note] stream file size=$sz4 (expected 2097152)" >> "$seqres.full"
+
+echo "cifs261: rapid lease break storm OK" >> "$seqres.full"
+
+echo "lease break mid-I/O OK"
+
+status=0
+exit

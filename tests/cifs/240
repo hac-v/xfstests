@@ -1,0 +1,110 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: swap-over-SMB (swapon / swapoff on CIFS file)
+#
+# Behavior under test
+# - Activate a swap file on a CIFS mount via swapon(8).
+# - Verify the system runs stably with swap active.
+# - Deactivate swap via swapoff(8).
+# - Skip if swapon fails (kernel/server may not support).
+# - Uses cifs_swap_activate / cifs_swap_deactivate / cifs_swap_rw paths.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+
+command -v mkswap >/dev/null 2>&1 || _notrun "requires mkswap"
+command -v swapon >/dev/null 2>&1 || _notrun "requires swapon"
+command -v swapoff >/dev/null 2>&1 || _notrun "requires swapoff"
+
+W="$TEST_DIR/cifs240.$$"
+SWAPFILE="$W/swapfile"
+SWAP_ACTIVE=false
+_cleanup_240() {
+    $SWAP_ACTIVE && swapoff "$SWAPFILE" 2>/dev/null || true
+    rm -rf "$W" >/dev/null 2>&1 || true
+}
+_register_cleanup _cleanup_240
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# --- Create a swap file ---
+# Swap files need to be pre-allocated (no holes), minimum ~40K
+# Use dd to write a contiguous 64 MiB file
+dd if=/dev/zero of="$SWAPFILE" bs=1048576 count=64 2>>"$seqres.full" || \
+    _fail "create swapfile failed"
+
+# Set up swap header
+mkswap "$SWAPFILE" >>"$seqres.full" 2>&1 || _fail "mkswap failed"
+
+# Set proper permissions
+chmod 0600 "$SWAPFILE" 2>>"$seqres.full" || true
+
+echo "cifs240: swapfile created, size=$(stat -c %s "$SWAPFILE")" >> "$seqres.full"
+
+# --- Pre-check: CONFIG_CIFS_SWAP must be enabled in the running kernel ---
+cifs_swap_enabled=false
+if [ -r /proc/config.gz ]; then
+    zcat /proc/config.gz 2>/dev/null | grep -q '^CONFIG_CIFS_SWAP=y' && cifs_swap_enabled=true
+elif [ -r "/boot/config-$(uname -r)" ]; then
+    grep -q '^CONFIG_CIFS_SWAP=y' "/boot/config-$(uname -r)" && cifs_swap_enabled=true
+elif [ -r /lib/modules/$(uname -r)/config ]; then
+    grep -q '^CONFIG_CIFS_SWAP=y' "/lib/modules/$(uname -r)/config" && cifs_swap_enabled=true
+fi
+if ! $cifs_swap_enabled; then
+    _notrun "CONFIG_CIFS_SWAP not enabled in running kernel"
+fi
+
+# --- Test 1: swapon ---
+if ! swapon "$SWAPFILE" 2>>"$seqres.full"; then
+    _notrun "swapon on CIFS not supported (server or mount may not allow swap)"
+fi
+SWAP_ACTIVE=true
+
+# Verify swap is active
+swapon --show >> "$seqres.full" 2>&1
+grep -q "$SWAPFILE\|swapfile" /proc/swaps 2>/dev/null || \
+    echo "cifs240: [note] swapfile not visible in /proc/swaps (may use device path)" >> "$seqres.full"
+
+echo "cifs240: swapon OK" >> "$seqres.full"
+
+# --- Test 2: exercise swap with memory pressure ---
+# Allocate some memory to exercise the swap I/O path
+python3 -c "
+import sys
+# Allocate 32 MiB in small chunks to encourage some swap activity
+chunks = []
+try:
+    for i in range(32):
+        chunks.append(bytearray(1048576))  # 1 MiB each
+except MemoryError:
+    pass
+# Access them to ensure they're paged in
+total = 0
+for c in chunks:
+    total += c[0] + c[-1]
+print(f'Allocated {len(chunks)} MiB, checksum={total}', file=sys.stderr)
+" 2>>"$seqres.full" || true
+
+echo "cifs240: memory pressure OK" >> "$seqres.full"
+
+# --- Test 3: swapoff ---
+swapoff "$SWAPFILE" 2>>"$seqres.full" || _fail "swapoff failed"
+SWAP_ACTIVE=false
+
+echo "cifs240: swapoff OK" >> "$seqres.full"
+
+# Verify swap is deactivated
+if grep -q "$SWAPFILE" /proc/swaps 2>/dev/null; then
+    _fail "swapfile still active after swapoff"
+fi
+
+echo "swap-over-SMB OK"
+
+status=0
+exit

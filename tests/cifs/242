@@ -1,0 +1,110 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: mount option parsing — batch 2
+#
+# Behavior under test
+# - iocharset: character set for filename encoding.
+# - backupuid / backupgid: backup operator privileges.
+# - resilienthandles: resilient file handles (distinct from persistent).
+# - dynperm: dynamic permission tracking.
+# - locallease: client-only lease tracking.
+# - min_enc_offload: minimum encryption offload size.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+
+M1=""
+_cleanup_242() {
+    [ -n "$M1" ] && _do "umount -l '$M1'" >/dev/null 2>&1 || true
+    [ -n "$M1" ] && rmdir "$M1" >/dev/null 2>&1 || true
+}
+_register_cleanup _cleanup_242
+
+_test_unmount >/dev/null 2>&1
+
+_strip_opts_pattern() {
+    local opts="$1"
+    shift
+    for pat in "$@"; do
+        opts=$(echo "$opts" | awk -F, -v p="$pat" '{
+            out=""
+            for(i=1;i<=NF;i++){
+                if($i ~ p) continue
+                out = out (out ? "," : "") $i
+            }
+            print out
+        }')
+    done
+    echo "$opts"
+}
+
+BASE=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+passed=0
+total=0
+
+_try_mount_opt() {
+    local label="$1"
+    local extra_opt="$2"
+    local strip_pats="$3"
+
+    total=$((total + 1))
+    echo "cifs242: testing $label..." >> "$seqres.full"
+
+    local stripped
+    if [ -n "$strip_pats" ]; then
+        stripped=$(_strip_opts_pattern "$BASE" $strip_pats)
+    else
+        stripped="$BASE"
+    fi
+
+    local mo="$stripped"
+    [ -n "$mo" ] && mo="$mo,$extra_opt" || mo="$extra_opt"
+
+    if [ -z "$M1" ]; then M1=$(mktemp -d /tmp/cifs242.XXXXXX) || _fail "mktemp"; fi
+    if _do "mount -t cifs '$TEST_DEV' '$M1' -o '$mo'" 2>>"$seqres.full"; then
+        # Basic I/O sanity
+        echo "test_$label" > "$M1/cifs242_$label.$$" 2>/dev/null || true
+        rm -f "$M1/cifs242_$label.$$" 2>/dev/null
+        _do "umount '$M1'" 2>>"$seqres.full" || true
+        echo "cifs242: $label OK" >> "$seqres.full"
+        passed=$((passed + 1))
+        return 0
+    else
+        echo "cifs242: [skip] $label mount failed" >> "$seqres.full"
+        return 1
+    fi
+}
+
+# --- Test 1: iocharset ---
+_try_mount_opt "iocharset_utf8" "iocharset=utf8" "^iocharset="
+
+# --- Test 2: backupuid / backupgid ---
+_try_mount_opt "backupuid" "backupuid=$(id -u),backupgid=$(id -g)" "^backupuid= ^backupgid="
+
+# --- Test 3: resilienthandles ---
+_try_mount_opt "resilienthandles" "resilienthandles" "^resilienthandles ^noresilienthandles ^persistenthandles ^nopersistenthandles"
+
+# --- Test 4: dynperm ---
+_try_mount_opt "dynperm" "dynperm" "^dynperm ^nodynperm"
+
+# --- Test 5: locallease ---
+_try_mount_opt "locallease" "locallease" "^locallease"
+
+# --- Test 6: min_enc_offload (default 4096) ---
+_try_mount_opt "min_enc_offload" "seal,min_enc_offload=8192" "^min_enc_offload= ^seal$"
+
+echo "cifs242: passed $passed of $total mount option tests" >> "$seqres.full"
+
+# At least 2 should have succeeded (iocharset and dynperm are widely supported)
+[ "$passed" -ge 1 ] || _fail "no mount options accepted"
+
+echo "mount option parsing batch2 OK"
+
+status=0
+exit

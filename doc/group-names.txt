@@ -9,6 +9,7 @@ quick			Tests that should run in under 30 seconds.
 deprecated		Old tests that should not be run.
 
 acl			Access Control Lists
+auth			Authentication and credential handling
 admin			xfs_admin functionality
 aio			general libaio async io tests
 atime			file access time
@@ -87,6 +88,7 @@ online_repair		online repair functionality tests
 other			dumping ground, do not add more tests to this group
 parent			Parent pointer tests
 pattern			specific IO pattern tests
+perf			performance and throughput measurement tests
 perms			access control and permission checking
 pipe			pipe functionality
 pnfs			PNFS

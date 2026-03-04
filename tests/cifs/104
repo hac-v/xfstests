@@ -23,15 +23,15 @@ _host_from_unc() { echo "$1" | sed -E 's#^//([^/]+)/.*#\1#'; }
 _share_from_unc() { echo "$1" | sed -E 's#^//[^/]+/([^/]+).*#\1#'; }
 _unc_windows() {
     local h=$(_host_from_unc "$1"); local s=$(_share_from_unc "$1");
-    printf "\\\\%s\\%s" "$h" "$s"
+    printf "\\\\\\\\%s\\\\%s" "$h" "$s"
 }
 _unc_posix() {
     local h=$(_host_from_unc "$1"); local s=$(_share_from_unc "$1");
     printf "//%s/%s" "$h" "$s"
 }
 
-UNCW=$(_unc_windows "$TEST_DEV")
-[ -n "$UNCW" ] || _notrun "could not derive UNC"
+SHARE=$(_share_from_unc "$TEST_DEV")
+[ -n "$SHARE" ] || _notrun "could not derive share name"
 UNCP=$(_unc_posix "$TEST_DEV")
 
 _stats_for_unc() {
@@ -40,7 +40,7 @@ _stats_for_unc() {
         snap=$(cat /proc/fs/cifs/Stats 2>/dev/null)
         echo "$snap" >> $seqres.full
         # look for the share block header, e.g. "1) \\host\share"
-        echo "$snap" | grep -Fq ") $unc" && break
+        echo "$snap" | grep -q "$unc" && break
         tries=$((tries-1)); sleep $delay
     done
     echo "$snap" | awk -v UNC="$unc" '
@@ -67,8 +67,8 @@ _register_cleanup "_test_unmount >/dev/null 2>&1; rm -f \"$TEST_DIR/.cifs104.$$\
 _test_unmount > /dev/null 2>&1
 _do "_test_mount" || _fail "mount TEST_DEV failed"
 
-read br0 bw0 cr0 cl0 rd0 wr0 < <(_stats_for_unc "$UNCW")
-echo "before: $UNCW br=$br0 bw=$bw0 cr=$cr0 cl=$cl0 rd=$rd0 wr=$wr0" >> $seqres.full
+read br0 bw0 cr0 cl0 rd0 wr0 < <(_stats_for_unc "$SHARE")
+echo "before: $SHARE br=$br0 bw=$bw0 cr=$cr0 cl=$cl0 rd=$rd0 wr=$wr0" >> $seqres.full
 
 # Perform controlled I/O
 FILE="$TEST_DIR/.cifs104.$$"
@@ -94,8 +94,8 @@ stat "$FILE" >/dev/null 2>&1 || true
 # Poll for Stats update (write + creates/closes)
 tries=50
 while [ $tries -gt 0 ]; do
-    read br1 bw1 cr1 cl1 rd1 wr1 < <(_stats_for_unc "$UNCW")
-    echo "after write: $UNCW br=$br1 bw=$bw1 cr=$cr1 cl=$cl1 rd=$rd1 wr=$wr1 (tries=$tries)" >> $seqres.full
+    read br1 bw1 cr1 cl1 rd1 wr1 < <(_stats_for_unc "$SHARE")
+    echo "after write: $SHARE br=$br1 bw=$bw1 cr=$cr1 cl=$cl1 rd=$rd1 wr=$wr1 (tries=$tries)" >> $seqres.full
     dbw=0; dwr=0
     if [ -n "$bw1" ]; then dbw=$((bw1 - bw0)); fi
     if [ -n "$wr1" ]; then dwr=$((wr1 - wr0)); fi
@@ -105,7 +105,7 @@ while [ $tries -gt 0 ]; do
     tries=$((tries-1)); sleep 0.2
 done
 
-[ $tries -gt 0 ] || _notrun "CIFS Stats did not reflect write for $UNCW (bytes or op count); stats may be disabled on this kernel"
+[ $tries -gt 0 ] || _notrun "CIFS Stats did not reflect write for $SHARE (bytes or op count); stats may be disabled on this kernel"
 
 # Determine if this is the only CIFS mount
 only_this_mount=false
@@ -133,11 +133,11 @@ fi
 
 # Phase A: Direct read of first half (0..READ1_BYTES)
 $XFS_IO_PROG -c "fadvise -d 0 $READ1_BYTES" "$FILE" >> $seqres.full 2>&1 || true
-read brA0 _bw _cr _cl _rd _wr < <(_stats_for_unc "$UNCW")
+read brA0 _bw _cr _cl _rd _wr < <(_stats_for_unc "$SHARE")
 dd if="$FILE" of=/dev/null bs=$BS count=$RCOUNT1 iflag=direct status=none || true
 tries=50
 while [ $tries -gt 0 ]; do
-    read brA1 _bw _cr _cl rdA1 _wr < <(_stats_for_unc "$UNCW")
+    read brA1 _bw _cr _cl rdA1 _wr < <(_stats_for_unc "$SHARE")
     dbrA=$((brA1 - brA0)); drdA=0
     if [ -n "$rdA1" ]; then drdA=$((rdA1 - rd0)); fi
     echo "after direct read: dbrA=$dbrA drdA=$drdA (tries=$tries)" >> $seqres.full
@@ -155,11 +155,11 @@ fi
 
 # Phase B: Buffered read of second half (READ1..READ1+READ2)
 $XFS_IO_PROG -c "fadvise -d $READ1_BYTES $READ2_BYTES" "$FILE" >> $seqres.full 2>&1 || true
-read brB0 _bw _cr _cl _rd _wr < <(_stats_for_unc "$UNCW")
+read brB0 _bw _cr _cl _rd _wr < <(_stats_for_unc "$SHARE")
 dd if="$FILE" of=/dev/null bs=$BS count=$RCOUNT2 skip=$((READ1_BYTES/BS)) status=none || true
 tries=50
 while [ $tries -gt 0 ]; do
-    read brB1 _bw _cr _cl rdB1 _wr < <(_stats_for_unc "$UNCW")
+    read brB1 _bw _cr _cl rdB1 _wr < <(_stats_for_unc "$SHARE")
     dbrB=$((brB1 - brB0)); drdB=0
     if [ -n "$rdB1" ]; then drdB=$((rdB1 - rd0)); fi
     echo "after buffered read: dbrB=$dbrB drdB=$drdB (tries=$tries)" >> $seqres.full

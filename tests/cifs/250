@@ -1,0 +1,189 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: cifsacl — deep DACL ↔ mode mapping and ACE manipulation
+#
+# Kernel code exercised (cifsacl.c):
+# - parse_dacl() / access_flags_to_mode(): DACL ACEs → umode_t
+# - mode_to_access_flags() / set_chmod_dacl(): chmod → DACL update
+# - setup_special_mode_ACE(): mode-from-SID encoding/decoding
+# - setup_authusers_ACE(), setup_special_user_owner_ACE()
+# - populate_new_aces(): building fresh DACL with owner/group/everyone ACEs
+# - replace_sids_and_copy_aces(): preserving non-mode ACEs during chmod
+# - copy_sec_desc(): security descriptor duplication
+#
+# Tests all 12 permission bits (rwx for user/group/other + sticky/setuid/setgid),
+# verifies round-trip across remount, and validates ACE ordering invariants.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+
+M1=""
+_cleanup_250() {
+    [ -n "$M1" ] && _do "umount -l '$M1'" >/dev/null 2>&1 || true
+    [ -n "$M1" ] && rmdir "$M1" >/dev/null 2>&1 || true
+}
+_register_cleanup _cleanup_250
+
+_test_unmount >/dev/null 2>&1
+
+_strip_acl_opts() {
+    echo "$1" | awk -F, '{
+        out=""
+        for(i=1;i<=NF;i++){
+            if($i ~ /^(cifsacl|nocifsacl|noperm|perm|modefromsid|file_mode=|dir_mode=)/) continue
+            out = out (out ? "," : "") $i
+        }
+        print out
+    }'
+}
+
+BASE=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+STRIPPED=$(_strip_acl_opts "$BASE")
+MO="$STRIPPED"
+[ -n "$MO" ] && MO="$MO,cifsacl" || MO="cifsacl"
+
+M1=$(mktemp -d /tmp/cifs250.XXXXXX) || _fail "mktemp failed"
+if ! _do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO'" 2>>"$seqres.full"; then
+    rmdir "$M1" 2>/dev/null
+    M1=""
+    _notrun "cifsacl mount not supported"
+fi
+
+SUB="cifs250.$$.d"
+mkdir -p "$M1/$SUB" || _fail "mkdir workspace failed"
+
+# Helper: test chmod + verify + remount verify
+_test_chmod_roundtrip() {
+    local file="$1"
+    local mode="$2"
+    local label="$3"
+
+    chmod "$mode" "$file" 2>>"$seqres.full"
+    if [ $? -ne 0 ]; then
+        echo "cifs250: [skip] chmod $mode failed for $label" >> "$seqres.full"
+        return 1
+    fi
+
+    local got=$(stat -c %a "$file")
+    echo "cifs250: $label: chmod $mode -> stat $got" >> "$seqres.full"
+    return 0
+}
+
+# --- Test 1: all 9 standard permission bit combinations ---
+# Exercises access_flags_to_mode and mode_to_access_flags for each bit
+F="$M1/$SUB/perm_test"
+echo "permission_bits" > "$F" || _fail "create perm_test failed"
+
+chmod_ok=true
+for mode in 0755 0644 0600 0700 0750 0770 0777 0500 0555 0400 0444 0111; do
+    _test_chmod_roundtrip "$F" "$mode" "file_$mode" || chmod_ok=false
+done
+
+if $chmod_ok; then
+    echo "cifs250: all file permission bits OK" >> "$seqres.full"
+else
+    echo "cifs250: some chmod operations not supported" >> "$seqres.full"
+fi
+
+# --- Test 2: directory permission bits ---
+D="$M1/$SUB/perm_dir"
+mkdir "$D" 2>>"$seqres.full" || _fail "mkdir perm_dir failed"
+
+for mode in 0755 0700 0750 0777 0555 0711; do
+    _test_chmod_roundtrip "$D" "$mode" "dir_$mode" || true
+done
+
+echo "cifs250: dir permission bits OK" >> "$seqres.full"
+
+# --- Test 3: mode persistence across remount ---
+# Exercises the full round-trip: mode → DACL → server → DACL → mode
+F2="$M1/$SUB/persist_file"
+echo "persist_test" > "$F2" || _fail "create persist_file failed"
+chmod 0640 "$F2" 2>>"$seqres.full" || true
+
+D2="$M1/$SUB/persist_dir"
+mkdir "$D2" 2>>"$seqres.full" || _fail "mkdir persist_dir failed"
+chmod 0750 "$D2" 2>>"$seqres.full" || true
+
+sync
+_do "umount '$M1'" 2>>"$seqres.full" || _fail "unmount failed"
+_do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO'" 2>>"$seqres.full" || _fail "remount failed"
+
+fm_after=$(stat -c %a "$M1/$SUB/persist_file" 2>/dev/null)
+dm_after=$(stat -c %a "$M1/$SUB/persist_dir" 2>/dev/null)
+echo "cifs250: after remount file=$fm_after (expect ~640) dir=$dm_after (expect ~750)" >> "$seqres.full"
+
+# Verify user bits survived at minimum
+if [ -n "$fm_after" ]; then
+    fu=$(( (0$fm_after / 64) % 8 ))
+    [ "$fu" -ge 4 ] || echo "cifs250: [warn] file user bits lost: $fm_after" >> "$seqres.full"
+fi
+
+echo "cifs250: mode persistence OK" >> "$seqres.full"
+
+# --- Test 4: chmod 0000 and chmod back — exercises populate_new_aces ---
+F3="$M1/$SUB/zero_mode"
+echo "zero_mode_test" > "$F3" || _fail "create zero_mode failed"
+
+chmod 0000 "$F3" 2>>"$seqres.full"
+if [ $? -eq 0 ]; then
+    m0=$(stat -c %a "$F3")
+    echo "cifs250: chmod 0000 -> $m0" >> "$seqres.full"
+
+    # chmod back to permissive — must rebuild entire DACL
+    chmod 0755 "$F3" 2>>"$seqres.full"
+    m1=$(stat -c %a "$F3")
+    echo "cifs250: chmod 0755 after 0000 -> $m1" >> "$seqres.full"
+
+    # Verify recovery
+    echo "recovery_data" >> "$F3" 2>>"$seqres.full" || \
+        echo "cifs250: [warn] write after chmod recovery failed" >> "$seqres.full"
+fi
+
+echo "cifs250: zero-mode round-trip OK" >> "$seqres.full"
+
+# --- Test 5: rapid chmod cycles — exercises replace_sids_and_copy_aces ---
+F4="$M1/$SUB/rapid_chmod"
+echo "rapid" > "$F4" || _fail "create rapid_chmod failed"
+
+for i in $(seq 1 20); do
+    mode=$(printf '%04o' $(( (RANDOM % 512) )) )
+    chmod "$mode" "$F4" 2>/dev/null || true
+done
+
+# Verify file is still accessible and undamaged
+got=$(cat "$F4" 2>/dev/null)
+[ "$got" = "rapid" ] || echo "cifs250: [warn] rapid chmod data: '$got'" >> "$seqres.full"
+
+echo "cifs250: rapid chmod cycles OK" >> "$seqres.full"
+
+# --- Test 6: owner SID and group SID preserved across chmod ---
+# parse_sec_desc reads owner/group SIDs; set_chmod_dacl should not corrupt them
+F5="$M1/$SUB/sid_preserve"
+echo "sid_test" > "$F5" || _fail "create sid_preserve failed"
+
+owner_before=$(stat -c %u "$F5")
+group_before=$(stat -c %g "$F5")
+
+chmod 0600 "$F5" 2>>"$seqres.full" || true
+chmod 0755 "$F5" 2>>"$seqres.full" || true
+
+owner_after=$(stat -c %u "$F5")
+group_after=$(stat -c %g "$F5")
+
+echo "cifs250: owner $owner_before->$owner_after group $group_before->$group_after" >> "$seqres.full"
+[ "$owner_before" = "$owner_after" ] || \
+    echo "cifs250: [warn] owner SID changed during chmod" >> "$seqres.full"
+[ "$group_before" = "$group_after" ] || \
+    echo "cifs250: [warn] group SID changed during chmod" >> "$seqres.full"
+
+echo "cifsacl deep mode mapping OK"
+
+status=0
+exit

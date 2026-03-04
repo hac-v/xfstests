@@ -1,0 +1,126 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: remount transitions — cache mode, actimeo, seal changes
+#
+# Kernel code exercised (cifsfs.c):
+# - cifs_remount(): handle mount option changes on live mount
+# - Cache mode transitions: strict→none, none→strict
+# - actimeo changes on remount
+# - Adding/removing seal on remount
+# - Verify I/O works after each remount transition
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+
+M1=""
+_cleanup_258() {
+    [ -n "$M1" ] && _do "umount -l '$M1'" >/dev/null 2>&1 || true
+    [ -n "$M1" ] && rmdir "$M1" >/dev/null 2>&1 || true
+}
+_register_cleanup _cleanup_258
+
+_test_unmount >/dev/null 2>&1
+
+BASE=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+
+_strip_opts_pattern() {
+    local opts="$1"; shift
+    for pat in "$@"; do
+        opts=$(echo "$opts" | awk -F, -v p="$pat" '{
+            out=""
+            for(i=1;i<=NF;i++){
+                if($i ~ p) continue
+                out = out (out ? "," : "") $i
+            }
+            print out
+        }')
+    done
+    echo "$opts"
+}
+
+STRIPPED=$(_strip_opts_pattern "$BASE" "^cache=" "^actimeo=" "^seal$" "^noseal$")
+MO_INIT="$STRIPPED"
+[ -n "$MO_INIT" ] && MO_INIT="$MO_INIT,cache=strict,actimeo=1" || MO_INIT="cache=strict,actimeo=1"
+
+M1=$(mktemp -d /tmp/cifs258.XXXXXX) || _fail "mktemp failed"
+_do "mount -t cifs '$TEST_DEV' '$M1' -o '$MO_INIT'" 2>>"$seqres.full" || _fail "initial mount failed"
+
+SUB="cifs258.$$.d"
+mkdir -p "$M1/$SUB" || _fail "mkdir workspace failed"
+
+# Helper: verify basic I/O works
+_verify_io() {
+    local label="$1"
+    local f="$M1/$SUB/io_$label"
+    echo "test_$label" > "$f" 2>>"$seqres.full" || return 1
+    got=$(cat "$f" 2>>"$seqres.full") || return 1
+    [ "$got" = "test_$label" ] || return 1
+    rm -f "$f" 2>/dev/null
+    return 0
+}
+
+_verify_io "initial" || _fail "initial I/O failed"
+echo "cifs258: initial mount OK" >> "$seqres.full"
+
+# --- Test 1: remount rw → ro → rw ---
+mount -o remount,ro "$M1" 2>>"$seqres.full"
+if [ $? -eq 0 ]; then
+    # Write should fail
+    if (echo "should_fail" > "$M1/$SUB/ro_test") >/dev/null 2>&1; then
+        echo "cifs258: [warn] write succeeded on ro remount" >> "$seqres.full"
+    else
+        echo "cifs258: ro remount blocks writes OK" >> "$seqres.full"
+    fi
+
+    # Remount back to rw
+    mount -o remount,rw "$M1" 2>>"$seqres.full" || _fail "remount rw failed"
+    _verify_io "after_ro_rw" || _fail "I/O failed after ro→rw"
+    echo "cifs258: ro→rw OK" >> "$seqres.full"
+else
+    echo "cifs258: [skip] remount ro not supported" >> "$seqres.full"
+fi
+
+# --- Test 2: remount with different actimeo ---
+mount -o "remount,actimeo=30" "$M1" 2>>"$seqres.full"
+if [ $? -eq 0 ]; then
+    _verify_io "actimeo30" || _fail "I/O failed after actimeo change"
+
+    # Check mount options reflect new actimeo
+    mnt_opts=$(mount | grep "$M1" | head -1)
+    echo "cifs258: after actimeo=30: $mnt_opts" >> "$seqres.full"
+
+    # Change back
+    mount -o "remount,actimeo=1" "$M1" 2>>"$seqres.full" || true
+    echo "cifs258: actimeo remount OK" >> "$seqres.full"
+else
+    echo "cifs258: [skip] actimeo remount not supported" >> "$seqres.full"
+fi
+
+# --- Test 3: remount with closetimeo change ---
+mount -o "remount,closetimeo=60" "$M1" 2>>"$seqres.full"
+if [ $? -eq 0 ]; then
+    _verify_io "closetimeo60" || _fail "I/O failed after closetimeo change"
+    mount -o "remount,closetimeo=30" "$M1" 2>>"$seqres.full" || true
+    echo "cifs258: closetimeo remount OK" >> "$seqres.full"
+else
+    echo "cifs258: [skip] closetimeo remount not supported" >> "$seqres.full"
+fi
+
+# --- Test 4: multiple rapid remounts ---
+for i in $(seq 1 5); do
+    mount -o remount,ro "$M1" 2>/dev/null && \
+    mount -o remount,rw "$M1" 2>/dev/null || true
+done
+_verify_io "rapid_remount" || _fail "I/O failed after rapid remounts"
+echo "cifs258: rapid remount OK" >> "$seqres.full"
+
+echo "remount transitions OK"
+
+status=0
+exit

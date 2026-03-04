@@ -1,0 +1,101 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: POSIX fdatasync correctness
+#
+# Behavior under test
+# - fdatasync(2) flushes file data to stable storage without necessarily
+#   flushing metadata (unlike fsync).
+# - Data written + fdatasync'd survives drop_caches.
+# - Compare with fsync behavior.
+#
+# Output
+# - Single success line; diagnostics go to $seqres.full.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs213.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# --- Test 1: fdatasync flushes data, survives drop_caches ---
+python3 -c "
+import os
+
+f = '$W/f1'
+fd = os.open(f, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644)
+os.write(fd, b'FDATASYNC_TEST_DATA_1234567890')
+os.fdatasync(fd)
+os.close(fd)
+" 2>>"$seqres.full" || _fail "fdatasync write failed"
+
+# Drop caches to force re-read from server
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+got=$(cat "$W/f1")
+[ "$got" = "FDATASYNC_TEST_DATA_1234567890" ] || \
+    _fail "fdatasync data not persisted: got '$got'"
+
+echo "cifs213: fdatasync persistence OK" >> "$seqres.full"
+
+# --- Test 2: multiple fdatasync calls in sequence ---
+python3 -c "
+import os
+
+f = '$W/f2'
+fd = os.open(f, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644)
+for i in range(10):
+    os.write(fd, f'chunk-{i}\n'.encode())
+    os.fdatasync(fd)
+os.close(fd)
+" 2>>"$seqres.full" || _fail "repeated fdatasync failed"
+
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+lines=$(wc -l < "$W/f2")
+[ "$lines" -eq 10 ] || _fail "expected 10 lines after repeated fdatasync, got $lines"
+
+echo "cifs213: repeated fdatasync OK" >> "$seqres.full"
+
+# --- Test 3: fdatasync vs fsync both preserve data ---
+python3 -c "
+import os
+
+f_ds = '$W/f_datasync'
+f_fs = '$W/f_fsync'
+payload = b'X' * 65536  # 64 KiB
+
+fd1 = os.open(f_ds, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644)
+os.write(fd1, payload)
+os.fdatasync(fd1)
+os.close(fd1)
+
+fd2 = os.open(f_fs, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644)
+os.write(fd2, payload)
+os.fsync(fd2)
+os.close(fd2)
+" 2>>"$seqres.full" || _fail "fdatasync vs fsync write failed"
+
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+sz_ds=$(stat -c %s "$W/f_datasync")
+sz_fs=$(stat -c %s "$W/f_fsync")
+[ "$sz_ds" -eq 65536 ] || _fail "fdatasync file size wrong: $sz_ds"
+[ "$sz_fs" -eq 65536 ] || _fail "fsync file size wrong: $sz_fs"
+
+md5_ds=$(md5sum < "$W/f_datasync" | awk '{print $1}')
+md5_fs=$(md5sum < "$W/f_fsync" | awk '{print $1}')
+[ "$md5_ds" = "$md5_fs" ] || _fail "fdatasync vs fsync data mismatch"
+
+echo "posix fdatasync OK"
+
+status=0
+exit

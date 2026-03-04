@@ -1,0 +1,165 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: writeback boundary data corruption regression test
+#
+# Regression test for kernel commits:
+#   f3dc1bdb6b0b ("cifs: Fix writeback data corruption")
+#   4860abb91f3d ("smb: Fix regression in writes when non-standard maximum
+#                  write size negotiated")
+#
+# Bug 1 (f3dc1bdb): cifs_extend_writeback() hits wsize limit, calls
+# xas_pause() which ADVANCES the loop counter, skipping a page. The
+# skipped page's data is lost — file has a hole of stale/zero data.
+#
+# Bug 2 (4860abb9): When negotiated wsize is not a multiple of 4096,
+# netfs code skips the end of the final page during large sequential
+# writes, causing data corruption at page boundaries.
+#
+# Test: write a large file sequentially, verify every byte matches
+# the expected pattern. Run with various write sizes to stress the
+# wsize boundary condition.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs280.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+# --- Test 1: large sequential write, verify no page skipped ---
+# Write 8 MiB with a repeating byte pattern, then read back and verify
+# every single byte. If writeback skips a page, we'll see zeros or
+# stale data in the middle.
+python3 -c "
+import os, sys
+
+f = '$W/wb_boundary'
+size = 8 * 1048576  # 8 MiB
+pattern = bytes(range(256)) * (size // 256)  # repeating 0x00-0xFF
+
+fd = os.open(f, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+# Write in chunks that might trigger wsize boundary
+chunk_size = 65536  # 64 KiB chunks
+offset = 0
+while offset < size:
+    end = min(offset + chunk_size, size)
+    os.write(fd, pattern[offset:end])
+    offset = end
+os.fsync(fd)
+os.close(fd)
+
+# Read back and verify EVERY byte
+fd = os.open(f, os.O_RDONLY)
+data = b''
+while True:
+    chunk = os.read(fd, 1048576)
+    if not chunk:
+        break
+    data += chunk
+os.close(fd)
+
+assert len(data) == size, f'size mismatch: {len(data)} vs {size}'
+
+# Check for corruption — compare against expected pattern
+errors = 0
+first_error = -1
+for i in range(size):
+    if data[i] != pattern[i]:
+        if first_error < 0:
+            first_error = i
+        errors += 1
+        if errors <= 5:
+            print(f'CORRUPTION at offset 0x{i:x}: expected 0x{pattern[i]:02x} got 0x{data[i]:02x}', file=sys.stderr)
+
+if errors > 0:
+    print(f'TOTAL: {errors} corrupted bytes, first at 0x{first_error:x}', file=sys.stderr)
+    # Check if it's a page-aligned skip (the f3dc1bdb bug pattern)
+    page = first_error & ~0xFFF
+    print(f'  (page-aligned: 0x{page:x}, page offset: {first_error - page})', file=sys.stderr)
+    sys.exit(1)
+
+print(f'8 MiB writeback: all {size} bytes correct', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "writeback boundary corruption detected"
+
+echo "cifs280: 8M sequential writeback OK" >> "$seqres.full"
+
+# --- Test 2: write with various chunk sizes near page boundaries ---
+for chunk in 4095 4096 4097 8191 8192 8193 65535 65536 65537; do
+    F="$W/wb_chunk_$chunk"
+    python3 -c "
+import os, sys
+
+f = '$F'
+size = 1048576  # 1 MiB
+chunk = $chunk
+pattern = bytes([($chunk & 0xFF)] * size)
+
+fd = os.open(f, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+offset = 0
+while offset < size:
+    end = min(offset + chunk, size)
+    os.write(fd, pattern[offset:end])
+    offset = end
+os.fsync(fd)
+os.close(fd)
+
+# Verify
+fd = os.open(f, os.O_RDONLY)
+data = os.read(fd, size + 4096)
+os.close(fd)
+
+if len(data) != size:
+    print(f'chunk={chunk}: size {len(data)} vs {size}', file=sys.stderr)
+    sys.exit(1)
+
+for i in range(size):
+    if data[i] != pattern[i]:
+        print(f'chunk={chunk}: CORRUPT at 0x{i:x}', file=sys.stderr)
+        sys.exit(1)
+" 2>>"$seqres.full" || _fail "writeback corruption with chunk=$chunk"
+done
+
+echo "cifs280: various chunk sizes OK" >> "$seqres.full"
+
+# --- Test 3: rapid sequential overwrite (dirty page replacement at wsize edge) ---
+python3 -c "
+import os, sys, hashlib
+
+f = '$W/wb_overwrite'
+size = 4 * 1048576  # 4 MiB
+
+# Write A pattern
+fd = os.open(f, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+os.write(fd, b'A' * size)
+# DON'T fsync — overwrite while dirty
+os.lseek(fd, 0, os.SEEK_SET)
+os.write(fd, b'B' * size)
+os.fsync(fd)
+os.close(fd)
+
+# Must be all B's
+fd = os.open(f, os.O_RDONLY)
+data = os.read(fd, size + 4096)
+os.close(fd)
+
+assert len(data) == size, f'overwrite size: {len(data)}'
+for i in range(size):
+    if data[i] != ord('B'):
+        print(f'OVERWRITE CORRUPTION at 0x{i:x}: expected B got 0x{data[i]:02x}', file=sys.stderr)
+        sys.exit(1)
+
+print(f'dirty overwrite: all {size} bytes correct', file=sys.stderr)
+" 2>>"$seqres.full" || _fail "dirty page overwrite corruption"
+
+echo "writeback boundary corruption OK"
+
+status=0
+exit
