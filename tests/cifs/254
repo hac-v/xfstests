@@ -32,8 +32,17 @@ echo "xattr_test" > "$F" || _fail "create file failed"
 setfattr -n user.test1 -v "value1" "$F" 2>>"$seqres.full" || \
     _notrun "setxattr user.* not supported on this CIFS mount"
 
+# Flush attribute cache to ensure we read from server
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+sync
+sleep 0.5
+
 got=$(getfattr -n user.test1 --only-values "$F" 2>>"$seqres.full")
-[ "$got" = "value1" ] || _fail "getxattr: expected 'value1' got '$got'"
+echo "cifs254: getfattr raw output: '$got'" >> "$seqres.full"
+
+# Some getfattr versions append a newline or the output may have trailing whitespace
+got_trimmed=$(echo "$got" | tr -d '\n\r')
+[ "$got_trimmed" = "value1" ] || _fail "getxattr: expected 'value1' got '$got_trimmed'"
 
 echo "cifs254: set/get user.test1 OK" >> "$seqres.full"
 
