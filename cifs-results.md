@@ -18,7 +18,7 @@
 | **Client Kernel** | 6.19.0-rc1+ | 6.19.0-rc1+ | 6.19.0-rc1+ |
 | **Server** | Samba 4.21.4 (localhost) | Windows Server | Azure Files Premium |
 | **Protocol** | SMB3 (auto) | SMB 3.1.1 | SMB 3.1.1 |
-| **Multichannel** | No (single NIC) | Yes (3 channels) | No (single channel) |
+| **Multichannel** | No (single NIC) | Yes (3 channels) | Yes (multichannel) |
 
 ## Detailed Results
 
