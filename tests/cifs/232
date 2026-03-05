@@ -52,6 +52,22 @@ _open_dirs_count() {
 
 _register_cleanup "_test_unmount >/dev/null 2>&1; rm -rf \"$TEST_DIR/cifs232.$$\" >/dev/null 2>&1"
 
+# To ensure nohandlecache takes effect, we must tear down the entire SMB
+# session between phases. If SCRATCH_DEV keeps the session alive, the kernel
+# reuses the existing tcon (with cached_fids already initialized) and the
+# nohandlecache flag is ignored. So we also unmount scratch between phases.
+_scratch_unmount_cmd() {
+    [ -n "$SCRATCH_MNT" ] && umount "$SCRATCH_MNT" >/dev/null 2>&1 || true
+    [ -n "$SCRATCH_DEV" ] && umount "$SCRATCH_DEV" >/dev/null 2>&1 || true
+}
+_scratch_remount_cmd() {
+    if [ -n "$SCRATCH_MNT" ] && [ -n "$SCRATCH_DEV" ]; then
+        local sopts
+        sopts=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^[[:space:]]*-o[[:space:]]*//' -e 's/^[[:space:]]*//')
+        mount -t cifs "$SCRATCH_DEV" "$SCRATCH_MNT" -o "$sopts" >/dev/null 2>&1 || true
+    fi
+}
+
 # ============================================================
 # Phase 1: Mount normally (with dir handle caching)
 # ============================================================
@@ -86,10 +102,24 @@ fi
 
 _test_unmount > /dev/null 2>&1
 
+# Also unmount scratch to tear down the shared session completely.
+# Without this, the kernel reuses the old tcon and nohandlecache is ignored.
+_scratch_unmount_cmd
+sleep 2
+
 # ============================================================
 # Phase 2: Mount with nohandlecache
 # ============================================================
 _do "_test_mount -o nohandlecache" || _notrun "mount with nohandlecache failed"
+# Remount scratch so the framework can clean up normally
+_scratch_remount_cmd
+
+# Snapshot open_dirs baseline AFTER nohandlecache mount (stale entries may exist)
+nohandle_baseline=0
+if $have_open_dirs; then
+    nohandle_baseline=$(_open_dirs_count "cifs232")
+    echo "phase2 (nohandlecache): open_dirs baseline=$nohandle_baseline" >> $seqres.full
+fi
 
 # Trigger readdir multiple times
 for i in $(seq 1 10); do
@@ -99,8 +129,11 @@ sleep 1
 
 nohandle_dirs=0
 if $have_open_dirs; then
-    nohandle_dirs=$(_open_dirs_count "cifs232")
-    echo "phase2 (nohandlecache): open_dirs entries=$nohandle_dirs" >> $seqres.full
+    nohandle_dirs_raw=$(_open_dirs_count "cifs232")
+    # Subtract baseline to ignore stale entries from tcon reuse
+    nohandle_dirs=$((nohandle_dirs_raw - nohandle_baseline))
+    [ "$nohandle_dirs" -lt 0 ] && nohandle_dirs=0
+    echo "phase2 (nohandlecache): open_dirs entries=$nohandle_dirs_raw baseline=$nohandle_baseline delta=$nohandle_dirs" >> $seqres.full
 fi
 
 cr_nohandle=0

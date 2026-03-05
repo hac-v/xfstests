@@ -42,6 +42,11 @@ echo "cifs254: getfattr raw output: '$got'" >> "$seqres.full"
 
 # Some getfattr versions append a newline or the output may have trailing whitespace
 got_trimmed=$(echo "$got" | tr -d '\n\r')
+# Windows Server silently accepts setfattr but getfattr returns nothing —
+# no real user.* xattr support
+if [ -z "$got_trimmed" ]; then
+    _notrun "server accepts setxattr but getxattr returns empty — no real user.* xattr support"
+fi
 [ "$got_trimmed" = "value1" ] || _fail "getxattr: expected 'value1' got '$got_trimmed'"
 
 echo "cifs254: set/get user.test1 OK" >> "$seqres.full"

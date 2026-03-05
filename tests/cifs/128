@@ -34,14 +34,12 @@ SHARE=$(_share_from_unc "$TEST_DEV")
 [ -n "$HOST" ] && [ -n "$SHARE" ] || _notrun "could not derive host/share"
 
 _qdir_for_share() {
-    local host="$1" share="$2" tries=10 val
+    local share="$1" tries=10 val
     while [ $tries -gt 0 ]; do
-        val=$(awk -v H="$host" -v S="$share" '
+        val=$(awk -v SH="$share" '
             BEGIN { inb=0; qd="" }
             /^[[:space:]]*[0-9]+\) / {
-                if (match($0, /\\\\+([^\\]+)\\([^[:space:]]+)/, m)) {
-                    inb = (m[1]==H && m[2]==S) ? 1 : 0;
-                } else { inb = 0 }
+                inb = (index($0, SH) > 0) ? 1 : 0
                 next
             }
             inb==1 && $1=="QueryDirectories:" { qd=$2 }
@@ -67,11 +65,11 @@ mkdir -p "$W/sub" || _fail "mkdir failed"
 for i in $(seq 1 10); do echo x > "$W/sub/f$i" || _fail "seed file $i"; done
 
 # Baseline and first ls
-qd0=$(_qdir_for_share "$HOST" "$SHARE") || _notrun "could not read Stats for //$HOST/$SHARE"
+qd0=$(_qdir_for_share "$SHARE") || _notrun "could not read Stats for //$HOST/$SHARE"
 ls -1 "$W/sub" >/dev/null 2>&1 || _fail "ls #1 failed"
 tries=30
 while [ $tries -gt 0 ]; do
-    qd1=$(_qdir_for_share "$HOST" "$SHARE") || qd1=""
+    qd1=$(_qdir_for_share "$SHARE") || qd1=""
     [ -n "$qd1" ] && [ $((qd1-qd0)) -ge 1 ] && break
     tries=$((tries-1)); sleep 0.1
 done
@@ -81,7 +79,7 @@ done
 ls -1 "$W/sub" >/dev/null 2>&1 || _fail "ls #2 failed"
 tries=30
 while [ $tries -gt 0 ]; do
-    qd2=$(_qdir_for_share "$HOST" "$SHARE") || qd2=""
+    qd2=$(_qdir_for_share "$SHARE") || qd2=""
     [ -n "$qd2" ] && [ $((qd2-qd1)) -ge 1 ] && break
     tries=$((tries-1)); sleep 0.1
 done

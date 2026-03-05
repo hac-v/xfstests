@@ -1,0 +1,70 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: rmdir non-empty → ENOTEMPTY, double unlink → ENOENT
+#
+# Negative tests:
+# 1. rmdir on a directory containing files → ENOTEMPTY
+# 2. unlink a file, then unlink again → ENOENT
+# 3. mkdir on existing file path → EEXIST
+# 4. create file on existing directory path → EISDIR
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+W="$TEST_DIR/cifs296.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace"
+
+pass=0
+fail=0
+
+check_fail() {
+    local desc="$1" expected_err="$2"; shift 2
+    local err
+    err=$("$@" 2>&1)
+    rc=$?
+    if [ $rc -eq 0 ]; then
+        echo "FAIL: $desc — expected failure but got success" >> "$seqres.full"
+        fail=$((fail + 1))
+        return
+    fi
+    if echo "$err" | grep -qiE "$expected_err"; then
+        echo "PASS: $desc" >> "$seqres.full"
+        pass=$((pass + 1))
+    else
+        echo "FAIL: $desc — got: $err (expected pattern: $expected_err)" >> "$seqres.full"
+        fail=$((fail + 1))
+    fi
+}
+
+# --- Test 1: rmdir non-empty directory ---
+mkdir -p "$W/notempty" || _fail "mkdir notempty"
+echo data > "$W/notempty/file1" || _fail "create file in notempty"
+check_fail "rmdir non-empty" "not empty|ENOTEMPTY|Directory not empty" rmdir "$W/notempty"
+
+# --- Test 2: double unlink ---
+echo data > "$W/delme" || _fail "create delme"
+rm "$W/delme" || _fail "first unlink"
+check_fail "double unlink" "No such file|ENOENT|not found" rm "$W/delme"
+
+# --- Test 3: mkdir on existing file ---
+echo data > "$W/afile" || _fail "create afile"
+check_fail "mkdir on file" "exists|EEXIST|File exists|Not a directory" mkdir "$W/afile"
+
+# --- Test 4: create file on existing directory ---
+mkdir -p "$W/adir" || _fail "mkdir adir"
+check_fail "echo > dir" "Is a directory|EISDIR|directory" bash -c "echo data > '$W/adir'"
+
+echo "pass=$pass fail=$fail" >> "$seqres.full"
+[ $fail -eq 0 ] || _fail "$fail negative tests failed (see $seqres.full)"
+
+echo "rmdir/unlink/mkdir negative tests OK"
+
+status=0
+exit

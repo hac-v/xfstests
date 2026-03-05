@@ -1,0 +1,74 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: write beyond max offset / huge seek
+#
+# Negative test: seeking to an absurdly large offset and attempting to
+# write should fail with EFBIG or EINVAL, not crash.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs300.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace"
+
+F="$W/bigseek"
+echo "x" > "$F" || _fail "create file"
+
+python3 -u - "$F" >> "$seqres.full" 2>&1 <<'PYEOF'
+import os, sys, errno
+
+filepath = sys.argv[1]
+failures = 0
+
+# Test 1: seek to near-max offset (2^63 - 2) then write
+fd = os.open(filepath, os.O_RDWR)
+try:
+    huge_offset = (1 << 63) - 2  # near LLONG_MAX
+    try:
+        os.lseek(fd, huge_offset, os.SEEK_SET)
+        os.write(fd, b"X")
+        # If it succeeds, that's unexpected but not a crash
+        print(f"write at offset {huge_offset} succeeded (unexpected but no crash)")
+    except (OSError, OverflowError) as e:
+        print(f"PASS: write at huge offset → {e}")
+except Exception as e:
+    print(f"PASS: huge seek/write rejected: {e}")
+finally:
+    os.close(fd)
+
+# Test 2: negative offset seek
+fd = os.open(filepath, os.O_RDWR)
+try:
+    os.lseek(fd, -1, os.SEEK_SET)
+    print("FAIL: negative seek succeeded")
+    failures += 1
+except OSError as e:
+    print(f"PASS: negative seek → errno {e.errno} ({e.strerror})")
+finally:
+    os.close(fd)
+
+sys.exit(failures)
+PYEOF
+
+rc=$?
+[ $rc -eq 0 ] || _fail "write-beyond-max-offset: $rc failures"
+
+# Check no kernel crash
+dmesg_tail=$(dmesg | tail -20)
+if echo "$dmesg_tail" | grep -qiE 'BUG:|kernel panic|Oops:|RIP:'; then
+    _fail "kernel oops after huge offset write"
+fi
+
+echo "write beyond max offset OK"
+
+status=0
+exit

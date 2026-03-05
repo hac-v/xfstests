@@ -1,0 +1,96 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: I/O on invalid fd modes (read from O_WRONLY, write to O_RDONLY)
+#
+# Negative test: reading from a write-only fd → EBADF, writing to a
+# read-only fd → EBADF. Also: fallocate on a directory fd.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs299.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace"
+
+F="$W/testfile"
+echo "test_data" > "$F" || _fail "create testfile"
+
+python3 -u - "$F" "$W" >> "$seqres.full" 2>&1 <<'PYEOF'
+import os, sys, errno
+
+filepath = sys.argv[1]
+dirpath = sys.argv[2]
+failures = 0
+
+# Test 1: read from O_WRONLY → EBADF
+fd = os.open(filepath, os.O_WRONLY)
+try:
+    os.read(fd, 10)
+    print("FAIL: read from O_WRONLY succeeded")
+    failures += 1
+except OSError as e:
+    if e.errno == errno.EBADF:
+        print("PASS: read from O_WRONLY → EBADF")
+    else:
+        print(f"PASS: read from O_WRONLY → errno {e.errno} ({e.strerror})")
+finally:
+    os.close(fd)
+
+# Test 2: write to O_RDONLY → EBADF
+fd = os.open(filepath, os.O_RDONLY)
+try:
+    os.write(fd, b"fail")
+    print("FAIL: write to O_RDONLY succeeded")
+    failures += 1
+except OSError as e:
+    if e.errno == errno.EBADF:
+        print("PASS: write to O_RDONLY → EBADF")
+    else:
+        print(f"PASS: write to O_RDONLY → errno {e.errno} ({e.strerror})")
+finally:
+    os.close(fd)
+
+# Test 3: read zero bytes (should succeed with 0)
+fd = os.open(filepath, os.O_RDONLY)
+try:
+    data = os.read(fd, 0)
+    if len(data) == 0:
+        print("PASS: read(0) returned empty bytes")
+    else:
+        print(f"FAIL: read(0) returned {len(data)} bytes")
+        failures += 1
+except OSError as e:
+    print(f"FAIL: read(0) raised {e}")
+    failures += 1
+finally:
+    os.close(fd)
+
+# Test 4: fallocate on directory fd
+fd = os.open(dirpath, os.O_RDONLY | os.O_DIRECTORY)
+try:
+    os.posix_fallocate(fd, 0, 4096)
+    print("FAIL: fallocate on directory succeeded")
+    failures += 1
+except OSError as e:
+    print(f"PASS: fallocate on dir → errno {e.errno} ({e.strerror})")
+finally:
+    os.close(fd)
+
+sys.exit(failures)
+PYEOF
+
+rc=$?
+[ $rc -eq 0 ] || _fail "I/O negative tests: $rc failures"
+
+echo "I/O invalid fd negative tests OK"
+
+status=0
+exit

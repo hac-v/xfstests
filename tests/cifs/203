@@ -202,7 +202,7 @@ CREDS_ADDED=1
 
 log_msg "mounting //$HOST/$SHARE with cifscreds"
 log_msg "mount options: $mount_opts"
-if ! mount -t cifs "$TEST_DEV" "$MNT" -o "$mount_opts" >>"$seqres.full" 2>&1; then
+if ! setsid mount -t cifs "$TEST_DEV" "$MNT" -o "$mount_opts" >>"$seqres.full" 2>&1 </dev/null; then
     _notrun "multiuser mount failed"
 fi
 MOUNTED=1
@@ -221,7 +221,7 @@ CREDS_ADDED=0
 
 log_msg "mount without stored credential (expect failure)"
 log_msg "retry mount options: $mount_opts"
-if mount -t cifs "$TEST_DEV" "$MNT" -o "$mount_opts" >>"$seqres.full" 2>&1; then
+if setsid mount -t cifs "$TEST_DEV" "$MNT" -o "$mount_opts" >>"$seqres.full" 2>&1 </dev/null; then
     umount "$MNT" >/dev/null 2>&1 || true
     _fail "mount succeeded without stored credential"
 fi

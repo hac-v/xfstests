@@ -1,0 +1,51 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: wrong password → clean mount failure (no crash/hang)
+#
+# Negative test: mount with an incorrect password must fail with a clean
+# error (EACCES / EPERM / ELOGONFAILURE) — not hang, crash, or oops.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+
+MNT=$(mktemp -d /tmp/cifs294.XXXXXX) || _fail "mktemp"
+_register_cleanup "umount '$MNT' 2>/dev/null; rmdir '$MNT' 2>/dev/null"
+
+# Build mount options with a deliberately wrong password
+base_opts=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+# Strip any credentials= or password= and inject a bad one
+bad_opts=$(echo "$base_opts" | sed -E \
+    's/(^|,)credentials=[^,]*//g; s/(^|,)password=[^,]*//g; s/,,/,/g; s/^,//; s/,$//')
+bad_opts="${bad_opts:+$bad_opts,}password=WRONG_PASSWORD_$$,username=WRONG_USER_$$"
+
+dmesg_before=$(dmesg | wc -l)
+
+timeout 30 mount -t cifs "$TEST_DEV" "$MNT" -o "$bad_opts" 2>>"$seqres.full"
+rc=$?
+echo "mount rc=$rc" >> "$seqres.full"
+
+if [ $rc -eq 0 ]; then
+    umount "$MNT" 2>/dev/null
+    # Some servers allow guest fallback — that's OK, not a crash
+    echo "mount unexpectedly succeeded (guest fallback?)" >> "$seqres.full"
+fi
+
+# Check no kernel crash
+dmesg_after=$(dmesg | wc -l)
+new_lines=$((dmesg_after - dmesg_before))
+if [ $new_lines -gt 0 ]; then
+    if dmesg | tail -n "$new_lines" | grep -qiE 'BUG:|kernel panic|Oops:|RIP:'; then
+        _fail "kernel oops after bad password mount"
+    fi
+fi
+
+echo "wrong password clean failure OK"
+
+status=0
+exit

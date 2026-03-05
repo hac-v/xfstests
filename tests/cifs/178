@@ -44,12 +44,18 @@ FILE="$DIR/file"
 mkdir -p "$DIR" || _fail "mkdir"
 echo "payload" > "$FILE" || _fail "create file"
 
-# Detect support
+# Detect support — probe with set+get on primary mount first
 if ! setfattr -n user.cifs178 -v first "$FILE" >>$seqres.full 2>&1; then
     if setfattr -n user.cifs178 -v first "$FILE" 2>&1 | grep -Eqi 'Operation not supported|Not supported|EOPNOTSUPP'; then
         _notrun "user xattr unsupported on this backend/mount"
     fi
     _fail "initial setfattr failed"
+fi
+# Verify the xattr is actually readable (Windows Server silently accepts
+# setfattr but getfattr returns nothing — no real user.* xattr support)
+_probe_val=$(getfattr --only-values -n user.cifs178 "$FILE" 2>>$seqres.full || true)
+if [ "$_probe_val" != "first" ]; then
+    _notrun "server accepts setxattr but getxattr returns empty — no real user.* xattr support"
 fi
 
 val=$(getfattr --only-values -n user.cifs178 "$MNT2/cifs178.dir/file" 2>>$seqres.full || true)

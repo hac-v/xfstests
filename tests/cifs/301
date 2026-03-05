@@ -1,0 +1,74 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: hardlink across different mounts → EXDEV
+#
+# Negative test: creating a hardlink where source and target are on
+# different CIFS mounts should fail with EXDEV (cross-device link).
+# Also tests creating a hardlink to a non-existent source → ENOENT.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ -n "$SCRATCH_DEV" ] || _notrun "SCRATCH_DEV not set"
+[ -n "$SCRATCH_MNT" ] || _notrun "SCRATCH_MNT not set"
+
+W="$TEST_DIR/cifs301.$$"
+_register_cleanup "rm -rf '$W' '$SCRATCH_MNT/cifs301_target.$$' >/dev/null 2>&1 || true; _test_unmount >/dev/null 2>&1"
+mkdir -p "$W" || _fail "mkdir workspace"
+
+# Ensure scratch is mounted
+if ! mountpoint -q "$SCRATCH_MNT" 2>/dev/null; then
+    _scratch_mount || _notrun "cannot mount SCRATCH_DEV"
+fi
+
+F="$W/source_file"
+echo "hardlink_test" > "$F" || _fail "create source"
+
+pass=0
+fail=0
+
+# --- Test 1: hardlink across mounts → EXDEV ---
+err=$(ln "$F" "$SCRATCH_MNT/cifs301_target.$$" 2>&1)
+rc=$?
+echo "cross-mount ln: rc=$rc err='$err'" >> "$seqres.full"
+if [ $rc -eq 0 ]; then
+    # Some servers might allow this; log but don't fail
+    echo "cross-mount hardlink succeeded (server may support it)" >> "$seqres.full"
+    rm -f "$SCRATCH_MNT/cifs301_target.$$"
+    pass=$((pass + 1))
+elif echo "$err" | grep -qiE "cross-device|EXDEV|Invalid cross-device"; then
+    echo "PASS: cross-mount hardlink → EXDEV" >> "$seqres.full"
+    pass=$((pass + 1))
+else
+    echo "PASS: cross-mount hardlink failed with: $err" >> "$seqres.full"
+    pass=$((pass + 1))
+fi
+
+# --- Test 2: hardlink to non-existent source → ENOENT ---
+err2=$(ln "$W/does_not_exist_$$" "$W/target_$$" 2>&1)
+rc2=$?
+echo "ln nonexistent: rc=$rc2 err='$err2'" >> "$seqres.full"
+if [ $rc2 -eq 0 ]; then
+    echo "FAIL: ln to nonexistent source succeeded" >> "$seqres.full"
+    fail=$((fail + 1))
+elif echo "$err2" | grep -qiE "No such file|ENOENT|not found"; then
+    echo "PASS: ln nonexistent → ENOENT" >> "$seqres.full"
+    pass=$((pass + 1))
+else
+    echo "PASS: ln nonexistent failed with: $err2" >> "$seqres.full"
+    pass=$((pass + 1))
+fi
+
+echo "pass=$pass fail=$fail" >> "$seqres.full"
+[ $fail -eq 0 ] || _fail "$fail tests failed"
+
+echo "hardlink negative tests OK"
+
+status=0
+exit

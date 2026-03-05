@@ -30,14 +30,14 @@ _do "mount -t cifs '$TEST_DEV' '$M2' -o '$MO2'" || _fail "mount M2 failed"
 
 SUB="cifs138.$$.d"; mkdir -p "$M2/$SUB" || _fail "mkdir"
 F1="$M1/$SUB/f"; F2="$M2/$SUB/f"
-echo one > "$F2" || _fail "seed write"
+echo -n "one" > "$F2" || _fail "seed write"
 
 # First read should see 'one'
 read1=$(cat "$F1") || _fail "read1 failed"
 [ "$read1" = "one" ] || _fail "unexpected read1: '$read1'"
 
 # Update from M2 and read immediately from M1; cache=none should see new data
-echo -n two >> "$F2" || _fail "append"
+echo -n "two" >> "$F2" || _fail "append"
 
 tries=5
 ok=0

@@ -1,0 +1,93 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: negative lookup — stat/open on non-existent paths
+#
+# Behavior under test (connectathon special test equivalent)
+# - stat() on a non-existent file returns ENOENT.
+# - open(O_RDONLY) on a non-existent file returns ENOENT.
+# - readlink() on a non-existent symlink returns ENOENT.
+# - stat() on a file inside a non-existent directory returns ENOENT.
+# - unlink() on a non-existent file returns ENOENT.
+# - rmdir() on a non-existent directory returns ENOENT.
+# - Verifies the kernel SMB2 error mapping for STATUS_OBJECT_NAME_NOT_FOUND.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+W="$TEST_DIR/cifs291.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+pass=0
+fail=0
+
+# Helper: expect a command to fail with a specific errno string
+expect_enoent() {
+    local desc="$1"; shift
+    local err
+    err=$("$@" 2>&1)
+    rc=$?
+    if [ $rc -eq 0 ]; then
+        echo "FAIL: $desc — expected failure but got success" >> $seqres.full
+        fail=$((fail + 1))
+        return
+    fi
+    # Check the error is ENOENT (various possible messages)
+    if echo "$err" | grep -qiE "no such file|ENOENT|not found"; then
+        echo "PASS: $desc — got ENOENT" >> $seqres.full
+        pass=$((pass + 1))
+    else
+        echo "FAIL: $desc — got rc=$rc but unexpected error: $err" >> $seqres.full
+        fail=$((fail + 1))
+    fi
+}
+
+NOFILE="$W/this_file_does_not_exist_$$"
+NODIR="$W/this_dir_does_not_exist_$$"
+
+# --- Test 1: stat non-existent file ---
+expect_enoent "stat non-existent file" stat "$NOFILE"
+
+# --- Test 2: open non-existent file for read ---
+expect_enoent "open non-existent file" cat "$NOFILE"
+
+# --- Test 3: readlink non-existent symlink ---
+expect_enoent "readlink non-existent" readlink "$NOFILE"
+
+# --- Test 4: stat file inside non-existent directory ---
+expect_enoent "stat in non-existent dir" stat "$NODIR/somefile"
+
+# --- Test 5: unlink non-existent file ---
+expect_enoent "unlink non-existent" rm "$NOFILE"
+
+# --- Test 6: rmdir non-existent directory ---
+expect_enoent "rmdir non-existent" rmdir "$NODIR"
+
+# --- Test 7: rename from non-existent source ---
+expect_enoent "rename non-existent src" mv "$NOFILE" "$W/target"
+
+# --- Test 8: verify a real file succeeds (sanity) ---
+REALFILE="$W/realfile"
+echo "hello" > "$REALFILE" || _fail "create real file"
+if stat "$REALFILE" >/dev/null 2>&1; then
+    echo "PASS: stat real file succeeds" >> $seqres.full
+    pass=$((pass + 1))
+else
+    echo "FAIL: stat real file failed" >> $seqres.full
+    fail=$((fail + 1))
+fi
+
+echo "pass=$pass fail=$fail" >> $seqres.full
+
+[ $fail -eq 0 ] || _fail "negative lookup: $fail tests failed (see $seqres.full)"
+
+echo "negative lookup OK"
+
+status=0
+exit

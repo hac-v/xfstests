@@ -1,0 +1,106 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: fcntl F_SETLKW blocking lock (connectathon lock test equivalent)
+#
+# Behavior under test
+# - Process A takes an exclusive byte-range lock via fcntl(F_SETLK).
+# - Process B requests the same lock via fcntl(F_SETLKW) — should block.
+# - After a delay, Process A releases the lock.
+# - Process B should then acquire the lock and proceed.
+# - Validates the CIFS client's blocking lock (F_SETLKW) implementation.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs292.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+F="$W/lockfile"
+echo "lock_test_data" > "$F" || _fail "create file failed"
+
+# --- Test: F_SETLKW blocks then acquires after release ---
+# Process A: hold lock for 3 seconds then release
+# Process B: F_SETLKW should block until A releases, then succeed
+# Timeout: if B doesn't get lock within 10s, fail
+
+python3 -u - "$F" >> "$seqres.full" 2>&1 <<'PYEOF'
+import fcntl, struct, os, sys, time, signal
+
+filepath = sys.argv[1]
+LOCK_FMT = 'hhqqi'  # struct flock: l_type, l_whence, l_start, l_len, l_pid
+
+def make_flock(l_type, l_whence=0, l_start=0, l_len=0):
+    return struct.pack(LOCK_FMT, l_type, l_whence, l_start, l_len, 0)
+
+F_WRLCK = 1
+F_UNLCK = 2
+F_RDLCK = 0
+
+fd_a = os.open(filepath, os.O_RDWR)
+
+# Process A: take exclusive lock
+try:
+    fcntl.fcntl(fd_a, fcntl.F_SETLK, make_flock(F_WRLCK))
+    print("A: exclusive lock acquired", flush=True)
+except OSError as e:
+    print(f"A: F_SETLK failed: {e}", flush=True)
+    sys.exit(1)
+
+pid = os.fork()
+if pid == 0:
+    # Child = Process B
+    fd_b = os.open(filepath, os.O_RDWR)
+
+    # Set alarm so we don't hang forever
+    signal.alarm(10)
+
+    t0 = time.monotonic()
+    try:
+        # This should BLOCK until A releases
+        fcntl.fcntl(fd_b, fcntl.F_SETLKW, make_flock(F_WRLCK))
+        elapsed = time.monotonic() - t0
+        print(f"B: lock acquired after {elapsed:.1f}s", flush=True)
+
+        if elapsed < 1.0:
+            print("B: FAIL — lock acquired too quickly (should have blocked)", flush=True)
+            os._exit(1)
+
+        # Release
+        fcntl.fcntl(fd_b, fcntl.F_SETLK, make_flock(F_UNLCK))
+        os.close(fd_b)
+        print("B: PASS", flush=True)
+        os._exit(0)
+    except OSError as e:
+        print(f"B: F_SETLKW failed: {e}", flush=True)
+        os._exit(1)
+else:
+    # Parent = Process A: hold lock for 2 seconds then release
+    time.sleep(2)
+    fcntl.fcntl(fd_a, fcntl.F_SETLK, make_flock(F_UNLCK))
+    print("A: lock released", flush=True)
+    os.close(fd_a)
+
+    _, status = os.waitpid(pid, 0)
+    rc = os.waitstatus_to_exitcode(status)
+    if rc != 0:
+        print(f"FAIL: child exited with {rc}", flush=True)
+        sys.exit(1)
+    print("PASS: blocking lock test OK", flush=True)
+PYEOF
+
+rc=$?
+[ $rc -eq 0 ] || _fail "F_SETLKW blocking lock test failed (rc=$rc)"
+
+echo "F_SETLKW blocking lock OK"
+
+status=0
+exit

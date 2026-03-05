@@ -2,7 +2,7 @@
 
 This document describes the CIFS/SMB client test suite for xfstests.
 
-**Total: 189 tests (cifs/001–289)** covering:
+**Total: 200 tests (cifs/001–301)** covering:
 - POSIX I/O semantics, permissions, ACLs, xattr, locking
 - 45+ mount options, module parameters, remount transitions
 - Reconnect/resilience, lease/oplock handling, credit management
@@ -13,6 +13,7 @@ This document describes the CIFS/SMB client test suite for xfstests.
 - Unicode/i18n, large files, concurrent stress, rsize/wsize sweep
 - NTFS alternate data streams, quota, key dump
 - Kernel module parameter validation (enable_oplocks, disable_legacy_dialects, drop_dir_cache)
+- Negative/error-path tests (bad credentials, invalid options, ELOOP, EXDEV, EBADF)
 
 ## How to run CIFS tests
 
@@ -23,7 +24,7 @@ This document describes the CIFS/SMB client test suite for xfstests.
   sudo ./check cifs/100
 
   # Range of tests
-  sudo ./check cifs/{208..289}
+  sudo ./check cifs/{208..301}
 
   # All CIFS tests
   sudo ./check $(ls tests/cifs/ | grep -E '^[0-9]+$' | sort -n | sed 's/^/cifs\//')
@@ -348,3 +349,17 @@ Pass/fail interpretation must be **capability-based**:
 - **287**: `enable_oplocks` toggle — disable oplocks, verify increased server Reads, data integrity, restore.
 - **288**: `disable_legacy_dialects` — block vers=1.0, allow SMB2+, toggle and verify.
 - **289**: `drop_dir_cache` — force cached dir invalidation, open_dirs verification, rapid drops, new file visibility.
+
+### cifs/290-301 (negative tests, connectathon equivalents, error paths)
+- **290**: Kerberos `sec=krb5` negative path — mount without valid ticket fails cleanly, no crash/hang.
+- **291**: Negative lookup — `stat`/`open`/`readlink`/`unlink`/`rmdir`/`rename` on non-existent paths return ENOENT.
+- **292**: `fcntl F_SETLKW` blocking lock — exclusive lock blocks waiter, waiter proceeds after release.
+- **293**: Lock release on close — closing fd releases all held POSIX locks (even with other fds open).
+- **294**: Wrong password → clean mount failure (EACCES/EPERM), no crash or hang.
+- **295**: Non-existent share → clean mount failure (BAD_NETWORK_NAME), no crash or hang.
+- **296**: `rmdir` non-empty → ENOTEMPTY, double `unlink` → ENOENT, double `mkdir` → EEXIST.
+- **297**: Symlink loop (`a→b→a`) → ELOOP on stat, no hang or crash.
+- **298**: Invalid `vers=` mount option → clean rejection, no kernel oops.
+- **299**: I/O on invalid fd modes — read from O_WRONLY → EBADF, write to O_RDONLY → EBADF.
+- **300**: Write beyond max offset ($2^{63}-2$) → EFBIG/EINVAL, no crash; negative lseek → EINVAL.
+- **301**: Hardlink across different mounts → EXDEV; hardlink to non-existent source → ENOENT.

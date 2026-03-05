@@ -1,0 +1,51 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: non-existent share → clean mount failure
+#
+# Negative test: mounting a share that doesn't exist on the server must fail
+# cleanly (ENOENT / EACCES / BAD_NETWORK_NAME) — no crash or hang.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+
+# Derive server from TEST_DEV and construct a bogus share
+host=$(echo "$TEST_DEV" | sed -E 's#^//([^/]+)/.*#\1#')
+[ -n "$host" ] || _notrun "cannot parse host"
+BOGUS_DEV="//$host/NONEXISTENT_SHARE_$$_BOGUS"
+
+MNT=$(mktemp -d /tmp/cifs295.XXXXXX) || _fail "mktemp"
+_register_cleanup "umount '$MNT' 2>/dev/null; rmdir '$MNT' 2>/dev/null"
+
+base_opts=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+
+dmesg_before=$(dmesg | wc -l)
+
+timeout 30 mount -t cifs "$BOGUS_DEV" "$MNT" -o "$base_opts" 2>>"$seqres.full"
+rc=$?
+echo "mount bogus share rc=$rc" >> "$seqres.full"
+
+# Must fail
+if [ $rc -eq 0 ]; then
+    umount "$MNT" 2>/dev/null
+    _fail "mount to non-existent share unexpectedly succeeded"
+fi
+
+# Check no kernel crash
+dmesg_after=$(dmesg | wc -l)
+new_lines=$((dmesg_after - dmesg_before))
+if [ $new_lines -gt 0 ]; then
+    if dmesg | tail -n "$new_lines" | grep -qiE 'BUG:|kernel panic|Oops:|RIP:'; then
+        _fail "kernel oops after bogus share mount"
+    fi
+fi
+
+echo "non-existent share clean failure OK"
+
+status=0
+exit

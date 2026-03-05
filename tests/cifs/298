@@ -1,0 +1,60 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: invalid vers= mount option → clean rejection
+#
+# Negative test: mount with an invalid SMB protocol version string must
+# be rejected cleanly, not crash or produce a kernel oops.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+
+MNT=$(mktemp -d /tmp/cifs298.XXXXXX) || _fail "mktemp"
+_register_cleanup "umount '$MNT' 2>/dev/null; rmdir '$MNT' 2>/dev/null"
+
+base_opts=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^\s*-o\s*//')
+# Strip any existing vers= to avoid conflict
+clean_opts=$(echo "$base_opts" | sed -E 's/(^|,)vers=[^,]*//g; s/,,/,/g; s/^,//; s/,$//')
+
+dmesg_before=$(dmesg | wc -l)
+
+pass=0
+fail=0
+
+for bad_vers in "99.99" "0.0" "abc" "4.0" "-1"; do
+    opts="${clean_opts:+$clean_opts,}vers=$bad_vers"
+    timeout 15 mount -t cifs "$TEST_DEV" "$MNT" -o "$opts" 2>>"$seqres.full"
+    rc=$?
+    echo "vers=$bad_vers rc=$rc" >> "$seqres.full"
+
+    if [ $rc -eq 0 ]; then
+        umount "$MNT" 2>/dev/null
+        echo "FAIL: vers=$bad_vers accepted" >> "$seqres.full"
+        fail=$((fail + 1))
+    else
+        echo "PASS: vers=$bad_vers rejected" >> "$seqres.full"
+        pass=$((pass + 1))
+    fi
+done
+
+# Check no kernel crash
+dmesg_after=$(dmesg | wc -l)
+new_lines=$((dmesg_after - dmesg_before))
+if [ $new_lines -gt 0 ]; then
+    if dmesg | tail -n "$new_lines" | grep -qiE 'BUG:|kernel panic|Oops:|RIP:'; then
+        _fail "kernel oops after invalid vers= mount"
+    fi
+fi
+
+echo "pass=$pass fail=$fail" >> "$seqres.full"
+[ $fail -eq 0 ] || _fail "$fail invalid vers= values were accepted"
+
+echo "invalid vers= clean rejection OK"
+
+status=0
+exit

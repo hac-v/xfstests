@@ -45,17 +45,12 @@ if [ -r /sys/module/cifs/parameters/dir_cache_timeout ]; then
 fi
 
 _qdir_for_share() {
-    local host="$1" share="$2" tries=10 val
+    local share="$1" tries=10 val
     while [ $tries -gt 0 ]; do
-        val=$(awk -v H="$host" -v S="$share" '
+        val=$(awk -v SH="$share" '
             BEGIN { inb=0; qd="" }
             /^[[:space:]]*[0-9]+\) / {
-                # Parse header line like: "1) \\host\share"
-                if (match($0, /\\\\+([^\\]+)\\([^[:space:]]+)/, m)) {
-                    inb = (m[1]==H && m[2]==S) ? 1 : 0;
-                } else {
-                    inb = 0;
-                }
+                inb = (index($0, SH) > 0) ? 1 : 0
                 next
             }
             inb==1 && $1=="QueryDirectories:" { qd=$2 }
@@ -74,14 +69,14 @@ mkdir -p "$W/sub" || _fail "mkdir failed"
 for i in $(seq 1 20); do echo x > "$W/sub/f$i" || _fail "seed file $i"; done
 
 # Snapshot baseline QueryDirectories
-qd0=$(_qdir_for_share "$HOST" "$SHARE") || _notrun "could not read Stats for //$HOST/$SHARE"
+qd0=$(_qdir_for_share "$SHARE") || _notrun "could not read Stats for //$HOST/$SHARE"
 echo "cifs127: QD baseline=$qd0" >> "$seqres.full"
 
 # First ls should increment
 ls -1 "$W/sub" >/dev/null 2>&1 || _fail "ls initial failed"
 tries=50
 while [ $tries -gt 0 ]; do
-    qd1=$(_qdir_for_share "$HOST" "$SHARE") || qd1=""
+    qd1=$(_qdir_for_share "$SHARE") || qd1=""
     if [ -n "$qd1" ] && [ $((qd1-qd0)) -ge 1 ]; then break; fi
     tries=$((tries-1)); sleep 0.2
 done
@@ -92,7 +87,7 @@ echo "cifs127: QD after first ls=$qd1 delta=$((qd1-qd0))" >> "$seqres.full"
 start_ts=$(date +%s)
 
 # Do not access the directory within TTL to avoid refreshing the cache window
-qd2=$(_qdir_for_share "$HOST" "$SHARE") || _fail "read Stats after initial increment failed"
+qd2=$(_qdir_for_share "$SHARE") || _fail "read Stats after initial increment failed"
 echo "cifs127: QD before post-ttl access=$qd2" >> "$seqres.full"
 
 # After ~TTL from first ls, expect a refresh on next access
@@ -107,7 +102,7 @@ inc=0
 while [ $attempt -le 3 ] && [ $inc -eq 0 ]; do
     tries=15
     while [ $tries -gt 0 ]; do
-        qd3=$(_qdir_for_share "$HOST" "$SHARE") || qd3=""
+        qd3=$(_qdir_for_share "$SHARE") || qd3=""
         if [ -n "$qd3" ] && [ $((qd3-qd2)) -ge 1 ]; then inc=1; break; fi
         tries=$((tries-1)); sleep 0.2
     done

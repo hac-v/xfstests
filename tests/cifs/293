@@ -1,0 +1,155 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: lock release on close — closing fd releases all held locks
+#
+# Behavior under test (connectathon lock test equivalent)
+# - POSIX semantics: closing a file descriptor releases ALL locks held by the
+#   process on that file, even if other fds to the same file remain open.
+# - Process A opens file twice (fd1, fd2), locks via fd1, closes fd1.
+# - Process B should then be able to acquire the same lock.
+# - Also tests: lock via fd1, close fd2 (different fd) — lock should remain
+#   because POSIX says "all locks for the file are released when ANY fd is
+#   closed" — but only for the same (inode, pid) pair.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+command -v python3 >/dev/null 2>&1 || _notrun "requires python3"
+
+W="$TEST_DIR/cifs293.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace failed"
+
+F="$W/lockclose"
+echo "lock_close_test" > "$F" || _fail "create file failed"
+
+# --- Test 1: close fd releases lock, other process can acquire ---
+python3 -u - "$F" "test1" >> "$seqres.full" 2>&1 <<'PYEOF'
+import fcntl, struct, os, sys, time, signal
+
+filepath = sys.argv[1]
+testname = sys.argv[2]
+LOCK_FMT = 'hhqqi'
+F_WRLCK = 1
+F_UNLCK = 2
+
+def make_flock(l_type):
+    return struct.pack(LOCK_FMT, l_type, 0, 0, 0, 0)
+
+def try_lock(fd):
+    """Try non-blocking exclusive lock. Returns True if acquired."""
+    try:
+        fcntl.fcntl(fd, fcntl.F_SETLK, make_flock(F_WRLCK))
+        return True
+    except OSError:
+        return False
+
+# Process A: open, lock, close — then verify process B can lock
+fd1 = os.open(filepath, os.O_RDWR)
+if not try_lock(fd1):
+    print(f"{testname}: A: initial lock failed", flush=True)
+    sys.exit(1)
+print(f"{testname}: A: lock acquired on fd1", flush=True)
+
+# Close fd1 — this should release the lock per POSIX
+os.close(fd1)
+print(f"{testname}: A: fd1 closed (lock should be released)", flush=True)
+
+# Fork child to try acquiring the lock
+pid = os.fork()
+if pid == 0:
+    signal.alarm(5)
+    fd_b = os.open(filepath, os.O_RDWR)
+    if try_lock(fd_b):
+        print(f"{testname}: B: PASS — lock acquired after A closed fd", flush=True)
+        fcntl.fcntl(fd_b, fcntl.F_SETLK, make_flock(F_UNLCK))
+        os.close(fd_b)
+        os._exit(0)
+    else:
+        print(f"{testname}: B: FAIL — could not acquire lock after A closed fd", flush=True)
+        os.close(fd_b)
+        os._exit(1)
+else:
+    _, status = os.waitpid(pid, 0)
+    rc = os.waitstatus_to_exitcode(status)
+    if rc != 0:
+        sys.exit(1)
+PYEOF
+rc1=$?
+echo "test1 rc=$rc1" >> "$seqres.full"
+
+# --- Test 2: closing ANY fd for the file releases ALL locks (POSIX rule) ---
+python3 -u - "$F" "test2" >> "$seqres.full" 2>&1 <<'PYEOF'
+import fcntl, struct, os, sys, time, signal
+
+filepath = sys.argv[1]
+testname = sys.argv[2]
+LOCK_FMT = 'hhqqi'
+F_WRLCK = 1
+F_UNLCK = 2
+
+def make_flock(l_type):
+    return struct.pack(LOCK_FMT, l_type, 0, 0, 0, 0)
+
+def try_lock(fd):
+    try:
+        fcntl.fcntl(fd, fcntl.F_SETLK, make_flock(F_WRLCK))
+        return True
+    except OSError:
+        return False
+
+# Open twice, lock via fd1, close fd2 — POSIX says closing ANY fd
+# for the same file releases ALL locks held by this process.
+fd1 = os.open(filepath, os.O_RDWR)
+fd2 = os.open(filepath, os.O_RDWR)
+
+if not try_lock(fd1):
+    print(f"{testname}: lock via fd1 failed", flush=True)
+    sys.exit(1)
+print(f"{testname}: lock acquired via fd1", flush=True)
+
+# Close fd2 (not the fd we locked with)
+os.close(fd2)
+print(f"{testname}: fd2 closed", flush=True)
+
+# Per POSIX, the lock should now be released
+# Fork child to test
+pid = os.fork()
+if pid == 0:
+    signal.alarm(5)
+    fd_b = os.open(filepath, os.O_RDWR)
+    if try_lock(fd_b):
+        print(f"{testname}: B: PASS — lock released when other fd closed", flush=True)
+        fcntl.fcntl(fd_b, fcntl.F_SETLK, make_flock(F_UNLCK))
+        os.close(fd_b)
+        os._exit(0)
+    else:
+        # This is also acceptable — CIFS may not fully implement POSIX
+        # "close any fd releases all locks" semantics because each fd may
+        # map to a separate SMB handle with independent lock state.
+        print(f"{testname}: B: lock NOT released (CIFS may keep per-handle locks)", flush=True)
+        os.close(fd_b)
+        os._exit(0)  # Don't fail — log as info
+else:
+    _, status = os.waitpid(pid, 0)
+    rc = os.waitstatus_to_exitcode(status)
+    os.close(fd1)
+    if rc != 0:
+        sys.exit(1)
+PYEOF
+rc2=$?
+echo "test2 rc=$rc2" >> "$seqres.full"
+
+[ $rc1 -eq 0 ] || _fail "test1 (close-fd-releases-lock) failed"
+# test2 is informational — CIFS may deviate from strict POSIX here
+
+echo "lock release on close OK"
+
+status=0
+exit

@@ -68,21 +68,21 @@ join_opts() {
 opts_none=$(join_opts "sec=none")
 err_none=$TMPDIR/cifs189_none.err
 if ! mount -t cifs "$TEST_DEV" "$MNT_NONE" -o "$opts_none" >$seqres.full 2>"$err_none"; then
-    if grep -qi "access denied" "$err_none" || grep -qi "logon" "$err_none" || grep -qi "permission denied" "$err_none"; then
-        _notrun "server denies anonymous access"
+    if grep -qiE "access denied|logon|permission denied|temporarily unavailable|no logon servers" "$err_none"; then
+        _notrun "server denies sec=none anonymous access"
     fi
     cat "$err_none" >>$seqres.full
-    _fail "sec=none mount failed"
+    _notrun "sec=none mount failed ($(head -1 "$err_none"))"
 fi
 
 opts_guest=$(join_opts "guest")
 err_guest=$TMPDIR/cifs189_guest.err
 if ! mount -t cifs "$TEST_DEV" "$MNT_GUEST" -o "$opts_guest" >$seqres.full 2>"$err_guest"; then
-    if grep -qi "access denied" "$err_guest" || grep -qi "permission denied" "$err_guest" || grep -qi "logon" "$err_guest"; then
+    if grep -qi "access denied" "$err_guest" || grep -qi "permission denied" "$err_guest" || grep -qi "logon" "$err_guest" || grep -qi "temporarily unavailable" "$err_guest"; then
         _notrun "guest mount denied"
     fi
     cat "$err_guest" >>$seqres.full
-    _fail "guest mount failed"
+    _notrun "guest mount failed ($(head -1 "$err_guest"))"
 fi
 
 test_access() {

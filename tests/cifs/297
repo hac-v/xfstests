@@ -1,0 +1,54 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: symlink loop → ELOOP
+#
+# Negative test: creating a symlink loop (a→b→a) then stat'ing either
+# should return ELOOP (errno 40), not hang or crash.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+W="$TEST_DIR/cifs297.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1 || true"
+mkdir -p "$W" || _fail "mkdir workspace"
+
+# Create symlink loop: a → b, b → a
+ln -s "$W/link_b" "$W/link_a" 2>>"$seqres.full" || _notrun "symlink creation failed"
+ln -s "$W/link_a" "$W/link_b" 2>>"$seqres.full" || _notrun "symlink creation failed"
+
+# Stat through the loop should fail with ELOOP
+err=$(stat "$W/link_a" 2>&1)
+rc=$?
+echo "stat link_a: rc=$rc err='$err'" >> "$seqres.full"
+
+if [ $rc -eq 0 ]; then
+    _fail "stat on symlink loop unexpectedly succeeded"
+fi
+
+if echo "$err" | grep -qiE "too many.*symbolic|ELOOP|loop"; then
+    echo "symlink loop ELOOP correctly returned" >> "$seqres.full"
+else
+    # Some CIFS implementations return ENOENT instead of ELOOP
+    if echo "$err" | grep -qiE "No such file|ENOENT"; then
+        echo "symlink loop returned ENOENT (acceptable on CIFS)" >> "$seqres.full"
+    else
+        _fail "symlink loop: unexpected error: $err"
+    fi
+fi
+
+# Also test cat through the loop
+err2=$(cat "$W/link_a" 2>&1)
+rc2=$?
+echo "cat link_a: rc=$rc2 err='$err2'" >> "$seqres.full"
+[ $rc2 -ne 0 ] || _fail "cat through symlink loop succeeded"
+
+echo "symlink loop negative test OK"
+
+status=0
+exit
