@@ -2,7 +2,7 @@
 
 This document describes the CIFS/SMB client test suite for xfstests.
 
-**Total: 211 tests (cifs/001–310)** covering:
+**Total: 211 tests (cifs/001–312)** covering:
 - POSIX I/O semantics, permissions, ACLs, xattr, locking
 - 45+ mount options, module parameters, remount transitions
 - Reconnect/resilience, lease/oplock handling, credit management
@@ -376,5 +376,6 @@ Pass/fail interpretation must be **capability-based**:
 - **306**: Reconnect with 100 open files — open 100 files, iptables DROP 5s, restore, verify all data via persistent handles.
 - **307**: 500-file lease break flood — 2 nosharesock mounts, open 500 files on mount A, touch all from mount B, verify integrity.
 - **308**: readdir + drop_dir_cache race — concurrent `ls -R` loop + `drop_dir_cache` writes, verify no crash or corruption.
-- **309**: Writeback + truncate race — 8 writer threads + 1 truncator thread, verify no data corruption after concurrent operations.
 - **310**: Multi-mount consistency — 10 nosharesock mounts × 10 parallel processes: shared file writes at unique offsets, shared directory creates, cross-mount read verification, lease break confirmation, handle leak check.
+- **311**: Deferred close overflow — 3 rounds × 5000 rapid open/close with closetimeo=30, verify no resource exhaustion, data integrity, handle leaks, dmesg warnings.
+- **312**: Rapid mount/unmount stress — 100 parallel processes each mount/write/unmount + 50 sequential cycles, session/tcon leak detection, handle leak check.

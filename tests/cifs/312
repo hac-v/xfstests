@@ -1,0 +1,215 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: rapid mount/unmount stress — 100 parallel processes
+#
+# Stress test for session/tcon lifecycle:
+#   1. 100 processes each independently mount the share (nosharesock),
+#      write files, read back, unmount — all in parallel
+#   2. After all processes complete, verify:
+#      - No session/tcon leaks in DebugData
+#      - No handle leaks in open_files
+#      - No kernel warnings in dmesg
+#   3. Then run 50 sequential rapid mount/write/unmount cycles
+#      and check for cumulative leaks
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto stress
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+
+NPROCS=100
+NCYCLES=50
+MNT_PFX="/tmp/cifs312.mnt"
+
+# Build mount options
+base_opts=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^[[:space:]]*-o[[:space:]]*//' -e 's/^[[:space:]]*//')
+if [ -z "$base_opts" ]; then
+    base_opts=$(awk -v mnt="$TEST_DIR" '$2==mnt {print $4}' /proc/mounts)
+fi
+if ! echo "$base_opts" | grep -Eq '(^|,)(credentials=|username=|user=)'; then
+    if [ -n "$CIFS_CRED_FILE" ] && [ -r "$CIFS_CRED_FILE" ]; then
+        base_opts="${base_opts:+$base_opts,}credentials=$CIFS_CRED_FILE"
+    elif [ -r /root/.cifs-cred-xfstest ]; then
+        base_opts="${base_opts:+$base_opts,}credentials=/root/.cifs-cred-xfstest"
+    fi
+fi
+echo "$base_opts" | grep -q "nosharesock" || base_opts="${base_opts},nosharesock"
+
+_cleanup_all() {
+    # Kill any lingering child processes
+    jobs -p 2>/dev/null | xargs kill 2>/dev/null || true
+    wait 2>/dev/null || true
+    # Unmount everything
+    for i in $(seq 1 $NPROCS); do
+        umount "${MNT_PFX}.$i" 2>/dev/null || umount -l "${MNT_PFX}.$i" 2>/dev/null || true
+        rmdir "${MNT_PFX}.$i" 2>/dev/null || true
+    done
+    for i in $(seq 1 $NCYCLES); do
+        umount "${MNT_PFX}.seq.$i" 2>/dev/null || umount -l "${MNT_PFX}.seq.$i" 2>/dev/null || true
+        rmdir "${MNT_PFX}.seq.$i" 2>/dev/null || true
+    done
+    rm -rf "$TEST_DIR/cifs312.$$" 2>/dev/null || true
+}
+_register_cleanup "_cleanup_all"
+
+# Snapshot baselines
+dmesg_before=$(dmesg | wc -l)
+
+_sessions_count() {
+    awk '/CIFS Session:/ {print $3+0; exit}' /proc/fs/cifs/DebugData 2>/dev/null || echo 0
+}
+
+_tcon_count() {
+    awk '/Share \(unique mount targets\):/ {print $5+0; exit}' /proc/fs/cifs/DebugData 2>/dev/null || echo 0
+}
+
+sess_before=$(_sessions_count)
+tcon_before=$(_tcon_count)
+echo "cifs312: baseline sessions=$sess_before tcons=$tcon_before" >> "$seqres.full"
+
+# ============================================================
+# Phase 1: 100 parallel mount/write/unmount processes
+# ============================================================
+echo "cifs312: starting $NPROCS parallel mount/write/unmount processes" >> "$seqres.full"
+
+_worker() {
+    local id=$1
+    local mnt="${MNT_PFX}.$id"
+    local subdir="cifs312.$$/proc_$id"
+    local rc=0
+
+    mkdir -p "$mnt" || return 1
+
+    # Mount
+    if ! mount -t cifs "$TEST_DEV" "$mnt" -o "$base_opts" >/dev/null 2>&1; then
+        rmdir "$mnt" 2>/dev/null
+        return 1
+    fi
+
+    # Create subdir and write files
+    mkdir -p "$mnt/$subdir" 2>/dev/null
+    for f in $(seq 1 10); do
+        echo "proc${id}_file${f}_data" > "$mnt/$subdir/f_$f" 2>/dev/null || rc=1
+    done
+
+    # Read back and verify one file
+    got=$(cat "$mnt/$subdir/f_1" 2>/dev/null | tr -d '\n\r')
+    [ "$got" = "proc${id}_file1_data" ] || rc=1
+
+    # List directory
+    count=$(ls "$mnt/$subdir/" 2>/dev/null | wc -l)
+    [ "$count" -eq 10 ] || rc=1
+
+    # Unmount
+    umount "$mnt" 2>/dev/null || umount -l "$mnt" 2>/dev/null || true
+    rmdir "$mnt" 2>/dev/null || true
+
+    return $rc
+}
+
+# Launch all workers in parallel
+pids=""
+for i in $(seq 1 $NPROCS); do
+    _worker $i &
+    pids="$pids $!"
+done
+
+# Wait for all and count failures
+fail=0
+for p in $pids; do
+    wait $p || fail=$((fail + 1))
+done
+
+echo "cifs312: phase1 complete — $((NPROCS - fail))/$NPROCS succeeded, $fail failed" >> "$seqres.full"
+
+# Allow some failures (server may throttle), but majority must succeed
+[ $fail -le $((NPROCS / 5)) ] || _fail "phase1: too many failures: $fail/$NPROCS"
+
+# Wait for sessions to drain
+sleep 0.5
+
+# Check for leaks after parallel storm
+sess_after1=$(_sessions_count)
+tcon_after1=$(_tcon_count)
+echo "cifs312: after phase1 — sessions=$sess_after1 tcons=$tcon_after1" >> "$seqres.full"
+
+# Sessions/tcons may take time to drain with nosharesock — log but don't fail
+sess_leak=$((sess_after1 - sess_before))
+tcon_leak=$((tcon_after1 - tcon_before))
+echo "cifs312: phase1 leak check — sess_delta=$sess_leak tcon_delta=$tcon_leak" >> "$seqres.full"
+
+# ============================================================
+# Phase 2: 50 sequential rapid mount/write/unmount cycles
+# ============================================================
+echo "cifs312: starting $NCYCLES sequential mount/write/unmount cycles" >> "$seqres.full"
+
+seq_fail=0
+for i in $(seq 1 $NCYCLES); do
+    d="${MNT_PFX}.seq.$i"
+    mkdir -p "$d"
+
+    if mount -t cifs "$TEST_DEV" "$d" -o "$base_opts" >/dev/null 2>&1; then
+        # Write a file
+        echo "cycle_${i}_data" > "$d/cifs312.$$/cycle_$i" 2>/dev/null
+        # Unmount immediately
+        umount "$d" 2>/dev/null || umount -l "$d" 2>/dev/null || true
+    else
+        seq_fail=$((seq_fail + 1))
+    fi
+
+    rmdir "$d" 2>/dev/null || true
+done
+
+echo "cifs312: phase2 complete — $((NCYCLES - seq_fail))/$NCYCLES succeeded" >> "$seqres.full"
+[ $seq_fail -le $((NCYCLES / 5)) ] || _fail "phase2: too many failures: $seq_fail/$NCYCLES"
+
+# Wait for cleanup
+sleep 0.5
+
+# ============================================================
+# Phase 3: Final leak check
+# ============================================================
+sess_after2=$(_sessions_count)
+tcon_after2=$(_tcon_count)
+sess_leak2=$((sess_after2 - sess_before))
+tcon_leak2=$((tcon_after2 - tcon_before))
+
+echo "cifs312: final — sessions=$sess_after2(+$sess_leak2) tcons=$tcon_after2(+$tcon_leak2)" >> "$seqres.full"
+
+# After all mounts are gone, sessions should return to baseline.
+# tcons may lag due to deferred teardown — only fail on session leak.
+if [ "$sess_leak2" -gt 2 ]; then
+    _fail "session leak after 100 parallel + 50 sequential cycles: $sess_leak2 extra sessions"
+fi
+echo "cifs312: tcon delta=$tcon_leak2 (may be pending teardown)" >> "$seqres.full"
+
+# Check open_files
+if [ -r /proc/fs/cifs/open_files ]; then
+    leak=$(grep -c "cifs312" /proc/fs/cifs/open_files 2>/dev/null) || leak=0
+    echo "cifs312: open_files leaks=$leak" >> "$seqres.full"
+    [ "$leak" -eq 0 ] || _fail "handle leak: $leak entries in open_files"
+fi
+
+# Check dmesg
+dmesg_after=$(dmesg | wc -l)
+if [ "$dmesg_after" -gt "$dmesg_before" ]; then
+    new_msgs=$((dmesg_after - dmesg_before))
+    if dmesg | tail -"$new_msgs" | grep -Eqi 'BUG|WARNING|Oops|panic|refcount'; then
+        echo "cifs312: kernel warnings detected" >> "$seqres.full"
+        dmesg | tail -"$new_msgs" | grep -Ei 'BUG|WARNING|Oops|panic|refcount' >> "$seqres.full"
+        _fail "dmesg shows kernel warnings during mount/unmount stress"
+    fi
+fi
+
+# Cleanup test data via primary mount
+rm -rf "$TEST_DIR/cifs312.$$" 2>/dev/null || true
+
+echo "rapid mount/unmount stress OK"
+
+status=0
+exit

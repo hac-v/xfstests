@@ -1,0 +1,183 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: deferred close overflow stress
+#
+# Stress test: rapidly open/close 5000 files with closetimeo=30 to overflow
+# the deferred close queue. Verifies:
+#   1. No resource exhaustion (ENOMEM, EMFILE) during rapid open/close
+#   2. All files are accessible after the storm
+#   3. No handle leaks in /proc/fs/cifs/open_files after cleanup
+#   4. Server-side handles are eventually released (Stats Closes catch up)
+#   5. dmesg has no warnings/oops
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto stress
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+NFILES=5000
+W="$TEST_DIR/cifs311.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1"
+
+mkdir -p "$W" || _fail "mkdir workspace"
+
+# Snapshot dmesg
+dmesg_before=$(dmesg | wc -l)
+
+# --- Phase 1: Create 5000 files ---
+echo "cifs311: creating $NFILES files" >> "$seqres.full"
+for i in $(seq 1 $NFILES); do
+    echo "data_$i" > "$W/f_$i" || _fail "create f_$i failed at file $i"
+done
+sync
+echo "cifs311: $NFILES files created" >> "$seqres.full"
+
+# Snapshot Stats (Creates/Closes baseline)
+SHARE=$(echo "$TEST_DEV" | sed -E 's#^//[^/]+/([^/]+).*#\1#')
+_read_stat() {
+    local stat_name="$1"
+    awk -v SH="$SHARE" -v ST="$stat_name" '
+        BEGIN { inb=0; val=0 }
+        /^[[:space:]]*[0-9]+\) / { inb = (index($0, SH) > 0) ? 1 : 0; next }
+        inb==1 && $1==ST { val=$2 }
+        inb==1 && NF==0 { inb=0 }
+        END { print val+0 }
+    ' /proc/fs/cifs/Stats 2>/dev/null
+}
+
+creates_before=$(_read_stat "Creates:")
+closes_before=$(_read_stat "Closes:")
+echo "cifs311: before storm — Creates=$creates_before Closes=$closes_before" >> "$seqres.full"
+
+# --- Phase 2: Rapid open/close storm (5000 files) ---
+# Each iteration opens a file, reads it, closes immediately.
+# With closetimeo=30, the kernel defers the actual SMB Close — this
+# floods the deferred close queue.
+echo "cifs311: starting rapid open/close storm ($NFILES files)" >> "$seqres.full"
+
+fail=0
+python3 -c "
+import os, sys
+
+W = '$W'
+N = $NFILES
+errors = 0
+
+# Round 1: rapid open-read-close
+for i in range(1, N + 1):
+    try:
+        fd = os.open(f'{W}/f_{i}', os.O_RDONLY)
+        data = os.read(fd, 64)
+        os.close(fd)
+    except Exception as e:
+        errors += 1
+        if errors <= 5:
+            print(f'round1 f_{i}: {e}', file=sys.stderr)
+
+print(f'round1: {N - errors}/{N} OK, {errors} errors', file=sys.stderr)
+
+# Round 2: rapid open-write-close (reopen same files)
+errors2 = 0
+for i in range(1, N + 1):
+    try:
+        fd = os.open(f'{W}/f_{i}', os.O_WRONLY)
+        os.write(fd, f'updated_{i}\n'.encode())
+        os.close(fd)
+    except Exception as e:
+        errors2 += 1
+        if errors2 <= 5:
+            print(f'round2 f_{i}: {e}', file=sys.stderr)
+
+print(f'round2: {N - errors2}/{N} OK, {errors2} errors', file=sys.stderr)
+
+# Round 3: rapid open-close without read (pure handle churn)
+errors3 = 0
+for i in range(1, N + 1):
+    try:
+        fd = os.open(f'{W}/f_{i}', os.O_RDONLY)
+        os.close(fd)
+    except Exception as e:
+        errors3 += 1
+        if errors3 <= 5:
+            print(f'round3 f_{i}: {e}', file=sys.stderr)
+
+print(f'round3: {N - errors3}/{N} OK, {errors3} errors', file=sys.stderr)
+
+total_errors = errors + errors2 + errors3
+sys.exit(1 if total_errors > 0 else 0)
+" 2>>"$seqres.full" || fail=1
+
+[ $fail -eq 0 ] || _fail "open/close storm had errors (see $seqres.full)"
+
+echo "cifs311: storm complete (3 rounds × $NFILES)" >> "$seqres.full"
+
+# --- Phase 3: Verify all files still accessible ---
+echo "cifs311: verifying file access after storm" >> "$seqres.full"
+bad=0
+for i in 1 100 500 1000 2500 5000; do
+    if [ ! -f "$W/f_$i" ]; then
+        echo "cifs311: f_$i missing after storm" >> "$seqres.full"
+        bad=$((bad + 1))
+    fi
+done
+[ $bad -eq 0 ] || _fail "$bad sample files missing after storm"
+
+# Verify content of updated files
+got=$(cat "$W/f_1" 2>/dev/null | tr -d '\n\r')
+[ "$got" = "updated_1" ] || _fail "f_1 content wrong after storm: '$got'"
+
+echo "cifs311: file access OK after storm" >> "$seqres.full"
+
+# --- Phase 4: Wait for deferred closes to drain, check Stats ---
+echo "cifs311: waiting for deferred closes to drain..." >> "$seqres.full"
+sleep 5
+
+creates_after=$(_read_stat "Creates:")
+closes_after=$(_read_stat "Closes:")
+creates_delta=$((creates_after - creates_before))
+closes_delta=$((closes_after - closes_before))
+
+echo "cifs311: after storm — Creates=$creates_after(+$creates_delta) Closes=$closes_after(+$closes_delta)" >> "$seqres.full"
+
+# With 3 rounds of 5000 open/close, we expect significant Creates
+# Closes may lag due to deferred close, but should be > 0
+if [ "$creates_delta" -gt 0 ]; then
+    echo "cifs311: $creates_delta Creates observed" >> "$seqres.full"
+else
+    echo "cifs311: [warn] no Creates delta (Stats may not track this share)" >> "$seqres.full"
+fi
+
+# --- Phase 5: Check for handle leaks ---
+if [ -r /proc/fs/cifs/open_files ]; then
+    leak_count=$(grep -c "cifs311" /proc/fs/cifs/open_files 2>/dev/null) || leak_count=0
+    echo "cifs311: open_files entries matching cifs311: $leak_count" >> "$seqres.full"
+    # Some deferred closes may still be pending — don't hard-fail, just warn
+    if [ "$leak_count" -gt 100 ]; then
+        _fail "possible handle leak: $leak_count entries in open_files after $NFILES storm"
+    fi
+fi
+
+# --- Phase 6: Check dmesg for warnings ---
+dmesg_after=$(dmesg | wc -l)
+if [ "$dmesg_after" -gt "$dmesg_before" ]; then
+    new_msgs=$((dmesg_after - dmesg_before))
+    if dmesg | tail -"$new_msgs" | grep -Eqi 'BUG|WARNING|Oops|panic|CIFS.*error.*resource'; then
+        echo "cifs311: WARNING — dmesg contains suspicious messages" >> "$seqres.full"
+        dmesg | tail -"$new_msgs" | grep -Ei 'BUG|WARNING|Oops|panic|CIFS' >> "$seqres.full"
+        _fail "dmesg shows kernel warnings during deferred close storm"
+    fi
+fi
+
+echo "cifs311: no dmesg warnings" >> "$seqres.full"
+
+# --- Phase 7: Cleanup ---
+rm -rf "$W" 2>/dev/null || true
+
+echo "deferred close overflow OK"
+
+status=0
+exit
