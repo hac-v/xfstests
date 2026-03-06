@@ -1,0 +1,2 @@
+QA output created by 308
+readdir + drop_dir_cache race OK

@@ -1,0 +1,207 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: reconnect with 100 open files — persistent handle recovery
+#
+# Open 100 files with active data, kill network via iptables for 5s,
+# restore, then verify all 100 files are still readable with correct
+# data. Tests durable/persistent handle reconnect under real load.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto stress
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+command -v iptables >/dev/null 2>&1 || _notrun "iptables required"
+
+# Resolve server IP
+_host_from_unc() { echo "$1" | sed -E 's#^//([^/]+)/.*#\1#'; }
+HOST=$(_host_from_unc "$TEST_DEV")
+[ -n "$HOST" ] || _notrun "could not derive host from TEST_DEV"
+
+# If host is a hostname, resolve it
+if ! echo "$HOST" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+    SERVER_IP=$(getent ahosts "$HOST" 2>/dev/null | awk 'NR==1{print $1}')
+else
+    SERVER_IP="$HOST"
+fi
+[ -n "$SERVER_IP" ] || _notrun "could not resolve server IP"
+
+# Determine disruption method:
+# - For remote servers: iptables DROP (blocks all traffic for duration)
+# - For localhost / when iptables unavailable: ss -K (kills TCP sockets)
+USE_IPTABLES=false
+USE_SS_KILL=false
+
+if [ "$SERVER_IP" = "127.0.0.1" ] || [ "$SERVER_IP" = "::1" ]; then
+    # localhost: can't use iptables, use ss -K
+    if ss -K dport = 445 2>/dev/null | grep -q . || true; then
+        USE_SS_KILL=true
+    else
+        _notrun "cannot disrupt localhost connection (ss -K not available)"
+    fi
+elif command -v iptables >/dev/null 2>&1; then
+    USE_IPTABLES=true
+else
+    # No iptables, try ss -K
+    if command -v ss >/dev/null 2>&1; then
+        USE_SS_KILL=true
+    else
+        _notrun "neither iptables nor ss available for network disruption"
+    fi
+fi
+
+_disrupt_start() {
+    if $USE_IPTABLES; then
+        iptables -A OUTPUT -d "$SERVER_IP" -p tcp --dport 445 -j DROP
+        echo "cifs306: iptables DROP inserted for $SERVER_IP:445" >> "$seqres.full"
+    elif $USE_SS_KILL; then
+        # Kill all established SMB connections to the server
+        ss -K dst "$SERVER_IP" dport = 445 >> "$seqres.full" 2>&1 || true
+        echo "cifs306: ss -K killed connections to $SERVER_IP:445" >> "$seqres.full"
+    fi
+}
+
+_disrupt_stop() {
+    if $USE_IPTABLES; then
+        iptables -D OUTPUT -d "$SERVER_IP" -p tcp --dport 445 -j DROP 2>/dev/null
+        echo "cifs306: iptables DROP removed" >> "$seqres.full"
+    fi
+    # ss -K is a one-shot kill, no "stop" needed — the kernel reconnects automatically
+}
+
+NFILES=100
+W="$TEST_DIR/cifs306.$$"
+
+_register_cleanup "_disrupt_stop 2>/dev/null; kill $HOLDER_PID 2>/dev/null; rm -rf '$W' >/dev/null 2>&1"
+
+mkdir -p "$W" || _fail "mkdir"
+
+# --- Phase 1: Create 100 files with known data ---
+echo "cifs306: creating $NFILES files" >> "$seqres.full"
+for i in $(seq 1 $NFILES); do
+    printf "file_%03d_data_%s\n" "$i" "$(printf '%080d' $i)" > "$W/f_$i" || _fail "create f_$i"
+done
+sync
+
+# Store checksums
+md5_before=""
+for i in $(seq 1 $NFILES); do
+    h=$(md5sum "$W/f_$i" 2>/dev/null | awk '{print $1}')
+    md5_before="$md5_before $h"
+done
+
+echo "cifs306: $NFILES files created, checksums stored" >> "$seqres.full"
+
+# --- Phase 2: Open files for reading (hold fds open) ---
+# Use a background process that opens all files and sleeps
+python3 -c "
+import os, sys, time, signal
+
+fds = []
+for i in range(1, $NFILES + 1):
+    try:
+        fd = os.open(f'$W/f_{i}', os.O_RDONLY)
+        fds.append(fd)
+    except Exception as e:
+        print(f'open f_{i} failed: {e}', file=sys.stderr)
+
+print(f'opened {len(fds)} files', file=sys.stderr)
+sys.stderr.flush()
+
+# Signal parent we're ready via a flag file
+open('$W/.holder_ready', 'w').close()
+
+# Wait for signal file to appear (polling — more robust than sigwait)
+for _ in range(120):
+    if os.path.exists('$W/.do_verify'):
+        break
+    time.sleep(1)
+else:
+    print('timeout waiting for verify signal', file=sys.stderr)
+    sys.exit(1)
+
+# Read and verify each file
+ok = bad = 0
+for idx, fd in enumerate(fds):
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        data = os.read(fd, 4096)
+        expected = f'file_{idx+1:03d}_data_'.encode()
+        if data[:len(expected)] == expected:
+            ok += 1
+        else:
+            bad += 1
+            if bad <= 3:
+                print(f'f_{idx+1}: expected {expected!r} got {data[:20]!r}', file=sys.stderr)
+    except Exception as e:
+        bad += 1
+        if bad <= 3:
+            print(f'f_{idx+1}: read failed: {e}', file=sys.stderr)
+    os.close(fd)
+
+print(f'verify: ok={ok} bad={bad}', file=sys.stderr)
+sys.exit(1 if bad > 0 else 0)
+" >>"$seqres.full" 2>&1 &
+HOLDER_PID=$!
+
+# Wait for holder to be ready
+tries=30
+while [ $tries -gt 0 ] && [ ! -f "$W/.holder_ready" ]; do
+    sleep 1
+    tries=$((tries - 1))
+done
+[ -f "$W/.holder_ready" ] || _fail "holder did not become ready"
+
+echo "cifs306: holder PID=$HOLDER_PID, files open" >> "$seqres.full"
+
+# --- Phase 3: Kill network for 5 seconds ---
+echo "cifs306: disrupting network to $SERVER_IP" >> "$seqres.full"
+_disrupt_start
+
+sleep 5
+
+echo "cifs306: restoring network" >> "$seqres.full"
+_disrupt_stop
+
+# Wait for reconnect — give extra time for persistent handle recovery
+sleep 15
+
+# --- Phase 4: Signal holder to verify data ---
+echo "cifs306: signaling holder to verify" >> "$seqres.full"
+touch "$W/.do_verify"
+
+# Wait for holder to finish (up to 60s)
+timeout 60 tail --pid=$HOLDER_PID -f /dev/null 2>/dev/null
+wait $HOLDER_PID
+holder_rc=$?
+
+echo "cifs306: holder exit code=$holder_rc" >> "$seqres.full"
+
+# --- Phase 5: Verify from this process too ---
+fail=0
+md5_after=""
+for i in $(seq 1 $NFILES); do
+    h=$(md5sum "$W/f_$i" 2>/dev/null | awk '{print $1}')
+    md5_after="$md5_after $h"
+done
+
+if [ "$md5_before" != "$md5_after" ]; then
+    echo "md5 mismatch after reconnect"
+    fail=$((fail+1))
+fi
+
+[ $holder_rc -eq 0 ] || { echo "holder detected corruption after reconnect"; fail=$((fail+1)); }
+
+# Check dmesg
+dmesg | tail -20 | grep -Eiq "BUG|oops|panic|RIP:" && { echo "kernel oops"; fail=$((fail+1)); }
+
+[ $fail -eq 0 ] || _fail "reconnect 100 open files: $fail failures"
+
+echo "reconnect 100 open files OK"
+
+status=0
+exit

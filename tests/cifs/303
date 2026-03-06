@@ -1,0 +1,123 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: git workload — real-world application I/O stress on CIFS
+#
+# Exercises a mixed I/O workload that git performs:
+# - git init (mkdir, small file writes, symlink-like refs)
+# - git add (stat, open, read, hash, write objects)
+# - git commit (write tree/commit objects, rename refs, fsync)
+# - git branch/checkout (readdir, unlink, create, rename, chmod)
+# - git merge (read, compare, write, rename)
+# - git diff (open, read, stat)
+# - Data integrity: verify file contents survive all operations
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto stress
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+command -v git >/dev/null 2>&1 || _notrun "git not installed"
+
+W="$TEST_DIR/cifs303_git.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1"
+mkdir -p "$W" || _fail "mkdir workspace"
+
+export GIT_AUTHOR_NAME="xfstest"
+export GIT_AUTHOR_EMAIL="xfstest@test"
+export GIT_COMMITTER_NAME="xfstest"
+export GIT_COMMITTER_EMAIL="xfstest@test"
+
+fail=0
+
+# --- Test 1: git init ---
+cd "$W" || _fail "cd workspace"
+git init >> "$seqres.full" 2>&1 || _fail "git init"
+echo "cifs303: git init OK" >> "$seqres.full"
+
+# --- Test 2: create files + git add + git commit ---
+for i in $(seq 1 50); do
+    echo "file content $i — $(head -c 64 /dev/urandom | base64)" > "file_$i.txt"
+done
+mkdir -p src/subdir
+for i in $(seq 1 20); do
+    echo "source code line $i" > "src/subdir/code_$i.c"
+done
+
+git add -A >> "$seqres.full" 2>&1 || { echo "git add failed"; fail=$((fail+1)); }
+git commit -m "initial commit with 70 files" >> "$seqres.full" 2>&1 || { echo "git commit failed"; fail=$((fail+1)); }
+echo "cifs303: initial commit OK (70 files)" >> "$seqres.full"
+
+# --- Test 3: verify data integrity ---
+for i in 1 25 50; do
+    content=$(cat "file_$i.txt")
+    [ -n "$content" ] || { echo "file_$i.txt empty after commit"; fail=$((fail+1)); }
+done
+
+# --- Test 4: git branch + modify + commit ---
+git checkout -b feature >> "$seqres.full" 2>&1 || { echo "git checkout -b failed"; fail=$((fail+1)); }
+echo "feature change" >> file_1.txt
+echo "new feature file" > feature.txt
+git add -A >> "$seqres.full" 2>&1
+git commit -m "feature branch changes" >> "$seqres.full" 2>&1 || { echo "feature commit failed"; fail=$((fail+1)); }
+echo "cifs303: feature branch OK" >> "$seqres.full"
+
+# --- Test 5: switch back to main, modify, commit ---
+# Detect default branch name
+main_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+if git show-ref --verify --quiet refs/heads/master 2>/dev/null; then
+    main_branch="master"
+elif git show-ref --verify --quiet refs/heads/main 2>/dev/null; then
+    main_branch="main"
+fi
+git checkout "$main_branch" >> "$seqres.full" 2>&1 || git checkout master >> "$seqres.full" 2>&1 || { echo "checkout main failed"; fail=$((fail+1)); }
+echo "main change" >> file_2.txt
+git add -A >> "$seqres.full" 2>&1
+git commit -m "main branch changes" >> "$seqres.full" 2>&1 || { echo "main commit failed"; fail=$((fail+1)); }
+echo "cifs303: main branch commit OK" >> "$seqres.full"
+
+# --- Test 6: git merge ---
+git merge feature --no-edit >> "$seqres.full" 2>&1 || { echo "merge failed"; fail=$((fail+1)); }
+# Verify merge brought the feature file
+[ -f feature.txt ] || { echo "feature.txt missing after merge"; fail=$((fail+1)); }
+echo "cifs303: merge OK" >> "$seqres.full"
+
+# --- Test 7: git diff (exercises read paths) ---
+echo "post-merge change" >> file_3.txt
+diff_out=$(git diff --stat 2>>"$seqres.full")
+echo "$diff_out" >> "$seqres.full"
+[ -n "$diff_out" ] || { echo "git diff empty"; fail=$((fail+1)); }
+echo "cifs303: diff OK" >> "$seqres.full"
+
+# --- Test 8: git stash + pop ---
+git stash >> "$seqres.full" 2>&1 || { echo "stash failed"; fail=$((fail+1)); }
+git stash pop >> "$seqres.full" 2>&1 || { echo "stash pop failed"; fail=$((fail+1)); }
+echo "cifs303: stash OK" >> "$seqres.full"
+
+# --- Test 9: git log (readdir + read objects) ---
+log_count=$(git log --oneline 2>>"$seqres.full" | wc -l)
+[ "$log_count" -ge 3 ] || { echo "expected >=3 commits, got $log_count"; fail=$((fail+1)); }
+echo "cifs303: log shows $log_count commits" >> "$seqres.full"
+
+# --- Test 10: bulk delete + commit (unlink stress) ---
+rm -f file_{10..50}.txt
+git add -A >> "$seqres.full" 2>&1
+git commit -m "bulk delete 40 files" >> "$seqres.full" 2>&1 || { echo "delete commit failed"; fail=$((fail+1)); }
+echo "cifs303: bulk delete commit OK" >> "$seqres.full"
+
+# --- Final integrity check ---
+remaining=$(git ls-files 2>>"$seqres.full" | wc -l)
+echo "cifs303: $remaining tracked files remaining" >> "$seqres.full"
+[ "$remaining" -ge 20 ] || { echo "too few files after operations: $remaining"; fail=$((fail+1)); }
+
+# Check dmesg for oops
+dmesg | tail -20 | grep -Eiq "BUG|oops|panic|RIP:" && { echo "kernel oops detected"; fail=$((fail+1)); }
+
+[ $fail -eq 0 ] || _fail "git workload: $fail failures"
+
+echo "git workload OK"
+
+status=0
+exit

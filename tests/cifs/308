@@ -1,0 +1,124 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: readdir + drop_dir_cache race — cached_dir stress
+#
+# Thread A does continuous readdir (ls -R) while Thread B writes
+# to /proc/fs/cifs/dfscache or drop_dir_cache sysfs to invalidate
+# the cached directory handles. This race has caused segfaults
+# (use-after-free in cached_dir) on Windows Server.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto stress
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+
+DROP_CACHE="/proc/fs/cifs/dfscache"
+if [ ! -w "$DROP_CACHE" ]; then
+    # Try sysfs path
+    DROP_CACHE=$(find /sys/module/cifs/parameters/ -name "drop_dir_cache" 2>/dev/null | head -1)
+fi
+[ -n "$DROP_CACHE" ] && [ -w "$DROP_CACHE" ] || _notrun "drop_dir_cache not available"
+
+DURATION=30  # seconds
+W="$TEST_DIR/cifs308.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1"
+
+# Create directory tree
+mkdir -p "$W" || _fail "mkdir"
+for d in $(seq 1 20); do
+    mkdir -p "$W/dir_$d"
+    for f in $(seq 1 10); do
+        echo "file_${d}_${f}" > "$W/dir_$d/f_$f"
+    done
+done
+sync
+
+echo "cifs308: created 20 dirs × 10 files = 200 files" >> "$seqres.full"
+echo "cifs308: drop_cache path=$DROP_CACHE" >> "$seqres.full"
+echo "cifs308: running for ${DURATION}s" >> "$seqres.full"
+
+# Record dmesg position
+dmesg_start=$(dmesg | wc -l)
+
+# --- Thread A: continuous readdir ---
+(
+    end=$(($(date +%s) + DURATION))
+    count=0
+    while [ $(date +%s) -lt $end ]; do
+        ls -R "$W" >/dev/null 2>&1
+        count=$((count+1))
+    done
+    echo "cifs308: readdir thread did $count iterations" >> "$seqres.full"
+) &
+READER_PID=$!
+
+# --- Thread B: continuous drop_dir_cache ---
+(
+    end=$(($(date +%s) + DURATION))
+    count=0
+    while [ $(date +%s) -lt $end ]; do
+        echo 1 > "$DROP_CACHE" 2>/dev/null
+        count=$((count+1))
+        sleep 0.1
+    done
+    echo "cifs308: drop_cache thread did $count iterations" >> "$seqres.full"
+) &
+DROPPER_PID=$!
+
+# --- Thread C: file modifications (add churn) ---
+(
+    end=$(($(date +%s) + DURATION))
+    count=0
+    while [ $(date +%s) -lt $end ]; do
+        i=$((RANDOM % 20 + 1))
+        j=$((RANDOM % 10 + 1))
+        echo "churn_$count" > "$W/dir_$i/f_$j" 2>/dev/null
+        count=$((count+1))
+        sleep 0.05
+    done
+    echo "cifs308: churn thread did $count modifications" >> "$seqres.full"
+) &
+CHURN_PID=$!
+
+# Wait for all threads
+wait $READER_PID
+reader_rc=$?
+wait $DROPPER_PID
+dropper_rc=$?
+wait $CHURN_PID
+churn_rc=$?
+
+echo "cifs308: threads done — reader=$reader_rc dropper=$dropper_rc churn=$churn_rc" >> "$seqres.full"
+
+# --- Verify no crash ---
+fail=0
+
+# Check dmesg for new oops/BUG since test start
+new_dmesg=$(dmesg | tail -n +$((dmesg_start+1)))
+if echo "$new_dmesg" | grep -Eiq "BUG|oops|panic|RIP:|segfault"; then
+    echo "kernel oops/segfault detected during readdir+drop_dir_cache race"
+    echo "$new_dmesg" | grep -Ei "BUG|oops|panic|RIP:|segfault" | head -5 >> "$seqres.full"
+    fail=$((fail+1))
+fi
+
+# Verify files are still accessible
+accessible=0
+for d in $(seq 1 20); do
+    for f in $(seq 1 10); do
+        [ -f "$W/dir_$d/f_$f" ] && accessible=$((accessible+1))
+    done
+done
+echo "cifs308: $accessible/200 files still accessible" >> "$seqres.full"
+[ $accessible -ge 190 ] || { echo "too many files missing: $accessible/200"; fail=$((fail+1)); }
+
+[ $fail -eq 0 ] || _fail "readdir + drop_dir_cache race: $fail failures"
+
+echo "readdir + drop_dir_cache race OK"
+
+status=0
+exit

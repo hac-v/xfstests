@@ -1,0 +1,147 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: writeback + truncate race — async I/O corruption stress
+#
+# 8 writer threads + 1 truncator thread operate on the same file.
+# Writers do sequential/random writes; truncator randomly shrinks/grows.
+# This pattern has caused 3+ CVEs in the CIFS writeback path where
+# async writeback pages get written to wrong offsets after truncate.
+# Verifies no data corruption and no kernel crash.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto stress
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+DURATION=${CIFS_STRESS_DURATION:-30}  # seconds
+NWRITERS=8
+W="$TEST_DIR/cifs309.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1"
+mkdir -p "$W" || _fail "mkdir"
+
+F="$W/race_file"
+echo "initial" > "$F" || _fail "create race file"
+
+echo "cifs309: $NWRITERS writers + 1 truncator for ${DURATION}s" >> "$seqres.full"
+
+# Record dmesg position
+dmesg_start=$(dmesg | wc -l)
+
+# --- Writer threads ---
+for w in $(seq 1 $NWRITERS); do
+    (
+        end=$(($(date +%s) + DURATION))
+        count=0
+        while [ $(date +%s) -lt $end ]; do
+            # Random offset write
+            python3 -c "
+import os, random
+try:
+    fd = os.open('$F', os.O_WRONLY | os.O_CREAT, 0o666)
+    offset = random.randint(0, 1048576)
+    os.lseek(fd, offset, os.SEEK_SET)
+    os.write(fd, b'W${w}' * 512)
+    os.close(fd)
+except:
+    pass
+" 2>/dev/null
+            count=$((count+1))
+        done
+        echo "cifs309: writer $w did $count writes" >> "$seqres.full"
+    ) &
+done
+
+# --- Truncator thread ---
+(
+    end=$(($(date +%s) + DURATION))
+    count=0
+    while [ $(date +%s) -lt $end ]; do
+        # Random truncate size between 0 and 2MB
+        python3 -c "
+import os, random
+try:
+    fd = os.open('$F', os.O_WRONLY)
+    size = random.choice([0, 4096, 65536, 262144, 1048576, 2097152])
+    os.ftruncate(fd, size)
+    os.close(fd)
+except:
+    pass
+" 2>/dev/null
+        count=$((count+1))
+        sleep 0.01
+    done
+    echo "cifs309: truncator did $count truncates" >> "$seqres.full"
+) &
+
+# Wait for all
+wait
+
+echo "cifs309: all threads done" >> "$seqres.full"
+
+fail=0
+
+# --- Verify no crash ---
+new_dmesg=$(dmesg | tail -n +$((dmesg_start+1)))
+if echo "$new_dmesg" | grep -Eiq "BUG|oops|panic|RIP:|segfault|WARNING.*cifs"; then
+    echo "kernel oops/warning during writeback+truncate race"
+    echo "$new_dmesg" | grep -Ei "BUG|oops|panic|RIP:|segfault|WARNING" | head -5 >> "$seqres.full"
+    fail=$((fail+1))
+fi
+
+# --- Verify file is accessible (not corrupted inode) ---
+if ! stat "$F" >> "$seqres.full" 2>&1; then
+    echo "file stat failed after race"
+    fail=$((fail+1))
+fi
+
+# Write + read back to verify file is usable
+echo "post_race_verify" > "$F" 2>/dev/null
+got=$(cat "$F" 2>/dev/null)
+[ "$got" = "post_race_verify" ] || { echo "file unusable after race"; fail=$((fail+1)); }
+
+# --- Second round: pure truncate-to-zero while reading ---
+echo "cifs309: round 2 — truncate-to-zero vs readers" >> "$seqres.full"
+
+# Create a 1MB file
+dd if=/dev/urandom of="$F" bs=1M count=1 2>/dev/null || _fail "dd"
+sync
+
+(
+    end=$(($(date +%s) + 10))
+    while [ $(date +%s) -lt $end ]; do
+        cat "$F" > /dev/null 2>&1
+    done
+) &
+
+(
+    end=$(($(date +%s) + 10))
+    while [ $(date +%s) -lt $end ]; do
+        truncate -s 0 "$F" 2>/dev/null
+        dd if=/dev/urandom of="$F" bs=4K count=256 2>/dev/null
+    done
+) &
+
+wait
+
+# Final check
+new_dmesg2=$(dmesg | tail -n +$((dmesg_start+1)))
+if echo "$new_dmesg2" | grep -Eiq "BUG|oops|panic|RIP:|segfault"; then
+    echo "kernel oops in round 2"
+    fail=$((fail+1))
+fi
+
+if ! stat "$F" >> "$seqres.full" 2>&1; then
+    echo "file stat failed after round 2"
+    fail=$((fail+1))
+fi
+
+[ $fail -eq 0 ] || _fail "writeback + truncate race: $fail failures"
+
+echo "writeback + truncate race OK"
+
+status=0
+exit

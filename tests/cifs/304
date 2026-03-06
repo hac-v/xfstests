@@ -1,0 +1,128 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: nosharesock mount stress — progressive mount scaling
+#
+# Stress test for SMB session/tcon management:
+# - Mount the same share 10, 50, then 100 times with nosharesock
+# - Each mount creates a separate TCP connection + SMB session + tcon
+# - Verify I/O works on each mount
+# - Unmount all and verify no session/tcon/socket leaks via DebugData
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto stress
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+
+# Build mount options from existing MOUNT_OPTIONS
+base_opts=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^[[:space:]]*-o[[:space:]]*//' -e 's/^[[:space:]]*//')
+if [ -z "$base_opts" ]; then
+    base_opts=$(awk -v mnt="$TEST_DIR" '$2==mnt {print $4}' /proc/mounts)
+fi
+# Ensure credentials are present
+if ! echo "$base_opts" | grep -Eq '(^|,)(credentials=|username=|user=)'; then
+    if [ -n "$CIFS_CRED_FILE" ] && [ -r "$CIFS_CRED_FILE" ]; then
+        base_opts="${base_opts:+$base_opts,}credentials=$CIFS_CRED_FILE"
+    elif [ -r /root/.cifs-cred-xfstest ]; then
+        base_opts="${base_opts:+$base_opts,}credentials=/root/.cifs-cred-xfstest"
+    fi
+fi
+# Add nosharesock if not present
+echo "$base_opts" | grep -q "nosharesock" || base_opts="${base_opts},nosharesock"
+
+MNT_BASE="/tmp/cifs304_mnt"
+PIDS_MOUNTED=""
+
+_cleanup_mounts() {
+    for d in "$MNT_BASE".*; do
+        [ -d "$d" ] && umount -l "$d" 2>/dev/null && rmdir "$d" 2>/dev/null
+    done
+}
+_register_cleanup "_cleanup_mounts"
+
+_do_mount_phase() {
+    local count=$1
+    local phase=$2
+    local fail=0
+
+    echo "cifs304: phase $phase — mounting $count shares" >> "$seqres.full"
+
+    # Snapshot session count before
+    local sess_before=$(grep -c "^[[:space:]]*[0-9]*) Address:" /proc/fs/cifs/DebugData 2>/dev/null || echo 0)
+
+    for i in $(seq 1 "$count"); do
+        local mnt="$MNT_BASE.${phase}_${i}"
+        mkdir -p "$mnt" || { fail=$((fail+1)); continue; }
+        if ! mount -t cifs "$TEST_DEV" "$mnt" -o "$base_opts" >> "$seqres.full" 2>&1; then
+            echo "cifs304: mount $i/$count failed" >> "$seqres.full"
+            rmdir "$mnt" 2>/dev/null
+            fail=$((fail+1))
+            # If first mount fails, skip this phase
+            [ $i -eq 1 ] && return 1
+            continue
+        fi
+    done
+
+    echo "cifs304: phase $phase — $((count - fail))/$count mounted" >> "$seqres.full"
+
+    # Quick I/O on a sample of mounts
+    local tested=0
+    for i in 1 $((count/2)) $count; do
+        local mnt="$MNT_BASE.${phase}_${i}"
+        [ -d "$mnt" ] || continue
+        if echo "test_$phase_$i" > "$mnt/cifs304_test_$phase" 2>/dev/null; then
+            local got=$(cat "$mnt/cifs304_test_$phase" 2>/dev/null)
+            [ "$got" = "test_$phase_$i" ] || { echo "cifs304: data mismatch on mount $i"; fail=$((fail+1)); }
+            rm -f "$mnt/cifs304_test_$phase" 2>/dev/null
+            tested=$((tested+1))
+        fi
+    done
+
+    echo "cifs304: phase $phase — tested I/O on $tested mounts" >> "$seqres.full"
+
+    # Unmount all
+    for i in $(seq 1 "$count"); do
+        local mnt="$MNT_BASE.${phase}_${i}"
+        [ -d "$mnt" ] && { umount -l "$mnt" 2>/dev/null; rmdir "$mnt" 2>/dev/null; }
+    done
+
+    sleep 2
+
+    # Check for leaks
+    local sess_after=$(grep -c "^[[:space:]]*[0-9]*) Address:" /proc/fs/cifs/DebugData 2>/dev/null || echo 0)
+    local leaked=$((sess_after - sess_before))
+    echo "cifs304: phase $phase — sessions before=$sess_before after=$sess_after leaked=$leaked" >> "$seqres.full"
+
+    # Allow 1-2 for the framework's own mounts
+    if [ "$leaked" -gt 2 ]; then
+        echo "cifs304: WARNING session leak: $leaked sessions after phase $phase" >> "$seqres.full"
+        fail=$((fail+1))
+    fi
+
+    # Check dmesg for oops
+    dmesg | tail -30 | grep -Eiq "BUG|oops|panic|RIP:" && { echo "kernel oops after phase $phase"; fail=$((fail+1)); }
+
+    return $fail
+}
+
+total_fail=0
+
+# Phase 1: 10 mounts
+_do_mount_phase 10 "p1" || total_fail=$((total_fail + $?))
+
+# Phase 2: 50 mounts
+_do_mount_phase 50 "p2" || total_fail=$((total_fail + $?))
+
+# Phase 3: 100 mounts
+_do_mount_phase 100 "p3" || total_fail=$((total_fail + $?))
+
+[ $total_fail -eq 0 ] || _fail "nosharesock mount stress: $total_fail failures"
+
+echo "nosharesock mount stress OK"
+
+status=0
+exit

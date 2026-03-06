@@ -1,0 +1,142 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: 1000-process concurrent write/read stress
+#
+# Pattern A: 1000 processes each write their own file, then all verified.
+# Pattern B: 1000 processes write to same file at unique offsets, then verified.
+# Tests credit management, handle scalability, page cache under pressure.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto stress
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+NPROCS=${CIFS_STRESS_PROCS:-1000}
+CHUNK=4096
+W="$TEST_DIR/cifs305.$$"
+_register_cleanup "rm -rf '$W' >/dev/null 2>&1"
+mkdir -p "$W/files" || _fail "mkdir"
+
+fail=0
+
+# --- Pattern A: 1000 separate files ---
+echo "cifs305: pattern A — $NPROCS processes, separate files" >> "$seqres.full"
+
+for i in $(seq 1 "$NPROCS"); do
+    (
+        printf "proc_%04d_data_%s" "$i" "$(printf '%0960d' $i)" > "$W/files/f_$i" 2>/dev/null
+    ) &
+    # Batch in groups of 200 to avoid fork bomb
+    [ $((i % 200)) -eq 0 ] && wait
+done
+wait
+
+echo "cifs305: pattern A — all writes done, verifying" >> "$seqres.full"
+
+verified=0
+corrupt=0
+missing=0
+for i in $(seq 1 "$NPROCS"); do
+    if [ -f "$W/files/f_$i" ]; then
+        got=$(head -c 10 "$W/files/f_$i" 2>/dev/null)
+        expected=$(printf "proc_%04d_" "$i")
+        if [ "$got" = "$expected" ]; then
+            verified=$((verified+1))
+        else
+            corrupt=$((corrupt+1))
+        fi
+    else
+        missing=$((missing+1))
+    fi
+    # Sample check — don't verify all 1000 for speed
+    [ $((i % 100)) -eq 0 ] || [ $i -le 10 ] || [ $i -ge $((NPROCS-10)) ] || continue
+done
+# Actually verify all for integrity
+verified=0; corrupt=0; missing=0
+for i in $(seq 1 "$NPROCS"); do
+    if [ -f "$W/files/f_$i" ]; then
+        got=$(head -c 10 "$W/files/f_$i" 2>/dev/null)
+        expected=$(printf "proc_%04d_" "$i")
+        if [ "$got" = "$expected" ]; then
+            verified=$((verified+1))
+        else
+            corrupt=$((corrupt+1))
+        fi
+    else
+        missing=$((missing+1))
+    fi
+done
+
+echo "cifs305: pattern A — verified=$verified corrupt=$corrupt missing=$missing" >> "$seqres.full"
+[ $corrupt -eq 0 ] || { echo "pattern A: $corrupt corrupted files"; fail=$((fail+1)); }
+[ $missing -le $((NPROCS/10)) ] || { echo "pattern A: $missing missing files (>10%)"; fail=$((fail+1)); }
+
+# --- Pattern B: 1000 processes write to same file at unique offsets ---
+echo "cifs305: pattern B — $NPROCS processes, same file" >> "$seqres.full"
+
+SHARED="$W/shared_file"
+# Pre-allocate the file
+dd if=/dev/zero of="$SHARED" bs=$CHUNK count=$NPROCS 2>/dev/null || _fail "preallocate"
+
+for i in $(seq 1 "$NPROCS"); do
+    (
+        offset=$(( (i - 1) * CHUNK ))
+        # Write a unique pattern at this offset
+        python3 -c "
+import os
+fd = os.open('$SHARED', os.O_WRONLY)
+os.lseek(fd, $offset, os.SEEK_SET)
+pattern = (b'P%04d___' % $i) * ($CHUNK // 8)
+os.write(fd, pattern[:$CHUNK])
+os.close(fd)
+" 2>/dev/null
+    ) &
+    [ $((i % 200)) -eq 0 ] && wait
+done
+wait
+sync
+
+echo "cifs305: pattern B — all writes done, verifying" >> "$seqres.full"
+
+# Verify each chunk
+b_ok=0
+b_bad=0
+python3 -c "
+import sys
+CHUNK = $CHUNK
+NPROCS = $NPROCS
+ok = bad = 0
+with open('$SHARED', 'rb') as f:
+    for i in range(1, NPROCS + 1):
+        f.seek((i - 1) * CHUNK)
+        data = f.read(CHUNK)
+        expected_prefix = b'P%04d___' % i
+        if data[:8] == expected_prefix:
+            ok += 1
+        else:
+            bad += 1
+            if bad <= 5:
+                print(f'chunk {i}: expected {expected_prefix!r} got {data[:8]!r}', file=sys.stderr)
+print(f'ok={ok} bad={bad}', file=sys.stderr)
+sys.exit(1 if bad > 0 else 0)
+" 2>>"$seqres.full"
+b_rc=$?
+
+if [ $b_rc -ne 0 ]; then
+    echo "pattern B: data corruption detected"
+    fail=$((fail+1))
+fi
+
+# Check dmesg
+dmesg | tail -20 | grep -Eiq "BUG|oops|panic|RIP:" && { echo "kernel oops"; fail=$((fail+1)); }
+
+[ $fail -eq 0 ] || _fail "1000-process write/read: $fail failures"
+
+echo "1000-process concurrent write/read OK"
+
+status=0
+exit

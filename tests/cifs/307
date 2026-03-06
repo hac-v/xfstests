@@ -1,0 +1,136 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: 500-file lease break flood — SMB oplock/lease stress
+#
+# Mount same share twice with nosharesock, open 500 files on mount A,
+# then touch all 500 from mount B — triggering 500 lease breaks.
+# Verify no crash, no data corruption, all files accessible after.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto stress
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+[ "$(id -u)" = 0 ] || _notrun "root required"
+
+NFILES=500
+
+# Build mount options
+base_opts=$(echo "${MOUNT_OPTIONS:-}" | sed -e 's/^[[:space:]]*-o[[:space:]]*//' -e 's/^[[:space:]]*//')
+if [ -z "$base_opts" ]; then
+    base_opts=$(awk -v mnt="$TEST_DIR" '$2==mnt {print $4}' /proc/mounts)
+fi
+if ! echo "$base_opts" | grep -Eq '(^|,)(credentials=|username=|user=)'; then
+    if [ -n "$CIFS_CRED_FILE" ] && [ -r "$CIFS_CRED_FILE" ]; then
+        base_opts="${base_opts:+$base_opts,}credentials=$CIFS_CRED_FILE"
+    elif [ -r /root/.cifs-cred-xfstest ]; then
+        base_opts="${base_opts:+$base_opts,}credentials=/root/.cifs-cred-xfstest"
+    fi
+fi
+echo "$base_opts" | grep -q "nosharesock" || base_opts="${base_opts},nosharesock"
+
+MNT_B=$(mktemp -d /tmp/cifs307.mnt.XXXXXX) || _fail "mktemp"
+W="$TEST_DIR/cifs307.$$"
+
+_register_cleanup "umount '$MNT_B' 2>/dev/null; rmdir '$MNT_B' 2>/dev/null; rm -rf '$W' 2>/dev/null"
+
+# Mount second instance
+if ! mount -t cifs "$TEST_DEV" "$MNT_B" -o "$base_opts" >> "$seqres.full" 2>&1; then
+    rmdir "$MNT_B" 2>/dev/null
+    _notrun "secondary nosharesock mount failed"
+fi
+
+mkdir -p "$W" || _fail "mkdir"
+
+# --- Phase 1: Create 500 files on mount A ---
+echo "cifs307: creating $NFILES files" >> "$seqres.full"
+for i in $(seq 1 $NFILES); do
+    printf "lease_test_%04d\n" "$i" > "$W/f_$i" || _fail "create f_$i"
+done
+sync
+
+echo "cifs307: $NFILES files created" >> "$seqres.full"
+
+# --- Phase 2: Open all files on mount A (acquire leases) ---
+python3 -c "
+import os, sys, time, signal
+
+fds = []
+for i in range(1, $NFILES + 1):
+    try:
+        fd = os.open('$W/f_{}'.format(i), os.O_RDWR)
+        # Read to establish lease
+        os.read(fd, 64)
+        fds.append(fd)
+    except Exception as e:
+        print(f'open f_{i}: {e}', file=sys.stderr)
+
+print(f'opened {len(fds)} files for lease', file=sys.stderr)
+sys.stderr.flush()
+sys.stdout.write('READY\n')
+sys.stdout.flush()
+
+# Wait for signal to close
+signal.sigwait([signal.SIGUSR1])
+
+for fd in fds:
+    os.close(fd)
+print('all fds closed', file=sys.stderr)
+" > /tmp/cifs307_ready.$$ 2>>"$seqres.full" &
+LEASE_PID=$!
+sleep 3
+
+echo "cifs307: lease holder PID=$LEASE_PID" >> "$seqres.full"
+
+# --- Phase 3: Touch all 500 files from mount B (triggers lease breaks) ---
+echo "cifs307: triggering $NFILES lease breaks from mount B" >> "$seqres.full"
+
+RELDIR=$(echo "$W" | sed "s|^$TEST_DIR||")
+MNT_B_W="$MNT_B$RELDIR"
+
+t_start=$(date +%s)
+fail=0
+for i in $(seq 1 $NFILES); do
+    if ! echo "modified_$i" >> "$MNT_B_W/f_$i" 2>>"$seqres.full"; then
+        fail=$((fail+1))
+        [ $fail -le 3 ] && echo "cifs307: write f_$i from mount B failed" >> "$seqres.full"
+    fi
+done
+t_end=$(date +%s)
+elapsed=$((t_end - t_start))
+
+echo "cifs307: $NFILES writes from mount B done in ${elapsed}s, failures=$fail" >> "$seqres.full"
+
+# --- Phase 4: Release leases ---
+kill -USR1 $LEASE_PID 2>/dev/null
+wait $LEASE_PID 2>/dev/null
+
+# --- Phase 5: Verify all files ---
+echo "cifs307: verifying all files" >> "$seqres.full"
+corrupt=0
+missing=0
+for i in $(seq 1 $NFILES); do
+    if [ -f "$W/f_$i" ]; then
+        got=$(head -1 "$W/f_$i" 2>/dev/null)
+        expected=$(printf "lease_test_%04d" "$i")
+        [ "$got" = "$expected" ] || corrupt=$((corrupt+1))
+    else
+        missing=$((missing+1))
+    fi
+done
+
+echo "cifs307: verify — corrupt=$corrupt missing=$missing" >> "$seqres.full"
+
+# Check dmesg
+dmesg | tail -30 | grep -Eiq "BUG|oops|panic|RIP:" && { echo "kernel oops after lease break flood"; fail=$((fail+1)); }
+
+total_fail=$((fail + corrupt + missing))
+[ $total_fail -eq 0 ] || _fail "500-file lease break flood: writes_failed=$fail corrupt=$corrupt missing=$missing"
+
+echo "500-file lease break flood OK"
+
+status=0
+exit

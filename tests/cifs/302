@@ -1,0 +1,96 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# CIFS: interrupted close — kill process with open file handle
+#
+# Regression test for "cifs: fix interrupted close commands".
+# A process opens a file (via shell redirect), gets killed while
+# the handle is still open, and the kernel must complete the close
+# without leaking the server-side handle. Subsequent stat and rm
+# must succeed within a reasonable timeout.
+
+. ./common/preamble
+. ./common/rc
+_begin_fstest auto quick
+
+[ "$FSTYP" = "cifs" ] || _notrun "requires CIFS"
+[ -n "$TEST_DEV" ] || _notrun "TEST_DEV not set"
+[ -n "$TEST_DIR" ] || _notrun "TEST_DIR not set"
+
+F="$TEST_DIR/cifs302_interrupted_close.$$"
+_register_cleanup "rm -f '$F' >/dev/null 2>&1"
+
+# Clean up any leftover from previous run
+rm -f "$F" 2>/dev/null
+
+# --- Test 1: kill process holding open write handle ---
+# 'sleep 5 > $F' opens $F for writing, then sleeps.
+# Killing the sleep causes the fd to close via signal path.
+sleep 5 > "$F" &
+pid=$!
+sleep 1
+
+# Ensure the process is still running and file exists
+kill -0 $pid 2>/dev/null || _fail "background process exited prematurely"
+[ -f "$F" ] || _fail "file not created by background process"
+
+# Kill the process — this triggers the interrupted close path
+kill $pid
+wait $pid 2>/dev/null || true
+
+# The key test: stat and rm must not hang.
+# If the interrupted close leaked the handle, these will block.
+timeout 5 stat "$F" > /dev/null 2>&1 || _fail "stat hung after interrupted close"
+timeout 5 rm -f "$F" 2>/dev/null || _fail "rm hung after interrupted close"
+
+# Verify file is gone
+[ ! -f "$F" ] || _fail "file still exists after rm"
+
+echo "cifs302: test1 (kill sleep) OK" >> "$seqres.full"
+
+# --- Test 2: kill process holding open read handle ---
+echo "read_test_data" > "$F" || _fail "create read test file"
+
+sleep 5 < "$F" &
+pid2=$!
+sleep 1
+kill $pid2
+wait $pid2 2>/dev/null || true
+
+timeout 5 stat "$F" > /dev/null 2>&1 || _fail "stat hung after interrupted read close"
+timeout 5 rm -f "$F" 2>/dev/null || _fail "rm hung after interrupted read close"
+
+echo "cifs302: test2 (kill read) OK" >> "$seqres.full"
+
+# --- Test 3: rapid kill cycles (stress the close path) ---
+for i in $(seq 1 50); do
+    sleep 10 > "$F" &
+    p=$!
+    # Minimal delay — kill as fast as possible
+    kill $p 2>/dev/null
+    wait $p 2>/dev/null || true
+done
+
+# After 50 rapid kill cycles, stat and rm must still work
+timeout 5 stat "$F" > /dev/null 2>&1 || _fail "stat hung after rapid kill cycles"
+timeout 5 rm -f "$F" 2>/dev/null || _fail "rm hung after rapid kill cycles"
+
+echo "cifs302: test3 (rapid kills) OK" >> "$seqres.full"
+
+# --- Test 4: SIGKILL (unblockable) variant ---
+echo "sigkill_test" > "$F" || _fail "create sigkill test file"
+sleep 10 >> "$F" &
+pid4=$!
+sleep 0.5
+kill -9 $pid4
+wait $pid4 2>/dev/null || true
+
+timeout 5 stat "$F" > /dev/null 2>&1 || _fail "stat hung after SIGKILL close"
+timeout 5 rm -f "$F" 2>/dev/null || _fail "rm hung after SIGKILL close"
+
+echo "cifs302: test4 (SIGKILL) OK" >> "$seqres.full"
+
+echo "interrupted close OK"
+
+status=0
+exit

@@ -2,7 +2,7 @@
 
 This document describes the CIFS/SMB client test suite for xfstests.
 
-**Total: 200 tests (cifs/001–301)** covering:
+**Total: 211 tests (cifs/001–310)** covering:
 - POSIX I/O semantics, permissions, ACLs, xattr, locking
 - 45+ mount options, module parameters, remount transitions
 - Reconnect/resilience, lease/oplock handling, credit management
@@ -14,6 +14,7 @@ This document describes the CIFS/SMB client test suite for xfstests.
 - NTFS alternate data streams, quota, key dump
 - Kernel module parameter validation (enable_oplocks, disable_legacy_dialects, drop_dir_cache)
 - Negative/error-path tests (bad credentials, invalid options, ELOOP, EXDEV, EBADF)
+- Stress tests (git workload, multi-mount consistency, lease flood, reconnect, writeback races)
 
 ## How to run CIFS tests
 
@@ -24,7 +25,10 @@ This document describes the CIFS/SMB client test suite for xfstests.
   sudo ./check cifs/100
 
   # Range of tests
-  sudo ./check cifs/{208..301}
+  sudo ./check cifs/{208..310}
+
+  # Stress tests only
+  sudo ./check -g stress
 
   # All CIFS tests
   sudo ./check $(ls tests/cifs/ | grep -E '^[0-9]+$' | sort -n | sed 's/^/cifs\//')
@@ -363,3 +367,14 @@ Pass/fail interpretation must be **capability-based**:
 - **299**: I/O on invalid fd modes — read from O_WRONLY → EBADF, write to O_RDONLY → EBADF.
 - **300**: Write beyond max offset ($2^{63}-2$) → EFBIG/EINVAL, no crash; negative lseek → EINVAL.
 - **301**: Hardlink across different mounts → EXDEV; hardlink to non-existent source → ENOENT.
+
+### cifs/302-310 (stress tests)
+- **302**: Interrupted close — kill process with open file handle, verify no server-side handle leak (stat/rm don’t hang). SIGTERM, SIGKILL, 50 rapid kill cycles.
+- **303**: Git workload — `git init`/`add`/`commit`/`branch`/`checkout`/`merge`/`diff` on CIFS share, data integrity verification.
+- **304**: nosharesock mount stress — progressive 10→50→100 mount scaling, I/O on each, leak check after unmount.
+- **305**: 1000-process concurrent write/read — 1000 separate files + 1000 writers to same file at unique offsets, data verification.
+- **306**: Reconnect with 100 open files — open 100 files, iptables DROP 5s, restore, verify all data via persistent handles.
+- **307**: 500-file lease break flood — 2 nosharesock mounts, open 500 files on mount A, touch all from mount B, verify integrity.
+- **308**: readdir + drop_dir_cache race — concurrent `ls -R` loop + `drop_dir_cache` writes, verify no crash or corruption.
+- **309**: Writeback + truncate race — 8 writer threads + 1 truncator thread, verify no data corruption after concurrent operations.
+- **310**: Multi-mount consistency — 10 nosharesock mounts × 10 parallel processes: shared file writes at unique offsets, shared directory creates, cross-mount read verification, lease break confirmation, handle leak check.

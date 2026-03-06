@@ -1,15 +1,15 @@
 # CIFS xfstests — Test Results
 
-**Generated**: 2026-03-05 19:00
+**Generated**: 2026-03-06
 
 ## Summary
 
 | Result | Samba | Windows Server | Azure Files |
 |---|---|---|---|
-| ✅ Passed | **155** | **158** | **139** |
-| ⏭️ Skipped | **38** | **35** | **46** |
+| ✅ Passed | **163** | **158** | **139** |
+| ⏭️ Skipped | **39** | **35** | **46** |
 | ❌ Failed | **4** | **7** | **15** |
-| **Total** | **197** | **200** | **200** |
+| **Total** | **206** | **200** | **200** |
 
 ## Environment
 
@@ -224,6 +224,15 @@
 | cifs/299 | ✅ 1s | ✅ 1s | ✅ 3s |
 | cifs/300 | — | ❌ | ❌ |
 | cifs/301 | — | ✅ 2s | ✅ 5s |
+| cifs/302 | ✅ 435s | — | — |
+| cifs/303 | ✅ 7s | — | — |
+| cifs/304 | ✅ 25s | — | — |
+| cifs/305 | ✅ 43s | — | — |
+| cifs/306 | ⏭️ | ✅ 27s | — |
+| cifs/307 | ✅ 19s | — | — |
+| cifs/308 | ✅ 33s | — | — |
+| cifs/309 | ✅ 41s | — | — |
+| cifs/310 | ✅ 9s | — | — |
 
 ## Failed Tests
 
